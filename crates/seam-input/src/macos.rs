@@ -997,6 +997,33 @@ mod tap_behaviour {
         seen
     }
 
+    /// Can a **daemon** decouple the cursor from the mouse?
+    ///
+    /// This matters because it decides whether the mirrored-cursor bug is fixable at all
+    /// from a background process. Earlier work in this project assumed
+    /// `CGAssociateMouseAndMouseCursorPosition` required foreground status and routed
+    /// around it — twice, and one of those workarounds locked the machine. Measuring it
+    /// says otherwise: it returns success (0) from the test binary, which has no
+    /// foreground status, no window and no activation policy.
+    ///
+    /// What this test deliberately does **not** claim: that the local cursor stays put.
+    /// That cannot be measured with `CGEventPost`, because a posted event always carries
+    /// an absolute location and so repositions the cursor directly, bypassing both the
+    /// association and the tap's discard. A physical mouse reports deltas and does not.
+    /// Proving the real device path needs a human hand on a real mouse.
+    #[test]
+    fn a_daemon_can_detach_the_cursor_from_the_mouse() {
+        // SAFETY: documented CoreGraphics calls; the association is always restored.
+        let detached = unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
+        unsafe { CGAssociateMouseAndMouseCursorPosition(1) };
+        assert_eq!(
+            detached, 0,
+            "CGAssociateMouseAndMouseCursorPosition(0) failed with {detached}; if this ever \
+             starts failing, cursor detachment is no longer available to a daemon and the \
+             fix has to move into a foreground agent"
+        );
+    }
+
     /// The decisive question: does movement still reach the tap while the cursor is
     /// detached **and** events are being discarded?
     ///

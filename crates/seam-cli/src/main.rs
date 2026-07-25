@@ -591,7 +591,7 @@ async fn daemon(
         }
     }
 
-    start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry));
+    start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry), dir.to_path_buf());
 
     start_clipboard_sync(Arc::clone(&links), Arc::clone(&clipboard));
     start_input_watchdog();
@@ -861,11 +861,22 @@ async fn sync_peers(
     graph: &mut focus::Graph,
     known: &mut Vec<seam_proto::PeerId>,
     geometry: &Geometry,
+    dir: &std::path::Path,
 ) {
     let live: Vec<seam_proto::PeerId> = links.lock().await.iter().map(|l| l.peer_id()).collect();
     let sizes = geometry.lock().await.clone();
 
-    for id in &live {
+    // Place in PAIRING order, never connection order. Connection order is a race, and
+    // losing it meant the laptop took the iMac's Left edge and the iMac was left with
+    // nowhere to sit. Pairing order is a deliberate human act, recorded once.
+    let order = store::pairing_order(dir);
+    let mut ordered: Vec<seam_proto::PeerId> =
+        order.iter().copied().filter(|id| live.contains(id)).collect();
+    // Anything paired before this build wrote an ordering still gets placed, after those
+    // that have one, so an upgrade never strands a peer.
+    ordered.extend(live.iter().copied().filter(|id| !order.contains(id)));
+
+    for id in &ordered {
         if graph.is_placed(*id) {
             continue;
         }
@@ -879,6 +890,12 @@ async fn sync_peers(
             None => (focus::Edge::Left, None),
             Some(first) => (focus::Edge::Bottom, Some(*first)),
         };
+        // A later-paired peer hangs below the first one, so it cannot be placed until the
+        // first one is. Waiting is correct: taking the free Left edge instead is exactly
+        // the bug this ordering exists to stop.
+        if anchor.is_some_and(|a| !graph.is_placed(a)) {
+            continue;
+        }
         graph.place(*id, edge, anchor, w, h);
         known.push(*id);
         tracing::info!(peer = %id, ?edge, w, h, "placed — push the pointer off that edge to reach it");
@@ -1110,7 +1127,11 @@ async fn receive_reliable(
 /// this proves the whole path end to end without any code being able to suppress input,
 /// which is the failure that can freeze a Mac until it is rebooted.
 #[expect(clippy::too_many_lines, reason = "one event loop; splitting it hides the ordering")]
-fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geometry: Geometry) {
+fn start_pointer_forwarding(
+    links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    geometry: Geometry,
+    dir: std::path::PathBuf,
+) {
     #[cfg(target_os = "macos")]
     {
         let observed = match seam_input::macos::observe_pointer() {
@@ -1153,7 +1174,7 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geom
                 }
                 seq = seq.wrapping_add(1);
 
-                sync_peers(&links, &mut graph, &mut known, &geometry).await;
+                sync_peers(&links, &mut graph, &mut known, &geometry, &dir).await;
 
                 // Safety net. `sync_peers` can hand focus back on its own — a peer that
                 // disappears while holding the pointer is sent home immediately — and that

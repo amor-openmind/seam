@@ -106,6 +106,26 @@ pub(crate) fn load_peers(dir: &Path) -> TrustStore {
     store
 }
 
+/// The order peers were paired in, which is the order they get placed in the layout.
+///
+/// Connection order is a race: whichever daemon happens to start first took the Left edge,
+/// so a laptop that booted before the iMac stole the iMac's place and the iMac then had
+/// nowhere to go. Pairing order is not a race — it is the order a human deliberately ran
+/// `seam pair`, once, and it survives reboots because it is the order of the peers file.
+pub(crate) fn pairing_order(dir: &Path) -> Vec<seam_proto::PeerId> {
+    let Ok(text) = fs::read_to_string(dir.join(PEERS)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let (hex, _) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+            parse_fingerprint(hex).map(|f| f.peer_id())
+        })
+        .collect()
+}
+
 pub(crate) fn save_peers(dir: &Path, store: &TrustStore) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut text = String::from("# seam paired peers: <fingerprint> <name>\n");
