@@ -580,7 +580,12 @@ async fn daemon(
                 let link = Arc::new(link);
                 links.lock().await.push(Arc::clone(&link));
                 announce_geometry(&link).await;
-                tokio::spawn(receive_from(link, Arc::clone(&geometry), Arc::clone(&clipboard)));
+                tokio::spawn(receive_from(
+                    link,
+                    Arc::clone(&geometry),
+                    Arc::clone(&clipboard),
+                    Arc::clone(&links),
+                ));
             }
             Err(e) => tracing::warn!(%target, "could not connect: {e}"),
         }
@@ -612,6 +617,7 @@ async fn daemon(
                                     link,
                                     Arc::clone(&geometry),
                                     Arc::clone(&clipboard),
+                                    Arc::clone(&links),
                                 ));
                             }
                             Err(e) => {
@@ -639,8 +645,13 @@ async fn daemon(
 }
 
 /// Receive motion from a peer and reproduce it on this machine.
-async fn receive_from(link: Arc<Link>, geometry: Geometry, clipboard: Clipboard) {
-    tokio::spawn(receive_reliable(Arc::clone(&link), geometry, clipboard));
+async fn receive_from(
+    link: Arc<Link>,
+    geometry: Geometry,
+    clipboard: Clipboard,
+    links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+) {
+    tokio::spawn(receive_reliable(Arc::clone(&link), geometry, clipboard, links));
     let peer = link.peer_id();
     let Ok(desktop) = seam_input::desktop() else {
         tracing::warn!(%peer, "cannot read this machine's displays, so incoming motion is ignored");
@@ -997,7 +1008,12 @@ fn log_event(frame: &seam_proto::Frame) {
 }
 
 /// Receive buttons, scroll and keystrokes, which travel reliably.
-async fn receive_reliable(link: Arc<Link>, geometry: Geometry, clipboard: Clipboard) {
+async fn receive_reliable(
+    link: Arc<Link>,
+    geometry: Geometry,
+    clipboard: Clipboard,
+    links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+) {
     let peer = link.peer_id();
     loop {
         match link.recv_reliable().await {
@@ -1045,7 +1061,26 @@ async fn receive_reliable(link: Arc<Link>, geometry: Geometry, clipboard: Clipbo
                         state.applied_generation = generation;
                         // Remember what we just wrote, so the poller does not see it as a
                         // local change and send it straight back.
-                        state.last_seen = Some(text);
+                        state.last_seen = Some(text.clone());
+                        drop(state);
+
+                        // Relay to every *other* peer. Machines connect in a star through
+                        // whichever one they dialled, so without this a copy on one leaf
+                        // reaches the centre and stops there — which is exactly what was
+                        // reported: only the machine in the middle ever shared anything.
+                        //
+                        // The generation is passed through unchanged rather than reissued,
+                        // so the update keeps its original identity and cannot echo back
+                        // around the star.
+                        let relay = seam_proto::Frame::ClipboardText { seq: 0, generation, text };
+                        for other in links.lock().await.iter() {
+                            if other.peer_id() == peer {
+                                continue;
+                            }
+                            if let Err(e) = other.send_reliable(&relay).await {
+                                tracing::warn!(peer = %other.peer_id(), "could not relay the clipboard: {e}");
+                            }
+                        }
                     }
                     Err(e) => tracing::warn!(%peer, "could not set the clipboard: {e}"),
                 }
