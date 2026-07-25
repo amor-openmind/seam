@@ -1101,7 +1101,7 @@ mod tap_behaviour {
         eprintln!("asked for {target:?}, cursor reads {after:?}");
         eprintln!(
             "{}",
-            if after.map(|p| p == target).unwrap_or(false) {
+            if after.is_ok_and(|p| p == target) {
                 "WARP WORKS: pinning is viable; if the cursor still moves, the pin is not running"
             } else {
                 "WARP IGNORED: warping cannot pin the cursor from this process"
