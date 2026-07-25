@@ -2,36 +2,34 @@
 <html lang="en"><head>
 
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>seam — fleet</title>
+<title>seam</title>
 <link rel="stylesheet" href="_ds/tokens.css">
 <style>
-.shell{max-width:1060px;margin:0 auto;padding:24px 24px 64px}
-header.top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px;gap:16px;flex-wrap:wrap}
+.shell{max-width:840px;margin:0 auto;padding:26px 24px 64px}
+header.top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:16px;gap:16px;flex-wrap:wrap}
 header.top h1{font:400 var(--text-3xl)/1.1 var(--font-display)}
 header.top h1 .stitch{color:var(--text-accent)}
 header.top .machine{font:400 var(--text-xs)/1.4 var(--font-mono);color:var(--text-secondary);text-align:right}
-/* Navigation — every screen reachable from every screen */
-nav.tabs{display:flex;gap:2px;margin-bottom:20px;border-bottom:1px solid var(--border-subtle);overflow-x:auto}
-nav.tabs a{padding:9px 13px;font:500 var(--text-sm)/1.2 var(--font-sans);color:var(--text-secondary);text-decoration:none;border-bottom:2px solid transparent;white-space:nowrap}
-nav.tabs a:hover{color:var(--text-primary);background:var(--surface-hover)}
-nav.tabs a[aria-current=page]{color:var(--text-link);border-bottom-color:var(--border-accent)}
-.grid{display:grid;grid-template-columns:1.6fr 1fr;gap:20px}
-@media (max-width:820px){.grid{grid-template-columns:1fr}}
-section.card{padding:20px}
-section.card h2{font:600 var(--text-md)/1.3 var(--font-sans);margin:2px 0 14px}
-/* Desk — any number of machines, laid out by the edge each sits on */
-.desk{background:var(--surface-sunken);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:22px;display:flex;flex-wrap:wrap;gap:16px;justify-content:center;align-items:center;min-height:150px}
-.screen{position:relative;border-radius:8px;border:1.5px solid var(--border-heavy);background:var(--surface-card);display:flex;flex-direction:column;justify-content:flex-end;padding:10px;width:200px;height:112px;transition:opacity .15s}
-.screen .name{font:500 var(--text-xs)/1.2 var(--font-sans)}
-.screen .size{font:400 10px/1.2 var(--font-mono);color:var(--text-tertiary)}
-.screen .edge{position:absolute;top:8px;left:10px;font:400 9px/1 var(--font-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--text-tertiary)}
-.screen.self{width:236px;height:126px;border-color:var(--ink-a40)}
+/* The desk is the whole page now: what a person came to see, at full size. */
+.desk{background:var(--surface-sunken);border:1px solid var(--border-subtle);border-radius:var(--radius-lg);padding:26px;display:flex;flex-wrap:wrap;gap:16px;justify-content:center;align-items:center;min-height:180px;margin-bottom:14px}
+.screen{position:relative;border-radius:9px;border:1.5px solid var(--border-heavy);background:var(--surface-card);display:flex;flex-direction:column;justify-content:flex-end;padding:12px;width:210px;height:120px;transition:opacity .15s,box-shadow .15s}
+.screen .name{font:500 var(--text-sm)/1.25 var(--font-sans)}
+.screen .size{font:400 var(--text-2xs)/1.3 var(--font-mono);color:var(--text-tertiary)}
+.screen .edge{position:absolute;top:9px;left:12px;font:400 9px/1 var(--font-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--text-tertiary)}
+.screen .off-badge{position:absolute;top:9px;right:12px;font:600 9px/1 var(--font-mono);letter-spacing:.08em;color:var(--text-tertiary);display:none}
+.screen.self{width:250px;height:134px;border-color:var(--ink-a40)}
 .screen.holding{border-color:var(--border-accent);background:var(--surface-selected);box-shadow:0 0 0 3px var(--indigo-100)}
-.screen.holding::after{content:"POINTER";position:absolute;top:8px;right:10px;font:600 9px/1 var(--font-mono);letter-spacing:.1em;color:var(--indigo-700)}
-.screen.off{opacity:.38}
-.desk-empty{color:var(--text-tertiary);font:400 var(--text-sm)/1.5 var(--font-sans);text-align:center;max-width:36ch}
-.peers{display:flex;flex-direction:column}
-.peer{display:flex;align-items:center;gap:12px;padding:12px 2px;border-top:1px dashed var(--border-line)}
+.screen.holding::after{content:"POINTER";position:absolute;top:9px;right:12px;font:600 9px/1 var(--font-mono);letter-spacing:.1em;color:var(--indigo-700)}
+.screen.off{opacity:.4}
+.screen.off .off-badge{display:block}
+.desk-empty{color:var(--text-tertiary);font:400 var(--text-sm)/1.6 var(--font-sans);text-align:center;max-width:38ch}
+.desk-empty a{color:var(--text-link)}
+.deskbar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:26px}
+.deskbar .hint{font:400 var(--text-xs)/1.55 var(--font-sans);color:var(--text-secondary);flex:1;min-width:16ch}
+/* Machines — one row each, with the only control most people ever touch. */
+h2.sec{font:600 var(--text-2xs)/1.2 var(--font-mono);letter-spacing:.12em;text-transform:uppercase;color:var(--text-tertiary);margin:0 0 8px}
+.peers{display:flex;flex-direction:column;margin-bottom:24px}
+.peer{display:flex;align-items:center;gap:13px;padding:13px 2px;border-top:1px dashed var(--border-line)}
 .peer:first-child{border-top:0}
 .peer .who{flex:1;min-width:0}
 .peer .who .n{font:500 var(--text-sm)/1.3 var(--font-sans)}
@@ -40,112 +38,71 @@ section.card h2{font:600 var(--text-md)/1.3 var(--font-sans);margin:2px 0 14px}
 .sw::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--surface-card);box-shadow:0 1px 2px var(--ink-a24)}
 .sw.on{background:var(--action-primary);border-color:var(--action-primary)}
 .sw.on::after{left:auto;right:2px}
-.xfer-now{display:flex;align-items:center;gap:12px;margin-top:14px;padding:12px 14px;border-radius:var(--radius-md);background:var(--surface-accent-soft);border:1px solid var(--indigo-100)}
-.xfer-now .spin{width:16px;height:16px;border-radius:50%;border:2px solid var(--indigo-100);border-top-color:var(--indigo-600);flex:none}
+.peers-empty{padding:14px 2px;color:var(--text-tertiary);font:400 var(--text-sm)/1.6 var(--font-sans)}
+.peers-empty a{color:var(--text-link)}
+/* Everything else lives in one quiet line, not four cards. */
+.status{display:flex;align-items:center;gap:10px;padding:13px 15px;border-radius:var(--radius-md);background:var(--surface-sunken);font:400 var(--text-sm)/1.5 var(--font-sans);color:var(--text-secondary);flex-wrap:wrap}
+.status .dot{width:8px;height:8px;border-radius:50%;background:var(--sage-500);flex:none}
+.status.bad{background:var(--feedback-danger-bg);border:1px solid var(--feedback-danger-line);color:var(--feedback-danger-fg)}
+.status.bad .dot{background:var(--rust-500)}
+.status .grow{flex:1;min-width:12ch}
+.status a{color:inherit;text-decoration:underline}
+.xfer-now{display:flex;align-items:center;gap:12px;margin-top:10px;padding:12px 15px;border-radius:var(--radius-md);background:var(--surface-accent-soft);border:1px solid var(--indigo-100)}
+.xfer-now .spin{width:15px;height:15px;border-radius:50%;border:2px solid var(--indigo-100);border-top-color:var(--indigo-600);flex:none}
 .xfer-now.busy .spin{animation:seam-spin .8s linear infinite}
 @keyframes seam-spin{to{transform:rotate(360deg)}}
 .xfer-now .xfer-what{font:600 var(--text-sm)/1.3 var(--font-sans);color:var(--indigo-800)}
 .xfer-now .xfer-detail{font:400 var(--text-2xs)/1.4 var(--font-mono);color:var(--indigo-700)}
-.health{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.health .item{border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:12px}
-.health .item .k{font:400 var(--text-2xs)/1.2 var(--font-mono);letter-spacing:.1em;text-transform:uppercase;color:var(--text-tertiary)}
-.health .item .v{margin-top:6px;font:500 var(--text-sm)/1.3 var(--font-sans)}
-.health .ok{color:var(--feedback-success-fg)}
-.health .bad{color:var(--feedback-danger-fg)}
-.peers-empty{padding:16px 2px;color:var(--text-tertiary);font:400 var(--text-sm)/1.5 var(--font-sans)}
-footer.bar{margin-top:22px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--text-tertiary);font:400 var(--text-xs)/1.4 var(--font-mono)}
-@media (max-width:560px){.shell{padding:18px 14px 48px}header.top h1{font-size:var(--text-2xl)}.screen,.screen.self{width:100%;height:96px}}
+@media (max-width:560px){.shell{padding:18px 14px 48px}header.top h1{font-size:var(--text-2xl)}.screen,.screen.self{width:100%;height:98px}}
 </style></head><body>
 <div class="shell">
   <header class="top">
     <h1>seam<span class="stitch">.</span></h1>
     <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
-      <div class="machine">Mac-mini · 8c1695ce · <b>shares input</b><br>v0.3.8 · macos/aarch64</div>
+      <div class="machine">Mac-mini · 8c1695ce · <b>shares input</b><br>v0.5.2 · macos/aarch64</div>
       <button class="btn ghost" data-action="quit" style="padding:4px 10px">Quit seam</button>
     </div>
   </header>
 
-  <nav class="tabs" aria-label="Sections">
-    <a href="/" aria-current="page">Fleet</a>
-    <a href="/settings.html">Settings</a>
-    <a href="/pairing.html">Pairing</a>
-    <a href="/transfers.html">Transfers</a>
-    <a href="/doctor.html">Doctor</a>
-    <a href="/onboarding.html">First run</a>
-    <a href="/update.html">Update</a>
-  </nav>
-
-  <div class="grid">
-    <section class="card" aria-label="Desk layout">
-      <h2>Desk <span class="label" style="margin-left:8px">live · detected, never configured</span></h2>
-      <div class="desk">
-        <!-- One machine. Repeated per connected machine; this machine carries .self. -->
-        <div class="screen self holding" data-machine role="img">
-          <span class="edge">this machine</span>
-          <div class="name">Mac-mini</div><div class="size">2560 × 1080 · 8c1695ce</div>
-        </div>
-        <div class="screen" data-machine role="img">
-          <span class="edge">left</span>
-          <div class="name">AMorIMac</div><div class="size">2048 × 1152 · d6be3828</div>
-        </div>
-        <div class="screen" data-machine role="img">
-          <span class="edge">bottom</span>
-          <div class="name">om-amorabbi23</div><div class="size">1536 × 960 · e59a43b8</div>
-        </div>
-        <p class="desk-empty">Only this machine so far. Start seam elsewhere — paired machines connect on their own.</p>
-      </div>
-      <p style="margin-top:12px;font:400 var(--text-xs)/1.55 var(--font-sans);color:var(--text-secondary)">Push the pointer off a shared edge to move machines. Order comes from pairing, geometry from each machine itself.</p>
-      <button class="btn" data-action="release" style="margin-top:10px">Release input to this machine</button>
-
-      <div class="xfer-now busy" role="status" aria-live="polite">
-        <span class="spin"></span>
-        <div><div class="xfer-what">sending image</div><div class="xfer-detail">2048 x 1152</div></div>
-      </div>
-    </section>
-
-    <section class="card" aria-label="Machines">
-      <h2>Machines <span class="label" style="margin-left:8px">switch off to skip one</span></h2>
-      <div class="peers">
-        <!-- One row. Repeated per connected machine. -->
-        <div class="peer" data-peer-row>
-          <span class="pill connected"><span class="dot"></span>connected</span>
-          <div class="who"><div class="n">AMorIMac</div><div class="id">d6be3828 · receives input · left edge</div></div>
-          <span class="sw on" role="switch" aria-checked="true" aria-label="Share with this machine"></span>
-        </div>
-        <div class="peer" data-peer-row>
-          <span class="pill holding"><span class="dot"></span>holds pointer</span>
-          <div class="who"><div class="n">om-amorabbi23</div><div class="id">e59a43b8 · receives input · bottom edge</div></div>
-          <span class="sw on" role="switch" aria-checked="true" aria-label="Share with this machine"></span>
-        </div>
-      </div>
-      <div class="peers-empty">No machines connected yet. Start seam on another machine — paired machines find each other on their own.</div>
-      <a class="btn" href="/pairing.html" style="margin-top:14px;display:block;text-align:center;text-decoration:none">Pair a new machine…</a>
-    </section>
-
-    <section class="card" aria-label="Health">
-      <h2>Health <a href="/doctor.html" style="font:400 var(--text-xs)/1 var(--font-sans);margin-left:8px;color:var(--text-link)">full report</a></h2>
-      <div class="health">
-        <div class="item"><div class="k">capture</div><div class="v ok">● granted</div></div>
-        <div class="item"><div class="k">withhold input</div><div class="v ok">● granted</div></div>
-        <div class="item"><div class="k">cursor control</div><div class="v ok">● window server granted</div></div>
-        <div class="item"><div class="k">input tap</div><div class="v ok">● alive</div></div>
-      </div>
-    </section>
-
-    <section class="card" aria-label="Sharing">
-      <h2>Sharing <span class="label" style="margin-left:8px">saved on this machine</span></h2>
-      <div class="peers">
-        <div class="peer"><div class="who"><div class="n">Text</div></div><span class="sw on" data-share="text" role="switch" aria-checked="true" aria-label="Share clipboard text"></span></div>
-        <div class="peer"><div class="who"><div class="n">Images</div></div><span class="sw on" data-share="images" role="switch" aria-checked="true" aria-label="Share clipboard images"></span></div>
-        <div class="peer"><div class="who"><div class="n">Files &amp; folders</div></div><span class="sw on" data-share="files" role="switch" aria-checked="true" aria-label="Share clipboard files"></span></div>
-        <div class="peer"><div class="who"><div class="n">Start when I sign in</div></div><span class="sw" data-startup role="switch" aria-checked="false" aria-label="Start seam at login"></span></div>
-      </div>
-    </section>
+  <div class="desk">
+    <div class="screen self holding" data-machine role="img">
+      <span class="edge">this machine</span><span class="off-badge">OFF</span>
+      <div class="name">Mac-mini</div><div class="size">8c1695ce</div>
+    </div>
+    <div class="screen" data-machine role="img">
+      <span class="edge">left</span><span class="off-badge">OFF</span>
+      <div class="name">AMorIMac</div><div class="size">d6be3828</div>
+    </div>
+    <p class="desk-empty">Only this machine so far. <a href="/join.html">Add a machine</a> — it takes one line.</p>
   </div>
 
-  <footer class="bar"><span>encrypted · QUIC · zero-config</span><span class="log-path">log: INFO</span></footer>
+  <div class="deskbar">
+    <span class="hint">Push the pointer off a shared edge to move machines. Screens and layout are detected, never configured.</span>
+    <button class="btn" data-action="release">Bring input back here</button>
+  </div>
+
+  <div class="xfer-now busy" role="status" aria-live="polite">
+    <span class="spin"></span>
+    <div><div class="xfer-what">sending image</div><div class="xfer-detail">2048 x 1152</div></div>
+  </div>
+
+  <h2 class="sec">Machines</h2>
+  <div class="peers">
+    <div class="peer" data-peer-row>
+      <span class="pill connected"><span class="dot"></span>connected</span>
+      <div class="who"><div class="n">AMorIMac</div><div class="id">d6be3828 · left edge</div></div>
+      <span class="sw on" role="switch" aria-checked="true" aria-label="Share with this machine"></span>
+    </div>
+  </div>
+  <p class="peers-empty">No other machines yet. <a href="/join.html">Add one</a> — paired machines find each other and connect on their own.</p>
+
+  <div class="status" data-health-line>
+    <span class="dot"></span>
+    <span class="grow" data-health-text>Everything is working on this machine.</span>
+    <a href="/doctor.html">Details</a>
+  </div>
 </div>
-<script src="_ds/bind.js"></script>
 <script src="_ds/nav.js"></script>
+<script src="_ds/bind.js"></script>
 <script src="_ds/quit.js"></script>
 </body></html>

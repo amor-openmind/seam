@@ -1,35 +1,37 @@
-// seam — the section navigation, authored here so every page shows the same one.
+// seam — the section navigation.
 //
-// The markup and styles below are the design's, kept in a single place rather than copied
-// into a dozen pages where they would drift apart. A page that already carries its own nav
-// keeps it untouched.
+// Three sections, not nine. The app had grown a tab per feature, which is how a tool for
+// one job ends up looking like an admin console: a person opening seam wants to see their
+// machines, occasionally add one, and rarely change something. Everything else — doctor,
+// first run, update, roadmap — is consulted when something is wrong, so it belongs behind
+// one door rather than four across the top.
 (function () {
   "use strict";
 
-  // Order is the order a person meets them: the fleet first, then the two things they
-  // came to do (add a machine, pair it), then the things they consult.
   var SECTIONS = [
-    ["/", "Fleet"],
+    ["/", "Machines"],
     ["/join.html", "Add a machine"],
-    ["/pairing.html", "Pairing"],
-    ["/settings.html", "Settings"],
-    ["/transfers.html", "Clipboard"],
-    ["/doctor.html", "Doctor"],
-    ["/update.html", "Update"],
-    ["/onboarding.html", "First run"],
-    ["/ideas.html", "Roadmap"]
+    ["/settings.html", "Settings"]
   ];
 
-  var CSS = "nav.tabs{display:flex;gap:2px;margin-bottom:20px;border-bottom:1px solid var(--border-subtle);overflow-x:auto}" +
-    "nav.tabs a{padding:9px 13px;font:500 var(--text-sm)/1.2 var(--font-sans);color:var(--text-secondary);text-decoration:none;border-bottom:2px solid transparent;white-space:nowrap}" +
+  // Reached from Settings and from the health card, not from the top bar.
+  var TUCKED = ["/doctor.html", "/pairing.html", "/transfers.html", "/update.html", "/onboarding.html", "/ideas.html"];
+
+  var CSS = "nav.tabs{display:flex;gap:2px;margin-bottom:22px;border-bottom:1px solid var(--border-subtle);overflow-x:auto}" +
+    "nav.tabs a{padding:10px 14px;font:500 var(--text-sm)/1.2 var(--font-sans);color:var(--text-secondary);text-decoration:none;border-bottom:2px solid transparent;white-space:nowrap}" +
     "nav.tabs a:hover{color:var(--text-primary);background:var(--surface-hover)}" +
-    "nav.tabs a[aria-current=page]{color:var(--text-link);border-bottom-color:var(--border-accent)}";
+    "nav.tabs a[aria-current=page]{color:var(--text-link);border-bottom-color:var(--border-accent)}" +
+    "nav.tabs .back{margin-right:6px;color:var(--text-tertiary)}";
 
-  function here() {
-    return location.pathname === "" ? "/" : location.pathname;
-  }
+  function here() { return location.pathname === "" ? "/" : location.pathname; }
 
-  function build(shell) {
+  function render() {
+    var shell = document.querySelector(".shell");
+    if (!shell) return;
+
+    var existing = shell.querySelector("nav.tabs");
+    if (existing) existing.remove();
+
     var style = document.createElement("style");
     style.textContent = CSS;
     document.head.appendChild(style);
@@ -37,34 +39,29 @@
     var nav = document.createElement("nav");
     nav.className = "tabs";
     nav.setAttribute("aria-label", "Sections");
+
+    // A tucked-away page shows a way back rather than pretending to be a top-level
+    // destination — otherwise the only route home is the browser's back button.
+    if (TUCKED.indexOf(here()) !== -1) {
+      var back = document.createElement("a");
+      back.className = "back";
+      back.setAttribute("href", "/");
+      back.textContent = "← Machines";
+      nav.appendChild(back);
+    }
+
     SECTIONS.forEach(function (s) {
       var a = document.createElement("a");
       a.setAttribute("href", s[0]);
       a.textContent = s[1];
+      if (s[0] === here()) a.setAttribute("aria-current", "page");
       nav.appendChild(a);
     });
+
     var header = shell.querySelector("header.top");
     if (header && header.nextSibling) shell.insertBefore(nav, header.nextSibling);
     else if (header) shell.appendChild(nav);
     else shell.insertBefore(nav, shell.firstChild);
-    return nav;
-  }
-
-  function render() {
-    var shell = document.querySelector(".shell");
-    if (!shell) return;
-
-    // A page carrying its own nav from an earlier design is replaced, so the set of
-    // sections is defined in exactly one place and cannot fall behind.
-    var existing = shell.querySelector("nav.tabs");
-    if (existing) existing.remove();
-    var nav = build(shell);
-
-    var links = nav.querySelectorAll("a");
-    for (var i = 0; i < links.length; i++) {
-      if (links[i].getAttribute("href") === here()) links[i].setAttribute("aria-current", "page");
-      else links[i].removeAttribute("aria-current");
-    }
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", render);

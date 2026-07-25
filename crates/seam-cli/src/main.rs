@@ -1314,6 +1314,7 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/_ds/nav.js", include_str!("../ui/_ds/nav.js"), "text/javascript; charset=utf-8"),
     ("/_ds/quit.js", include_str!("../ui/_ds/quit.js"), "text/javascript; charset=utf-8"),
     ("/join.sh", include_str!("../../../scripts/join.sh"), "text/x-shellscript; charset=utf-8"),
+    ("/join.ps1", include_str!("../../../scripts/join.ps1"), "text/plain; charset=utf-8"),
     (
         "/_ds/page-settings.js",
         include_str!("../ui/_ds/page-settings.js"),
@@ -1593,6 +1594,37 @@ fn start_update_watch() {
     });
 }
 
+/// This machine's address on the network, as another machine would reach it.
+///
+/// Asked of the routing table via a connectionless UDP socket — no packet is sent. The
+/// join command previously used the browser's view, which on a loopback page is
+/// `127.0.0.1`: meaningless on the machine being added, and the cause of a join command
+/// that could never work.
+fn lan_address() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
+}
+
+/// Was this the first machine seam was installed on?
+///
+/// Decided once, on first run, by whether anything had been paired yet — then written
+/// down. A machine that starts alone is the one a person is sitting at, and every machine
+/// added afterwards joins it; deriving this fresh each time would let it flip whenever
+/// connections raced.
+fn first_machine(dir: &std::path::Path) -> bool {
+    if dir.join("first-machine").exists() {
+        return true;
+    }
+    if dir.join("joined").exists() {
+        return false;
+    }
+    let alone = store::pairing_order(dir).is_empty();
+    let _ = std::fs::write(dir.join(if alone { "first-machine" } else { "joined" }), "");
+    alone
+}
+
 /// The licence, as the page sees it: who it is for, and when it stops.
 fn licence_json(dir: &std::path::Path) -> String {
     licence::stored(dir).map_or_else(
@@ -1671,7 +1703,18 @@ async fn ui_state_json(
 
     // This machine's own capability, decided by what the build can actually do rather
     // than by any negotiation. Capture exists on macOS today; Windows replays only.
-    let self_role = if cfg!(target_os = "macos") { "shares input" } else { "receives input" };
+    // The first machine installed is the one whose keyboard and mouse get shared: it is
+    // where a person starts, and every machine added afterwards joins it. Recorded on
+    // first run rather than negotiated, so it cannot flip when connections race.
+    //
+    // Capability still constrains it: a machine that cannot capture says so regardless of
+    // what it was designated, because a role promising something this build cannot do
+    // would be a label that lies.
+    let self_role = if cfg!(target_os = "macos") {
+        if first_machine(dir) { "shares input" } else { "shares input, joined later" }
+    } else {
+        "receives input"
+    };
 
     let shares = UI_SHARES.lock().map_or((true, true, true), |s| *s);
 
@@ -1702,7 +1745,7 @@ async fn ui_state_json(
     }
 
     format!(
-        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"seamPort":{},"focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"licence":{},"update":{},"activity":[{}],"peers":[{peers}],"health":[{health}]}}"#,
+        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"seamPort":{},"lan":"{}","focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"licence":{},"update":{},"activity":[{}],"peers":[{peers}],"health":[{health}]}}"#,
         env!("CARGO_PKG_VERSION"),
         name.replace('"', "'"),
         std::env::consts::OS,
@@ -1716,6 +1759,7 @@ async fn ui_state_json(
         self_role,
         ui_port,
         seam_port,
+        lan_address().unwrap_or_default(),
         UI_TRANSFER.lock().ok().and_then(|slot| slot.clone()).map_or_else(
             || "null".to_owned(),
             |(what, detail)| format!(r#"{{"what":"{what}","detail":"{detail}"}}"#),
