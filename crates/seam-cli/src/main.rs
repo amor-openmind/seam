@@ -735,7 +735,7 @@ async fn daemon(
     #[cfg(target_os = "windows")]
     seam_input::windows::reveal_cursor();
 
-    start_ui_server(dir.to_path_buf(), name.clone(), identity.peer_id(), Arc::clone(&links));
+    start_ui_server(dir.to_path_buf(), name.clone(), identity.peer_id(), port, Arc::clone(&links));
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry), dir.to_path_buf());
 
     start_clipboard_sync(Arc::clone(&links), Arc::clone(&clipboard));
@@ -967,15 +967,27 @@ async fn apply_clipboard_image(
 
 /// Switch a peer on or off from the UI, matched by its short id (what the page shows).
 /// Answer one fleet-page request. Split out of the accept loop for length.
+/// What a request handler needs to know about this machine. Grouped rather than passed
+/// as eight parameters: the count was a lint, but the real point is that these travel
+/// together and always will.
+struct Serving<'a> {
+    /// The loopback port the page itself is on.
+    ui_port: u16,
+    /// The port peers connect to — what a joining machine needs, and not the same number.
+    seam_port: u16,
+    name: &'a str,
+    id: seam_proto::PeerId,
+    links: &'a Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    ui_port_note: &'a std::path::Path,
+}
+
 async fn route(
     request: &str,
     path: &str,
-    port: u16,
-    name: &str,
-    id: seam_proto::PeerId,
-    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
-    ui_port_note: &std::path::Path,
+    ctx: &Serving<'_>,
 ) -> (&'static str, &'static str, String) {
+    let (port, seam_port, name, id, links, ui_port_note) =
+        (ctx.ui_port, ctx.seam_port, ctx.name, ctx.id, ctx.links, ctx.ui_port_note);
     let method = request.split_whitespace().next().unwrap_or("GET");
 
     // The origin gate lives HERE, ahead of every branch, so no future route can be added
@@ -1026,8 +1038,22 @@ async fn route(
     } else if method == "POST" && path == "/action/release" {
         UI_RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
         ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+    } else if path == "/join" {
+        // The only thing a joining machine trusts this server for: which version to
+        // fetch. The bytes come from GitHub over TLS and are checked against that
+        // release's own published checksums — a binary served from a machine on the LAN
+        // would be unauthenticated and unverifiable.
+        (
+            "200 OK",
+            "application/json",
+            format!(
+                r#"{{"version":"{}","repo":"amor-openmind/seam"}}"#,
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
     } else if path == "/state" {
-        ("200 OK", "application/json", ui_state_json(name, id, port, ui_port_note.parent().unwrap_or(ui_port_note), links).await)
+        ("200 OK", "application/json", ui_state_json(name, id, port, seam_port, ui_port_note.parent().unwrap_or(ui_port_note), links)
+            .await)
     } else if let Some((_, page, ctype)) =
         UI_PAGES.iter().find(|(route, _, _)| *route == path)
     {
@@ -1207,6 +1233,12 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/doctor.html", include_str!("../ui/doctor.html"), "text/html; charset=utf-8"),
     ("/update.html", include_str!("../ui/update.html"), "text/html; charset=utf-8"),
     ("/ideas.html", include_str!("../ui/ideas.html"), "text/html; charset=utf-8"),
+    ("/join.html", include_str!("../ui/join.html"), "text/html; charset=utf-8"),
+    (
+        "/_ds/page-join.js",
+        include_str!("../ui/_ds/page-join.js"),
+        "text/javascript; charset=utf-8",
+    ),
     (
         "/notifications.html",
         include_str!("../ui/notifications.html"),
@@ -1217,6 +1249,7 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/_ds/shared.js", include_str!("../ui/_ds/shared.js"), "text/javascript; charset=utf-8"),
     ("/_ds/nav.js", include_str!("../ui/_ds/nav.js"), "text/javascript; charset=utf-8"),
     ("/_ds/quit.js", include_str!("../ui/_ds/quit.js"), "text/javascript; charset=utf-8"),
+    ("/join.sh", include_str!("../../../scripts/join.sh"), "text/x-shellscript; charset=utf-8"),
     (
         "/_ds/page-settings.js",
         include_str!("../ui/_ds/page-settings.js"),
@@ -1243,6 +1276,7 @@ fn start_ui_server(
     dir: std::path::PathBuf,
     name: String,
     id: seam_proto::PeerId,
+    seam_port: u16,
     links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
 ) {
     tokio::spawn(async move {
@@ -1291,7 +1325,19 @@ fn start_ui_server(
                 let request = String::from_utf8_lossy(&buf);
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
                 let (status, ctype, body) =
-                    route(&request, path, port, &name, id, &links, &ui_port_note).await;
+                    route(
+                        &request,
+                        path,
+                        &Serving {
+                            ui_port: port,
+                            seam_port,
+                            name: &name,
+                            id,
+                            links: &links,
+                            ui_port_note: &ui_port_note,
+                        },
+                    )
+                    .await;
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
                      Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
@@ -1440,6 +1486,7 @@ async fn ui_state_json(
     name: &str,
     id: seam_proto::PeerId,
     ui_port: u16,
+    seam_port: u16,
     dir: &std::path::Path,
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
 ) -> String {
@@ -1520,7 +1567,7 @@ async fn ui_state_json(
     }
 
     format!(
-        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"activity":[{}],"peers":[{peers}],"health":[{health}]}}"#,
+        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"seamPort":{},"focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"activity":[{}],"peers":[{peers}],"health":[{health}]}}"#,
         env!("CARGO_PKG_VERSION"),
         name.replace('"', "'"),
         std::env::consts::OS,
@@ -1533,6 +1580,7 @@ async fn ui_state_json(
         // which is why two idle machines both said "server".
         self_role,
         ui_port,
+        seam_port,
         UI_TRANSFER.lock().ok().and_then(|slot| slot.clone()).map_or_else(
             || "null".to_owned(),
             |(what, detail)| format!(r#"{{"what":"{what}","detail":"{detail}"}}"#),
