@@ -87,11 +87,40 @@ pub(crate) fn verify(text: &str) -> Result<Licence> {
     })
 }
 
-/// Where the activated licence is kept: beside the identity, so it travels with a
-/// portable install and is removed by removing the state directory.
+/// Where a licence lives: one place per machine, not per copy of the binary.
+///
+/// This was originally kept beside the identity so it would travel with a portable
+/// install — which meant a binary in `Downloads` and the same binary in `~/.seam` looked
+/// in different folders and each demanded its own activation. A licence is a fact about
+/// the machine, so it belongs in the platform's application-data directory whatever
+/// folder seam is run from. `SEAM_HOME` still overrides everything, for testing.
+fn licence_home() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("SEAM_HOME")
+        && !home.is_empty()
+    {
+        return Some(std::path::PathBuf::from(home));
+    }
+    let dirs = directories::ProjectDirs::from("dev", "seam", "seam")?;
+    let dir = dirs.data_dir().to_path_buf();
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// The activated licence for this machine, wherever seam was started from.
 pub(crate) fn stored(dir: &std::path::Path) -> Option<Licence> {
-    let text = std::fs::read_to_string(dir.join("licence")).ok()?;
-    verify(&text).ok().filter(Licence::is_current)
+    // The machine-wide location first, then the state directory — so a licence activated
+    // by an older build, which wrote it beside the identity, is still honoured instead of
+    // silently asking again after an update.
+    let places = [licence_home(), Some(dir.to_path_buf())];
+    for place in places.into_iter().flatten() {
+        if let Ok(text) = std::fs::read_to_string(place.join("licence"))
+            && let Ok(licence) = verify(&text)
+            && licence.is_current()
+        {
+            return Some(licence);
+        }
+    }
+    None
 }
 
 /// Store a licence after checking it, so an invalid one is refused at the moment it is
@@ -100,6 +129,12 @@ pub(crate) fn activate(dir: &std::path::Path, text: &str) -> Result<Licence> {
     let licence = verify(text)?;
     if !licence.is_current() {
         bail!("this licence has expired");
+    }
+    // Written machine-wide, so every copy of seam on this machine finds it. The state
+    // directory gets it too: a portable install carried to another machine then has the
+    // licence with it, which is what portability was for.
+    if let Some(home) = licence_home() {
+        std::fs::write(home.join("licence"), text.trim())?;
     }
     std::fs::write(dir.join("licence"), text.trim())?;
     Ok(licence)
