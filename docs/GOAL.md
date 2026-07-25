@@ -527,6 +527,33 @@ them), transfers (what is actually moving, honest empty state), settings (persis
 values). Still carrying authored sample states, and therefore still to bind: pairing,
 chrome, notifications, onboarding, update.
 
+## 12e. Why clients cannot see each other — the star, stated plainly
+
+Observed on the real fleet: the Mac mini lists both Windows machines; each Windows machine
+lists only the Mac mini. That is not a bug in the UI — it is the topology, and it was never
+made explicit.
+
+**Pairing is pairwise.** The iMac and the laptop were each paired with the Mac mini and
+never with each other, so they have no reason to trust or dial one another. Auto-discovery
+only dials machines this machine already trusts, deliberately: dialling strangers found on
+a network is how a KVM becomes an attack surface.
+
+So the fleet is a **star**, and each leaf genuinely knows only the centre. Two consequences
+the UI currently gets wrong:
+
+1. A leaf cannot show the fleet, because nobody tells it. **Fix**: the centre should send
+   its peer list, so leaves can *display* the fleet without connecting to it. This needs a
+   frame (kind `0x03`, reserved) carrying peer id, name, edge and capability. Display only
+   — never a basis for trust.
+2. Status changes are not reactive on a leaf for the same reason: it learns only what
+   arrives on its own link. The same frame, pushed on change, fixes both.
+
+**The alternative — a full mesh — is a security decision, not a convenience.** It would
+mean either pairing every pair by hand (n² SAS confirmations) or transitive trust ("the
+Mac mini vouches for the laptop"), which quietly turns one compromised machine into a
+compromised fleet. The star with pushed fleet state gives the right display without that
+trade.
+
 ## 12b. Review discipline — added after a self-inflicted vulnerability
 
 A line-by-line review of the newest code found that the fleet-page server validated
