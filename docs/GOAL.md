@@ -477,6 +477,28 @@ than another cursor warp.
 
 ---
 
+## 12b. Review discipline — added after a self-inflicted vulnerability
+
+A line-by-line review of the newest code found that the fleet-page server validated
+nothing about who was calling it. Any website the user visited could
+`fetch('http://127.0.0.1:PORT/action/quit', {method:'POST', mode:'no-cors'})` — a simple
+POST needs no preflight, so it lands — and kill the daemon, disable peers or release
+input; DNS rebinding could also read `/state` (machine names, ids, LAN addresses).
+Fixed in v0.3.5 with Origin and Host validation, four tests pinning the attack, and a
+live proof that a hostile POST is refused while the daemon keeps running.
+
+**The lesson, recorded so it becomes a rule rather than an anecdote**: seam's threat
+model was written entirely around the *network* — encrypted QUIC, certificate identity,
+SAS pairing — and the moment a local HTTP surface appeared, none of that reasoning
+applied to it. Every new surface gets its own threat model, not the project's.
+
+**Standing review checklist for any new surface**
+1. Who can reach it? (Loopback is not a permission — browsers reach loopback.)
+2. What proves the caller is who it claims? (Origin/Host, tokens, OS credentials.)
+3. What does it leak to a caller that cannot read the response? (Timing, side effects.)
+4. What happens if the process dies mid-operation? (Concealed cursors, held input.)
+5. Is the failure visible in the log, or silent?
+
 ## 12a. Design governance — permanent rule for every feature and config
 
 **Claude Design is the source of truth for everything visible, for the life of this

@@ -77,8 +77,9 @@ enum Command {
     Ui,
 
     Run {
-        /// Port to listen on. Chosen by the OS unless given — you should not need this.
-        #[arg(long, default_value_t = 0)]
+        /// Port to listen on. The default is stable on purpose: a machine that picks a
+        /// random port each start cannot be dialled by a peer that remembers the old one.
+        #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
         /// Windows: stay non-elevated instead of prompting UAC once at start. Input
         /// injection then dies whenever an elevated window has focus (UIPI).
@@ -165,7 +166,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     // No arguments is the double-click case: run, and show the fleet page.
     let Some(command) = cli.command else {
-        return run_daemon(&dir, identity, 0, Vec::new(), false, true).await;
+        return run_daemon(&dir, identity, DEFAULT_PORT, Vec::new(), false, true).await;
     };
     match command {
         Command::Doctor => doctor(&dir, &identity),
@@ -722,6 +723,8 @@ async fn daemon(
         );
     }
 
+    start_auto_dial(&discovery, &store, &links, &geometry, &clipboard, &endpoint);
+
     // Crash recovery: a previous seam that died while the cursor was concealed leaves
     // this machine with an invisible cursor. Restoring is free when nothing was hidden.
     #[cfg(target_os = "windows")]
@@ -969,6 +972,13 @@ async fn apply_clipboard_files(
 
 // ---------------------------------------------------------------- ui
 
+/// The port seam listens on unless told otherwise.
+///
+/// Stable rather than OS-assigned. A random port means a peer that was told an address
+/// once can never find this machine again, and discovery becomes the only way in — so any
+/// hiccup there looks like seam being broken. Fixed by default, overridable.
+const DEFAULT_PORT: u16 = 24810;
+
 /// Peers this machine dialled — it is their client; the ones that dialled us are ours.
 static UI_DIALLED: std::sync::Mutex<Vec<seam_proto::PeerId>> = std::sync::Mutex::new(Vec::new());
 
@@ -1047,12 +1057,44 @@ fn start_ui_server(
             let ui_port_note = ui_port_note.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let n = socket.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]);
+                // Read until the headers end, not just once: a single read is not
+                // guaranteed to contain them, and the Origin check below is only sound
+                // if the header is actually present in what was parsed.
+                let mut buf = Vec::with_capacity(2048);
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let Ok(n) = socket.read(&mut chunk).await else { return };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16 * 1024 {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
-
                 let method = request.split_whitespace().next().unwrap_or("GET");
+
+                // A browser on any website can POST to a loopback port — a simple POST
+                // needs no preflight, so `fetch('http://127.0.0.1:PORT/action/quit')`
+                // from a random page would have killed this daemon, disabled peers or
+                // released input. Two checks close that:
+                //
+                //   Origin: browsers always send it on a cross-origin POST. Anything
+                //           other than our own origin is refused.
+                //   Host:   defeats DNS rebinding, where an attacker's name resolves to
+                //           127.0.0.1 and the request looks local but is not.
+                //
+                // curl and other non-browser callers send no Origin and are allowed;
+                // they are already running as the user, so they gain nothing.
+                if !request_is_local(&request, port) {
+                    let refusal = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\
+                                   Connection: close\r\n\r\n";
+                    let _ = socket.write_all(refusal.as_bytes()).await;
+                    return;
+                }
+
                 let (status, ctype, body) = if method == "POST" && path == "/action/quit" {
                     // Respond first, then die: the page needs the reply to close its tab.
                     tracing::info!("quit requested from the fleet page");
@@ -1093,6 +1135,73 @@ fn start_ui_server(
     });
 }
 
+/// Is this request really from the fleet page on this machine?
+///
+/// A browser on any website can POST to a loopback port — a simple POST needs no
+/// preflight, so `fetch('http://127.0.0.1:PORT/action/quit')` from a random page would
+/// have killed this daemon, disabled peers or released input. Two checks close that:
+///
+/// - **Origin**: browsers always send it on a cross-origin POST. Anything but our own
+///   origin is refused.
+/// - **Host**: defeats DNS rebinding, where an attacker's name resolves to 127.0.0.1 so
+///   the request looks local but the page driving it is not.
+///
+/// Non-browser callers (curl, scripts) send no Origin and are allowed: they already run
+/// as the user and gain nothing they did not have.
+fn request_is_local(request: &str, port: u16) -> bool {
+    let header = |name: &str| -> Option<&str> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    };
+    let origin_ok = header("origin").is_none_or(|origin| {
+        origin == format!("http://127.0.0.1:{port}") || origin == format!("http://localhost:{port}")
+    });
+    let host_ok = header("host")
+        .is_none_or(|host| host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}"));
+    origin_ok && host_ok
+}
+
+#[cfg(test)]
+mod ui_origin {
+    use super::request_is_local;
+
+    fn get(headers: &str) -> String {
+        format!("POST /action/quit HTTP/1.1\r\n{headers}\r\n\r\n")
+    }
+
+    #[test]
+    fn a_page_on_another_site_cannot_drive_this_daemon() {
+        // The attack: any website the user visits POSTs to the loopback port. A simple
+        // POST is not preflighted, so it lands unless the origin is checked.
+        assert!(!request_is_local(
+            &get("Host: 127.0.0.1:5000\r\nOrigin: https://evil.example"),
+            5000
+        ));
+    }
+
+    #[test]
+    fn dns_rebinding_cannot_dress_up_as_local() {
+        assert!(!request_is_local(&get("Host: evil.example"), 5000));
+    }
+
+    #[test]
+    fn the_fleet_page_itself_is_allowed() {
+        assert!(request_is_local(
+            &get("Host: 127.0.0.1:5000\r\nOrigin: http://127.0.0.1:5000"),
+            5000
+        ));
+        assert!(request_is_local(&get("Host: localhost:5000"), 5000));
+    }
+
+    #[test]
+    fn a_non_browser_caller_is_allowed() {
+        // curl and scripts send no Origin; they already run as the user.
+        assert!(request_is_local(&get("Host: 127.0.0.1:5000"), 5000));
+    }
+}
+
 /// The live state the UI binds to. Assembled by hand — ten fields do not justify serde.
 async fn ui_state_json(
     name: &str,
@@ -1109,6 +1218,7 @@ async fn ui_state_json(
         .map_or_else(|| "local".to_owned(), |peer| peer.to_string());
 
     let mut peers = String::new();
+    let mut accepted_any = false;
     for link in links.lock().await.iter() {
         if !peers.is_empty() {
             peers.push(',');
@@ -1125,7 +1235,12 @@ async fn ui_state_json(
         // accepted the connection is the server for that pair.
         let we_dialled =
             UI_DIALLED.lock().is_ok_and(|dialled| dialled.contains(&peer));
+        // From our side: if we dialled them, they accepted, so THEY are the server and
+        // we are their client — and vice versa.
         let role = if we_dialled { "server" } else { "client" };
+        if !we_dialled {
+            accepted_any = true;
+        }
         let enabled = UI_DISABLED.lock().is_ok_and(|off| !off.contains(&peer));
         let _ = write!(
             peers,
@@ -1133,6 +1248,16 @@ async fn ui_state_json(
             link.remote_address()
         );
     }
+
+    // No peers at all is neither role. Saying "server" with nothing connected is a
+    // claim about a relationship that does not exist.
+    let self_role = if peers.is_empty() {
+        "standalone"
+    } else if accepted_any {
+        "server"
+    } else {
+        "client"
+    };
 
     let mut health = String::new();
     let mut push_health = |ok: bool, text: &str| {
@@ -1166,9 +1291,13 @@ async fn ui_state_json(
         name.replace('"', "'"),
         std::env::consts::OS,
         std::env::consts::ARCH,
-        // This machine is a server to everyone that dialled it, and a client of anyone
-        // it dialled. Both at once is normal in a star, so name the dominant role.
-        if UI_DIALLED.lock().is_ok_and(|dialled| dialled.is_empty()) { "server" } else { "client" },
+        // Role is per-pair and derived: the machine that ACCEPTED a connection is the
+        // server of that pair. This machine is therefore a server whenever at least one
+        // peer dialled it — i.e. some connected peer is not in the dialled list. Reading
+        // the empty dialled list as "server" was backwards: it made a machine that had
+        // dialled nothing (because nothing was connected at all) claim to be a server,
+        // which is why two idle machines both said "server".
+        self_role,
         ui_port,
     )
 }
@@ -1523,6 +1652,70 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
             share_with_all(&links, &frame, "image").await;
         }
     });
+}
+
+/// Dial every already-paired machine discovery finds.
+///
+/// Split out of `daemon` for length. Advertising without dialling meant two daemons could
+/// see each other and sit there — which is exactly what "no machines connected yet" on
+/// both screens looked like. Only already-trusted peers are dialled, and `register_link`
+/// drops any duplicate, so a peer that is also dialling us costs one redundant
+/// connection, not a loop.
+fn start_auto_dial(
+    discovery: &Discovery,
+    store: &Arc<seam_transport::TrustStore>,
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    geometry: &Geometry,
+    clipboard: &Clipboard,
+    endpoint: &Arc<seam_transport::Endpoint>,
+) {
+    match discovery.browse() {
+        Ok(found) => {
+            let store = Arc::clone(store);
+            let links = Arc::clone(links);
+            let geometry = Arc::clone(geometry);
+            let clipboard = Arc::clone(clipboard);
+            let endpoint = Arc::clone(endpoint);
+            tokio::spawn(async move {
+                while let Some(event) = found.next().await {
+                    let seam_transport::DiscoveryEvent::Found(peer) = event else { continue };
+                    // Trust is still decided by the handshake; this only decides who is
+                    // worth dialling, so an unpaired machine is skipped, not refused.
+                    if !peer
+                        .advertised_fingerprint
+                        .is_some_and(|fingerprint| store.is_trusted(fingerprint))
+                    {
+                        continue;
+                    }
+                    let already = links.lock().await.iter().any(|link| {
+                        peer.advertised_peer_id.is_some_and(|id| id == link.peer_id())
+                    });
+                    if already {
+                        continue;
+                    }
+                    for address in &peer.addresses {
+                        if let Ok(link) = endpoint.connect(*address).await
+                            && link.authorize(&store).is_ok()
+                        {
+                            tracing::info!(peer = %link.peer_id(), %address, "found and connected");
+                            let link = Arc::new(link);
+                            register_link(&links, &link).await;
+                            announce_geometry(&link).await;
+                            tokio::spawn(receive_from(
+                                link,
+                                Arc::clone(&geometry),
+                                Arc::clone(&clipboard),
+                                Arc::clone(&links),
+                            ));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        Err(e) => tracing::warn!("discovery unavailable; only --connect addresses work: {e}"),
+    }
+
 }
 
 /// Peer id to real screen size, as reported by that peer.
@@ -2257,14 +2450,17 @@ mod tests {
     }
 
     #[test]
-    fn the_port_is_optional_and_defaults_to_os_chosen() {
+    fn the_port_defaults_to_a_stable_number() {
         let Some(Command::Run { port, connect, .. }) =
             Cli::try_parse_from(["seam", "run"]).unwrap().command
         else {
             panic!("expected run");
         };
-        assert_eq!(port, 0, "0 means the OS picks, so the user never has to");
-        assert!(connect.is_empty(), "dialling out is opt-in, never required");
+        // Stable, not OS-chosen. A machine that takes a random port each start cannot
+        // be dialled by a peer that was told its address once — and the fleet then shows
+        // "no machines connected" on every screen with nothing obviously wrong.
+        assert_eq!(port, DEFAULT_PORT, "the listening port must not move between runs");
+        assert!(connect.is_empty(), "dialling out is opt-in: discovery finds paired peers");
     }
 }
 
