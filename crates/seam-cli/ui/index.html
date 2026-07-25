@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en"><head>
+
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>seam — fleet</title>
+<link rel="stylesheet" href="_ds/tokens.css">
+<style>
+.shell{max-width:1060px;margin:0 auto;padding:28px 24px 64px}
+header.top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:24px}
+header.top h1{font:400 var(--text-3xl)/1.1 var(--font-display)}
+header.top h1 .stitch{color:var(--text-accent)}
+header.top .machine{font:400 var(--text-xs)/1.4 var(--font-mono);color:var(--text-secondary);text-align:right}
+.grid{display:grid;grid-template-columns:1.6fr 1fr;gap:20px}
+@media (max-width:820px){.grid{grid-template-columns:1fr}}
+section.card{padding:20px}
+section.card h2{font:600 var(--text-md)/1.3 var(--font-sans);margin:2px 0 14px}
+/* Desk — the real topology, to scale, focus shown live */
+.desk{position:relative;background:var(--surface-sunken);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:26px;display:grid;grid-template-columns:auto auto;gap:18px 22px;justify-content:center;align-items:end}
+.screen{position:relative;border-radius:8px;border:1.5px solid var(--border-heavy);background:var(--surface-card);display:flex;flex-direction:column;justify-content:flex-end;padding:10px;min-height:72px}
+.screen .name{font:500 var(--text-xs)/1.2 var(--font-sans)}
+.screen .size{font:400 10px/1.2 var(--font-mono);color:var(--text-tertiary)}
+.screen.holding{border-color:var(--border-accent);background:var(--surface-selected);box-shadow:0 0 0 3px var(--indigo-100)}
+.screen.holding::after{content:"POINTER";position:absolute;top:8px;right:8px;font:600 9px/1 var(--font-mono);letter-spacing:.1em;color:var(--indigo-700)}
+.screen.imac{width:236px;height:132px}
+.screen.mac{width:290px;height:122px}
+.screen.laptop{width:178px;height:110px;grid-column:1;justify-self:end}
+.desk .edgehint{position:absolute;font:400 9px/1 var(--font-mono);color:var(--text-tertiary);letter-spacing:.08em}
+.peers{display:flex;flex-direction:column;gap:0}
+.peer{display:flex;align-items:center;gap:12px;padding:12px 2px;border-top:1px dashed var(--border-line)}
+.peer:first-child{border-top:0}
+.peer .who{flex:1;min-width:0}
+.peer .who .n{font:500 var(--text-sm)/1.3 var(--font-sans)}
+.peer .who .id{font:400 var(--text-2xs)/1.3 var(--font-mono);color:var(--text-tertiary)}
+.peer .lat{font:400 var(--text-xs)/1 var(--font-mono);color:var(--text-secondary)}
+.health{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.health .item{border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:12px}
+.health .item .k{font:400 var(--text-2xs)/1.2 var(--font-mono);letter-spacing:.1em;text-transform:uppercase;color:var(--text-tertiary)}
+.health .item .v{margin-top:6px;font:500 var(--text-sm)/1.3 var(--font-sans);display:flex;align-items:center;gap:8px}
+.health .ok{color:var(--feedback-success-fg)}
+.health .bad{color:var(--feedback-danger-fg)}
+.activity li{list-style:none;display:flex;gap:10px;padding:9px 2px;border-top:1px dashed var(--border-line);font:400 var(--text-sm)/1.4 var(--font-sans)}
+.activity li:first-child{border-top:0}
+.activity time{font:400 var(--text-2xs)/1.6 var(--font-mono);color:var(--text-tertiary);white-space:nowrap}
+.activity .what b{font-weight:600}
+footer.bar{margin-top:22px;display:flex;justify-content:space-between;align-items:center;color:var(--text-tertiary);font:400 var(--text-xs)/1.2 var(--font-mono)}
+</style></head><body>
+<div class="shell">
+  <header class="top">
+    <h1>seam<span class="stitch">.</span> <span style="font:400 var(--text-lg)/1 var(--font-display);color:var(--text-secondary);font-style:italic">one desk, three machines</span></h1>
+    <div class="machine">Mac-mini · 8c1695ce<br>v0.2.1 · macos/arm64</div>
+  </header>
+
+  <div class="grid">
+    <section class="card" aria-label="Desk layout">
+      <h2>Desk <span class="label" style="margin-left:8px">live · detected, never configured</span></h2>
+      <div class="desk">
+        <div class="screen imac" role="img" aria-label="AMorIMac, 2048 by 1152, left of Mac-mini">
+          <div class="name">AMorIMac</div><div class="size">2048 × 1152 · d6be3828</div>
+        </div>
+        <div class="screen mac holding" role="img" aria-label="Mac-mini, pointer is here">
+          <div class="name">Mac-mini <span class="label" style="color:var(--text-accent)">this machine</span></div><div class="size">2560 × 1080 · 8c1695ce</div>
+        </div>
+        <div class="screen laptop" role="img" aria-label="om-amorabbi23, below the iMac">
+          <div class="name">om-amorabbi23</div><div class="size">1536 × 960 · e59a43b8</div>
+        </div>
+      </div>
+      <p style="margin-top:12px;font:400 var(--text-xs)/1.5 var(--font-sans);color:var(--text-secondary)">Push the pointer off a shared edge to move machines. Order comes from pairing, geometry from each machine itself.</p>
+    </section>
+
+    <section class="card" aria-label="Peers">
+      <h2>Peers</h2>
+      <div class="peers">
+        <div class="peer">
+          <span class="pill connected"><span class="dot"></span>connected</span>
+          <div class="who"><div class="n">AMorIMac</div><div class="id">d6be3828 · left edge</div></div>
+          <span class="lat">2.1 ms</span>
+        </div>
+        <div class="peer">
+          <span class="pill connected"><span class="dot"></span>connected</span>
+          <div class="who"><div class="n">om-amorabbi23</div><div class="id">e59a43b8 · below iMac</div></div>
+          <span class="lat">3.4 ms</span>
+        </div>
+        <div class="peer">
+          <span class="pill offline"><span class="dot"></span>last seen 2 d</span>
+          <div class="who"><div class="n">travel-x1</div><div class="id">91f04c22 · unplaced</div></div>
+          <button class="btn ghost">forget</button>
+        </div>
+      </div>
+      <button class="btn" style="margin-top:14px;width:100%">Pair a new machine…</button>
+    </section>
+
+    <section class="card" aria-label="Health">
+      <h2>Health</h2>
+      <div class="health">
+        <div class="item"><div class="k">capture</div><div class="v ok">● granted</div></div>
+        <div class="item"><div class="k">withhold input</div><div class="v ok">● granted</div></div>
+        <div class="item"><div class="k">cursor control</div><div class="v ok">● window server granted</div></div>
+        <div class="item"><div class="k">input tap</div><div class="v ok">● alive</div></div>
+      </div>
+      <div style="margin-top:12px;padding:10px 12px;border-radius:var(--radius-md);background:var(--feedback-warning-bg);color:var(--feedback-warning-fg);border:1px solid var(--feedback-warning-line);font:400 var(--text-xs)/1.5 var(--font-sans)">
+        <b>If this machine mirrors instead of switching:</b> Accessibility was granted to an older build. macOS grants permissions per binary — re-grant after every update.
+      </div>
+    </section>
+
+    <section class="card" aria-label="Activity">
+      <h2>Activity</h2>
+      <ul class="activity" style="padding:0">
+        <li><time>16:56:33</time><span class="what">pointer → <b>AMorIMac</b></span></li>
+        <li><time>16:41:43</time><span class="what">clipboard <b>517 chars</b> from om-amorabbi23 → everyone</span></li>
+        <li><time>16:39:12</time><span class="what">clipboard image <b>2048×1152</b> shared</span></li>
+        <li><time>16:37:35</time><span class="what"><b>AMorIMac</b> placed on the left edge</span></li>
+        <li><time>16:37:33</time><span class="what">daemon started · v0.2.1</span></li>
+      </ul>
+    </section>
+  </div>
+
+  <footer class="bar"><span>encrypted · QUIC · zero-config</span><span>log: INFO · ~/Library/Application Support/dev.seam.seam/seam.log</span></footer>
+</div>
+<script src="_ds/bind.js"></script>
+</body></html>

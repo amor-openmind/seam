@@ -570,9 +570,14 @@ hand-touched; and chunked, resumable streaming for clipboard payloads over the 6
 **Honest phase status (per the completion contract)**
 1. Design authored + render-verified: PARTIAL (6 page groups; outstanding: onboarding/permissions walkthrough, doctor page, empty states, update flow, compact variants).
 2. Sync/mapping into the app: NOT STARTED.
-3. Frontend shells (menu-bar app on macOS, tray app on Windows) rendering the design 1:1:
-   NOT STARTED — the daemon currently has no GUI at all.
-4. Real data binding: NOT STARTED (page data is illustrative, from real log values).
+3. Frontend shells: V1 SHIPPED (v0.3.0) — the daemon serves the design mirror on
+   loopback and `seam ui` opens it; the artifacts are embedded verbatim from the
+   Claude Design pull (crates/seam-cli/ui is a mirror, never hand-edited). Native
+   menu-bar/tray wrappers around the same pages: NOT STARTED.
+4. Real data binding: STARTED (v0.3.0) — the fleet page binds live /state (identity,
+   version, focus holder, peers, permission health) via _ds/bind.js, authored in
+   Claude Design. Other pages still show authored sample data; activity feed,
+   transfers and settings are not yet bound.
 5. Tests/E2E for the frontend: NOT STARTED.
 6. Streaming protocol: DESIGNED above, NOT IMPLEMENTED — v0.2.1 ships the 64 MB
    single-frame cap.

@@ -73,6 +73,9 @@ enum Command {
     /// Remove a pairing.
     Forget { peer: String },
     /// Run the daemon: advertise this machine and keep links to paired peers.
+    /// Open the live fleet page served by the running daemon.
+    Ui,
+
     Run {
         /// Port to listen on. Chosen by the OS unless given — you should not need this.
         #[arg(long, default_value_t = 0)]
@@ -174,6 +177,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Forget { peer } => forget(&dir, &peer),
+        Command::Ui => open_ui(&dir),
         Command::Run { port, connect, no_elevate } => {
             #[cfg(target_os = "windows")]
             if !no_elevate && !seam_input::windows::is_elevated() {
@@ -670,6 +674,7 @@ async fn daemon(
         );
     }
 
+    start_ui_server(dir.to_path_buf(), name.clone(), identity.peer_id(), Arc::clone(&links));
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry), dir.to_path_buf());
 
     start_clipboard_sync(Arc::clone(&links), Arc::clone(&clipboard));
@@ -876,6 +881,168 @@ async fn apply_clipboard_files(
         }
         Err(e) => tracing::warn!(%peer, "could not point the clipboard at the files: {e}"),
     }
+}
+
+// ---------------------------------------------------------------- ui
+
+/// Which machine holds the pointer, for the UI. `None` means this one.
+static UI_FOCUS: std::sync::Mutex<Option<seam_proto::PeerId>> = std::sync::Mutex::new(None);
+
+/// The design artifacts, embedded verbatim.
+///
+/// These files are a MIRROR of the Claude Design "Seam Pages" project — the source of
+/// truth for everything visible. They are pulled from there, never edited here; see
+/// docs/GOAL.md §12a. The daemon serves them so the UI always matches the daemon it
+/// talks to, with no separate install.
+const UI_PAGES: &[(&str, &str, &str)] = &[
+    ("/", include_str!("../ui/index.html"), "text/html; charset=utf-8"),
+    ("/index.html", include_str!("../ui/index.html"), "text/html; charset=utf-8"),
+    ("/transfers.html", include_str!("../ui/transfers.html"), "text/html; charset=utf-8"),
+    ("/pairing.html", include_str!("../ui/pairing.html"), "text/html; charset=utf-8"),
+    ("/settings.html", include_str!("../ui/settings.html"), "text/html; charset=utf-8"),
+    ("/chrome.html", include_str!("../ui/chrome.html"), "text/html; charset=utf-8"),
+    (
+        "/notifications.html",
+        include_str!("../ui/notifications.html"),
+        "text/html; charset=utf-8",
+    ),
+    ("/_ds/tokens.css", include_str!("../ui/_ds/tokens.css"), "text/css; charset=utf-8"),
+    ("/_ds/bind.js", include_str!("../ui/_ds/bind.js"), "text/javascript; charset=utf-8"),
+];
+
+/// Serve the fleet UI on a loopback port, and record the port for `seam ui`.
+///
+/// Loopback only, read-only, no external requests possible. Hand-rolled GET handling
+/// rather than a web framework: nine static routes and one JSON endpoint do not justify
+/// a dependency tree on the input path's binary.
+fn start_ui_server(
+    dir: std::path::PathBuf,
+    name: String,
+    id: seam_proto::PeerId,
+    links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+) {
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::warn!("no ui: could not bind a loopback port: {e}");
+                return;
+            }
+        };
+        let port = match listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(e) => {
+                tracing::warn!("no ui: {e}");
+                return;
+            }
+        };
+        if let Err(e) = std::fs::write(dir.join("ui-port"), port.to_string()) {
+            tracing::warn!("ui is up but 'seam ui' will not find it: {e}");
+        }
+        tracing::info!(port, "fleet page ready — 'seam ui' opens it");
+
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else { continue };
+            let links = Arc::clone(&links);
+            let name = name.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+
+                let (status, ctype, body) = if path == "/state" {
+                    ("200 OK", "application/json", ui_state_json(&name, id, &links).await)
+                } else if let Some((_, page, ctype)) =
+                    UI_PAGES.iter().find(|(route, _, _)| *route == path)
+                {
+                    ("200 OK", *ctype, (*page).to_owned())
+                } else {
+                    ("404 Not Found", "text/plain", "not found".to_owned())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+                     Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+}
+
+/// The live state the UI binds to. Assembled by hand — ten fields do not justify serde.
+async fn ui_state_json(
+    name: &str,
+    id: seam_proto::PeerId,
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let focus = UI_FOCUS
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .map_or_else(|| "local".to_owned(), |peer| peer.to_string());
+
+    let mut peers = String::new();
+    for link in links.lock().await.iter() {
+        if !peers.is_empty() {
+            peers.push(',');
+        }
+        let peer = link.peer_id();
+        let _ = write!(peers, r#"{{"id":"{peer}","name":"{peer}","addr":"{}"}}"#, link.remote_address());
+    }
+
+    let mut health = String::new();
+    let mut push_health = |ok: bool, text: &str| {
+        if !health.is_empty() {
+            health.push(',');
+        }
+        let _ = write!(health, r#"{{"ok":{ok},"text":"{text}"}}"#);
+    };
+    if let Some(report) = seam_input::permission_report() {
+        for (_, granted, _) in report {
+            push_health(granted, if granted { "granted" } else { "missing — see doctor" });
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        push_health(true, "window server granted");
+        push_health(
+            seam_input::macos::capture_is_alive() != Some(false),
+            "alive",
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let elevated = seam_input::windows::is_elevated();
+        push_health(elevated, if elevated { "elevated" } else { "not elevated — see doctor" });
+    }
+
+    format!(
+        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","focus":"{focus}","peers":[{peers}],"health":[{health}]}}"#,
+        env!("CARGO_PKG_VERSION"),
+        name.replace('"', "'"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+}
+
+/// Open the fleet page of the daemon running on this machine.
+fn open_ui(dir: &std::path::Path) -> Result<()> {
+    let port: u16 = std::fs::read_to_string(dir.join("ui-port"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .context("seam is not running on this machine — start it, then run 'seam ui'")?;
+    let url = format!("http://127.0.0.1:{port}/");
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").arg(&url).spawn()?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn()?;
+    println!("{url}");
+    Ok(())
 }
 
 /// The moment input was last seen. Used by the watchdog.
@@ -1404,10 +1571,16 @@ fn handover(
                 }
             };
             seam_input::macos::set_suppress_local(true);
+            if let Ok(mut f) = UI_FOCUS.lock() {
+                *f = Some(peer);
+            }
             guard
         }
         Focus::Local => {
             tracing::info!("pointer and keyboard back on this machine");
+            if let Ok(mut f) = UI_FOCUS.lock() {
+                *f = None;
+            }
             seam_input::macos::set_suppress_local(false);
             drop(detached);
             // Put the real cursor where the layout says the pointer is. It has been frozen
@@ -1658,6 +1831,9 @@ fn start_pointer_forwarding(
                 // itself, with no way back. Fail open, always.
                 if graph.focus() == Focus::Local && seam_input::macos::is_suppressing_local() {
                     tracing::info!("input returned to this machine");
+                    if let Ok(mut f) = UI_FOCUS.lock() {
+                        *f = None;
+                    }
                     seam_input::macos::set_suppress_local(false);
                     detached = None;
                 }

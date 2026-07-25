@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en"><head>
+
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>seam — clipboard transfers</title>
+<link rel="stylesheet" href="_ds/tokens.css">
+<style>
+.shell{max-width:860px;margin:0 auto;padding:28px 24px 64px}
+header.top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:22px}
+header.top h1{font:400 var(--text-2xl)/1.1 var(--font-display)}
+.card{padding:20px;margin-bottom:18px}
+.card h2{font:600 var(--text-md)/1.3 var(--font-sans);margin-bottom:14px;display:flex;align-items:center;gap:10px}
+.xfer{border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:14px;margin-bottom:12px}
+.xfer .head{display:flex;align-items:center;gap:12px}
+.xfer .kind{width:34px;height:34px;border-radius:8px;background:var(--surface-accent-soft);color:var(--indigo-700);display:flex;align-items:center;justify-content:center;font:600 10px/1 var(--font-mono)}
+.xfer .meta{flex:1;min-width:0}
+.xfer .meta .t{font:500 var(--text-sm)/1.3 var(--font-sans);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.xfer .meta .s{font:400 var(--text-2xs)/1.4 var(--font-mono);color:var(--text-tertiary)}
+.xfer .act{display:flex;gap:8px}
+.progress{margin-top:12px;height:8px;border-radius:999px;background:var(--surface-sunken);overflow:hidden;position:relative}
+.progress .fill{position:absolute;inset:0 auto 0 0;background:var(--action-primary);border-radius:999px}
+.progress .fill.paused{background:var(--amber-500)}
+.progress.chunked .fill{background:repeating-linear-gradient(90deg,var(--indigo-600) 0 14px,var(--indigo-500) 14px 16px)}
+.xfer .row2{display:flex;justify-content:space-between;margin-top:8px;font:400 var(--text-2xs)/1.3 var(--font-mono);color:var(--text-secondary)}
+.done-icon{color:var(--feedback-success-fg)}
+.note{padding:12px 14px;border-radius:var(--radius-md);background:var(--feedback-info-bg);border:1px solid var(--feedback-info-line);color:var(--feedback-info-fg);font:400 var(--text-xs)/1.5 var(--font-sans)}
+table.hist{width:100%;border-collapse:collapse;font:400 var(--text-sm)/1.4 var(--font-sans)}
+table.hist th{font:500 var(--text-2xs)/1.2 var(--font-mono);letter-spacing:.1em;text-transform:uppercase;color:var(--text-tertiary);text-align:left;padding:8px 8px;border-bottom:1px solid var(--border-line)}
+table.hist td{padding:9px 8px;border-bottom:1px dashed var(--border-subtle)}
+table.hist td.mono,table.hist th.mono{font-family:var(--font-mono);font-size:var(--text-xs)}
+</style></head><body>
+<div class="shell">
+  <header class="top">
+    <h1>Clipboard transfers</h1>
+    <span class="label">streamed · resumable · verified</span>
+  </header>
+
+  <section class="card">
+    <h2>Moving now</h2>
+    <div class="xfer">
+      <div class="head">
+        <div class="kind">DIR</div>
+        <div class="meta">
+          <div class="t">photos-june/ · 214 files</div>
+          <div class="s">Mac-mini → AMorIMac · 1.9 GB total · chunk 412/1210 · 96 MB/s</div>
+        </div>
+        <div class="act"><button class="btn">Pause</button><button class="btn ghost">Cancel</button></div>
+      </div>
+      <div class="progress chunked" role="progressbar" aria-valuenow="34" aria-valuemin="0" aria-valuemax="100"><div class="fill" style="width:34%"></div></div>
+      <div class="row2"><span>648 MB of 1.9 GB</span><span>~13 s left · sha-256 per chunk</span></div>
+    </div>
+    <div class="xfer">
+      <div class="head">
+        <div class="kind">IMG</div>
+        <div class="meta">
+          <div class="t">Screenshot 2026-07-25 at 18.02.11.png</div>
+          <div class="s">om-amorabbi23 → everyone · 56 MB · resumed after reconnect at chunk 19</div>
+        </div>
+        <div class="act"><button class="btn">Resume</button></div>
+      </div>
+      <div class="progress" role="progressbar" aria-valuenow="61" aria-valuemin="0" aria-valuemax="100"><div class="fill paused" style="width:61%"></div></div>
+      <div class="row2"><span>34 MB of 56 MB · paused</span><span>picks up where it stopped — chunks already landed are never resent</span></div>
+    </div>
+    <p class="note" style="margin-top:4px">Large copies stream lazily: the receiving machine pastes a <b>promise</b> immediately and pulls chunks on demand, so a 2 GB folder never sits in memory on either side. A drop resumes from the last verified chunk.</p>
+  </section>
+
+  <section class="card">
+    <h2>Recent</h2>
+    <table class="hist">
+      <thead><tr><th>When</th><th>What</th><th>Route</th><th class="mono">Size</th><th>State</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">16:41</td><td>text · 517 chars</td><td>laptop → all</td><td class="mono">1 KB</td><td><span class="pill connected"><span class="dot"></span>done</span></td></tr>
+        <tr><td class="mono">16:39</td><td>image 2048×1152</td><td>iMac → all</td><td class="mono">9.4 MB</td><td><span class="pill connected"><span class="dot"></span>done</span></td></tr>
+        <tr><td class="mono">16:20</td><td>report-final.pdf</td><td>Mac-mini → iMac</td><td class="mono">4.2 MB</td><td><span class="pill connected"><span class="dot"></span>done</span></td></tr>
+        <tr><td class="mono">15:58</td><td>node_modules/ · 41,203 files</td><td>Mac-mini → laptop</td><td class="mono">612 MB</td><td><span class="pill offline"><span class="dot"></span>refused · over cap</span></td></tr>
+      </tbody>
+    </table>
+  </section>
+</div>
+</body></html>

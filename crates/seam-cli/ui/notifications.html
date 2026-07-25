@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en"><head>
+
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>seam — notifications</title>
+<link rel="stylesheet" href="_ds/tokens.css">
+<style>
+.shell{max-width:760px;margin:0 auto;padding:28px 24px 64px}
+header.top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:8px}
+header.top h1{font:400 var(--text-2xl)/1.1 var(--font-display)}
+p.lede{color:var(--text-secondary);font:400 var(--text-sm)/1.6 var(--font-sans);max-width:56ch;margin-bottom:24px}
+.group{margin-bottom:22px}
+.group>.label{display:block;margin-bottom:10px}
+.toast{display:flex;gap:12px;align-items:flex-start;width:min(420px,100%);background:var(--surface-card);border:1px solid var(--border-line);border-left-width:3px;border-radius:var(--radius-md);box-shadow:0 6px 28px var(--ink-a16);padding:12px 14px;margin-bottom:10px}
+.toast .mk{font:600 var(--text-md)/1 var(--font-mono);margin-top:1px}
+.toast .tx{flex:1;min-width:0}
+.toast .tx .t{font:600 var(--text-sm)/1.35 var(--font-sans)}
+.toast .tx .d{font:400 var(--text-xs)/1.5 var(--font-sans);color:var(--text-secondary)}
+.toast .tx .d b{font-weight:600;color:var(--text-primary)}
+.toast .act{display:flex;gap:8px;margin-top:8px}
+.toast.ok{border-left-color:var(--sage-500)}.toast.ok .mk{color:var(--feedback-success-fg)}
+.toast.info{border-left-color:var(--chalk-500)}.toast.info .mk{color:var(--feedback-info-fg)}
+.toast.warn{border-left-color:var(--amber-500)}.toast.warn .mk{color:var(--feedback-warning-fg)}
+.toast.bad{border-left-color:var(--rust-500)}.toast.bad .mk{color:var(--feedback-danger-fg)}
+.rule{margin-top:4px;padding:12px 14px;border-radius:var(--radius-md);background:var(--surface-accent-soft);border:1px solid var(--indigo-100);color:var(--indigo-700);font:400 var(--text-xs)/1.55 var(--font-sans)}
+</style></head><body>
+<div class="shell">
+  <header class="top"><h1>Notifications</h1><span class="label">native · quiet · useful</span></header>
+  <p class="lede">Delivered by each OS's own notification system, styled by the OS — these cards define the <b>content contract</b>: icon tone, title, body, and at most two actions. seam never notifies about what the user just did themselves.</p>
+
+  <div class="group">
+    <span class="label">connection</span>
+    <div class="toast ok"><span class="mk">✓</span><div class="tx"><div class="t">AMorIMac connected</div><div class="d">Push the pointer off the <b>left edge</b> to reach it.</div></div></div>
+    <div class="toast warn"><span class="mk">!</span><div class="tx"><div class="t">om-amorabbi23 dropped</div><div class="d">Reconnecting automatically. If it held the pointer, input came home instantly.</div></div></div>
+  </div>
+
+  <div class="group">
+    <span class="label">clipboard &amp; transfers</span>
+    <div class="toast ok"><span class="mk">✓</span><div class="tx"><div class="t">Folder arrived</div><div class="d"><b>photos-june</b> · 214 files · 1.9 GB from Mac-mini — ready to paste.</div><div class="act"><button class="btn">Reveal</button></div></div></div>
+    <div class="toast bad"><span class="mk">×</span><div class="tx"><div class="t">Transfer failed</div><div class="d"><b>backup.zip</b> stopped at 61% — the link dropped and did not come back. It resumes from chunk 19 when the machine returns; nothing is re-sent.</div></div></div>
+    <div class="toast info"><span class="mk">ⓘ</span><div class="tx"><div class="t">Copy too large to share</div><div class="d"><b>node_modules</b> · 612 MB is over the 64 MB direct limit. Streaming for copies this size is coming; nothing was sent.</div></div></div>
+  </div>
+
+  <div class="group">
+    <span class="label">health — the ones that save an evening</span>
+    <div class="toast warn"><span class="mk">!</span><div class="tx"><div class="t">seam can see input but not withhold it</div><div class="d">Accessibility is missing for <b>this build</b> — macOS grants it per binary, so updates need a re-grant. Until then this machine mirrors instead of switching.</div><div class="act"><button class="btn primary">Open System Settings</button><button class="btn ghost">Later</button></div></div></div>
+    <div class="toast warn"><span class="mk">!</span><div class="tx"><div class="t">Input blocked by an administrator window</div><div class="d">Windows refuses injected input while an elevated window has focus (UIPI). Click a normal window, or run seam as administrator.</div></div></div>
+    <div class="toast ok"><span class="mk">✓</span><div class="tx"><div class="t">Update ready · v0.2.2</div><div class="d">Restart seam to switch. macOS will ask for permissions again — that's the per-binary rule, not a bug.</div><div class="act"><button class="btn primary">Restart now</button><button class="btn ghost">Tonight</button></div></div></div>
+  </div>
+
+  <p class="rule">Voice rules: title says <b>what happened</b> in ≤ 5 words; body says <b>what it means here</b>, names in bold, one sentence of consequence; never jargon without its plain meaning in the same breath; at most two actions and the safe one is never destructive.</p>
+</div>
+</body></html>

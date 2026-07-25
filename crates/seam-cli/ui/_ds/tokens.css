@@ -1,0 +1,56 @@
+/* Seam pages — token mirror of the Seams Design System (source of truth:
+   project 22ae8beb, tokens/*.css). Values copied verbatim; edit THERE, re-mirror here. */
+:root{
+  --paper-000:#FFFDFA;--paper-050:#F8F5F0;--paper-100:#F1ECE4;--paper-200:#E5DED3;--paper-300:#D2C9BB;--paper-400:#B9AE9C;
+  --ink-900:#16130F;--ink-800:#241F19;--ink-700:#3A342C;--ink-600:#524A3F;--ink-500:#6B6357;--ink-400:#8C8474;--ink-300:#AAA294;
+  --indigo-900:#14203D;--indigo-800:#1A2B52;--indigo-700:#1E3363;--indigo-600:#2B4685;--indigo-500:#3A57A0;--indigo-300:#8CA0CC;--indigo-100:#DCE3F2;--indigo-050:#EEF2FA;
+  --thread-700:#93380F;--thread-600:#B04517;--thread-500:#C1531F;--thread-200:#F0C9AE;--thread-050:#FBEDE3;
+  --sage-700:#33513A;--sage-600:#45684E;--sage-500:#5B8265;--sage-200:#C3D6C7;--sage-050:#EAF1EB;
+  --amber-700:#7D590E;--amber-600:#9C6F12;--amber-500:#B98A22;--amber-200:#EBD9A8;--amber-050:#FAF2DD;
+  --rust-700:#822A1E;--rust-600:#A33526;--rust-500:#BE4B3B;--rust-200:#EEC4BC;--rust-050:#FBEBE8;
+  --chalk-700:#3E5D7C;--chalk-600:#4E7396;--chalk-500:#5D82A8;--chalk-200:#C6D6E4;--chalk-050:#EDF2F7;
+  --ink-a04:rgba(22,19,15,.04);--ink-a06:rgba(22,19,15,.06);--ink-a10:rgba(22,19,15,.10);--ink-a16:rgba(22,19,15,.16);--ink-a24:rgba(22,19,15,.24);--ink-a40:rgba(22,19,15,.40);--ink-a64:rgba(22,19,15,.64);
+  --paper-a08:rgba(255,253,250,.08);--paper-a16:rgba(255,253,250,.16);--paper-a72:rgba(255,253,250,.72);
+
+  --text-primary:var(--ink-900);--text-secondary:var(--ink-500);--text-tertiary:var(--ink-400);
+  --text-inverse:var(--paper-000);--text-inverse-secondary:var(--paper-a72);
+  --text-link:var(--indigo-600);--text-accent:var(--thread-600);--text-disabled:var(--ink-300);
+  --surface-page:var(--paper-050);--surface-card:var(--paper-000);--surface-sunken:var(--paper-100);
+  --surface-muted:var(--paper-200);--surface-inverse:var(--ink-900);--surface-inverse-soft:var(--ink-800);
+  --surface-accent:var(--indigo-600);--surface-accent-soft:var(--indigo-050);--surface-hover:var(--paper-100);--surface-selected:var(--indigo-050);
+  --border-subtle:var(--ink-a10);--border-line:var(--ink-a16);--border-heavy:var(--ink-a24);
+  --border-accent:var(--indigo-600);--border-focus:var(--indigo-600);--border-error:var(--rust-600);
+  --action-primary:var(--indigo-600);--action-primary-hover:var(--indigo-700);--action-danger:var(--rust-600);
+  --feedback-info-fg:var(--chalk-700);--feedback-info-bg:var(--chalk-050);--feedback-info-line:var(--chalk-200);
+  --feedback-success-fg:var(--sage-700);--feedback-success-bg:var(--sage-050);--feedback-success-line:var(--sage-200);
+  --feedback-warning-fg:var(--amber-700);--feedback-warning-bg:var(--amber-050);--feedback-warning-line:var(--amber-200);
+  --feedback-danger-fg:var(--rust-700);--feedback-danger-bg:var(--rust-050);--feedback-danger-line:var(--rust-200);
+
+  /* seam state vocabulary, derived from the DS status ramps */
+  --peer-connected-fg:var(--sage-700);--peer-connected-bg:var(--sage-050);
+  --peer-holding-fg:var(--indigo-700);--peer-holding-bg:var(--indigo-050);
+  --peer-degraded-fg:var(--amber-700);--peer-degraded-bg:var(--amber-050);
+  --peer-offline-fg:var(--rust-700);--peer-offline-bg:var(--rust-050);
+
+  --font-sans:"Archivo","Helvetica Neue",Helvetica,Arial,sans-serif;
+  --font-display:"Instrument Serif",Georgia,"Times New Roman",serif;
+  --font-mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
+  --text-2xs:11px;--text-xs:12px;--text-sm:13px;--text-base:14px;--text-md:16px;--text-lg:18px;--text-xl:21px;--text-2xl:26px;--text-3xl:32px;
+  --type-label:500 var(--text-2xs)/1.2 var(--font-mono);
+  --radius-sm:6px;--radius-md:10px;--radius-lg:14px;
+  --shadow-card:0 1px 2px var(--ink-a06),0 4px 16px var(--ink-a06);
+}
+*{box-sizing:border-box;margin:0}
+body{background:var(--surface-page);color:var(--text-primary);font:400 var(--text-base)/1.5 var(--font-sans)}
+.label{font:var(--type-label);letter-spacing:.14em;text-transform:uppercase;color:var(--text-tertiary)}
+.card{background:var(--surface-card);border:1px solid var(--border-subtle);border-radius:var(--radius-lg);box-shadow:var(--shadow-card)}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font:500 var(--text-xs)/1.2 var(--font-sans)}
+.pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.pill.connected{color:var(--peer-connected-fg);background:var(--peer-connected-bg)}
+.pill.holding{color:var(--peer-holding-fg);background:var(--peer-holding-bg)}
+.pill.degraded{color:var(--peer-degraded-fg);background:var(--peer-degraded-bg)}
+.pill.offline{color:var(--peer-offline-fg);background:var(--peer-offline-bg)}
+.mono{font-family:var(--font-mono)}
+button.btn{font:500 var(--text-sm)/1.2 var(--font-sans);padding:8px 14px;border-radius:var(--radius-md);border:1px solid var(--border-line);background:var(--surface-card);color:var(--text-primary);cursor:pointer}
+button.btn.primary{background:var(--action-primary);border-color:var(--action-primary);color:var(--text-inverse)}
+button.btn.ghost{border-color:transparent;background:transparent;color:var(--text-link)}
