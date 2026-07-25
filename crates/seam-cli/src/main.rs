@@ -995,7 +995,7 @@ async fn route(
         UI_RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
         ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
     } else if path == "/state" {
-        ("200 OK", "application/json", ui_state_json(name, id, port, links).await)
+        ("200 OK", "application/json", ui_state_json(name, id, port, ui_port_note.parent().unwrap_or(ui_port_note), links).await)
     } else if let Some((_, page, ctype)) =
         UI_PAGES.iter().find(|(route, _, _)| *route == path)
     {
@@ -1181,6 +1181,22 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ),
     ("/_ds/tokens.css", include_str!("../ui/_ds/tokens.css"), "text/css; charset=utf-8"),
     ("/_ds/bind.js", include_str!("../ui/_ds/bind.js"), "text/javascript; charset=utf-8"),
+    ("/_ds/shared.js", include_str!("../ui/_ds/shared.js"), "text/javascript; charset=utf-8"),
+    (
+        "/_ds/page-settings.js",
+        include_str!("../ui/_ds/page-settings.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "/_ds/page-doctor.js",
+        include_str!("../ui/_ds/page-doctor.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "/_ds/page-transfers.js",
+        include_str!("../ui/_ds/page-transfers.js"),
+        "text/javascript; charset=utf-8",
+    ),
 ];
 
 /// Serve the fleet UI on a loopback port, and record the port for `seam ui`.
@@ -1319,11 +1335,77 @@ mod ui_origin {
     }
 }
 
+/// The last few things that actually happened, read from the log seam already writes.
+///
+/// The fleet page previously showed invented timestamps and events — a design mock-up
+/// serving as product UI, which is a lie told in the user's own interface. This reads the
+/// real log tail instead, and shows nothing when there is nothing.
+fn recent_activity(dir: &std::path::Path) -> String {
+    use std::fmt::Write as _;
+    // Only lines a person would care about; the log also carries per-event noise.
+    const INTERESTING: [&str; 10] = [
+        "moved to this peer",
+        "back on this machine",
+        "clipboard received",
+        "clipboard image received",
+        "clipboard files received",
+        "clipboard changed; sharing",
+        "found and connected",
+        "peer went away",
+        "seam is running",
+        "peer enabled",
+    ];
+    let Ok(text) = std::fs::read_to_string(dir.join("seam.log")) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let lines: Vec<&str> = text.lines().rev().take(400).collect();
+    for line in lines {
+        if out.matches('{').count() >= 8 {
+            break;
+        }
+        let plain = strip_ansi(line);
+        let Some((stamp, message)) = plain.split_once(" INFO ") else {
+            continue;
+        };
+        if !INTERESTING.iter().any(|needle| message.contains(needle)) {
+            continue;
+        }
+        // "2026-07-25T18:31:21.521281Z" -> "18:31:21"
+        let time = stamp.trim().split('T').nth(1).map_or("", |t| t.get(0..8).unwrap_or(""));
+        let text = message.trim().replace('"', "'");
+        if !out.is_empty() {
+            out.push(',');
+        }
+        let _ = write!(out, r#"{{"time":"{time}","what":"{text}"}}"#);
+    }
+    out
+}
+
+/// Drop ANSI colour codes the log writer adds for terminals.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for skip in chars.by_ref() {
+                if skip == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// The live state the UI binds to. Assembled by hand — ten fields do not justify serde.
 async fn ui_state_json(
     name: &str,
     id: seam_proto::PeerId,
     ui_port: u16,
+    dir: &std::path::Path,
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
 ) -> String {
     use std::fmt::Write as _;
@@ -1403,7 +1485,7 @@ async fn ui_state_json(
     }
 
     format!(
-        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"peers":[{peers}],"health":[{health}]}}"#,
+        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"activity":[{}],"peers":[{peers}],"health":[{health}]}}"#,
         env!("CARGO_PKG_VERSION"),
         name.replace('"', "'"),
         std::env::consts::OS,
@@ -1424,6 +1506,7 @@ async fn ui_state_json(
         shares.1,
         shares.2,
         starts_at_login(),
+        recent_activity(dir),
     )
 }
 

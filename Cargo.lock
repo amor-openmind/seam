@@ -1329,7 +1329,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "seam-cli"
-version = "0.3.9"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "seam-input"
-version = "0.3.9"
+version = "0.4.0"
 dependencies = [
  "arboard",
  "core-foundation-sys",
@@ -1356,14 +1356,14 @@ dependencies = [
 
 [[package]]
 name = "seam-proto"
-version = "0.3.9"
+version = "0.4.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "seam-transport"
-version = "0.3.9"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "hostname",

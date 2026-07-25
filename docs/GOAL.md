@@ -506,6 +506,27 @@ live daemon data. The fleet page is the only one bound so far. Binding each is
 mechanical — a `_ds/bind.js` handler per page against endpoints that mostly exist —
 and must be done without touching the visible structure.
 
+## 12d. No mock data in the product — a rule, not a preference
+
+Design pages carry sample content: example machine names, plausible timestamps, a folder
+called `photos-june`. That is correct in a design tool and **a lie in a running
+application**. seam shipped it for several versions — a doctor page listing failures the
+machine did not have, an activity feed of events that never happened.
+
+**The rule**: any repeating or data-driven element in a design is a TEMPLATE. The binding
+clones it and fills it from real state, or the page shows its empty state. Sample content
+must never survive to a running screen.
+
+**How to check before shipping a page**: grep the served page for the sample values. If a
+machine name, timestamp or filename from the design appears in what the daemon serves,
+the page is not bound and must not claim to be.
+
+Bound to real state as of v0.4.0: fleet (machines, focus, health, transfers, sharing,
+start-at-login, activity from the real log), doctor (live checks, verdict counted from
+them), transfers (what is actually moving, honest empty state), settings (persisted
+values). Still carrying authored sample states, and therefore still to bind: pairing,
+chrome, notifications, onboarding, update.
+
 ## 12b. Review discipline — added after a self-inflicted vulnerability
 
 A line-by-line review of the newest code found that the fleet-page server validated
