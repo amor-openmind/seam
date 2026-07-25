@@ -255,6 +255,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "core-foundation-sys"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1034,11 +1040,23 @@ dependencies = [
  "anyhow",
  "clap",
  "directories",
+ "seam-input",
  "seam-proto",
  "seam-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "seam-input"
+version = "0.1.0"
+dependencies = [
+ "core-foundation-sys",
+ "seam-proto",
+ "thiserror",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

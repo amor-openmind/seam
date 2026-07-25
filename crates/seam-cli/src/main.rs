@@ -134,6 +134,43 @@ fn doctor(dir: &std::path::Path, identity: &Identity) -> Result<()> {
         );
     }
 
+    println!("\n  displays");
+    match seam_input::desktop() {
+        Ok(desktop) => {
+            for d in &desktop.displays {
+                let (w, h) = (d.pixels.width, d.pixels.height);
+                let scale = f64::from(d.scale) / 256.0;
+                let mm_w = d.width_mm / seam_input::MM;
+                let mm_h = d.height_mm / seam_input::MM;
+                println!(
+                    "    {}{}x{} at ({},{})  {scale:.2}x  {mm_w}x{mm_h} mm",
+                    if d.primary { "* " } else { "  " },
+                    w,
+                    h,
+                    d.pixels.x,
+                    d.pixels.y
+                );
+            }
+            let bb = desktop.bounding_box();
+            println!("    desktop  {}x{} at ({},{})", bb.width, bb.height, bb.x, bb.y);
+            if let Ok((x, y)) = seam_input::cursor_position() {
+                println!("    cursor   ({x}, {y})");
+            }
+        }
+        Err(e) => println!("    could not read displays: {e}"),
+    }
+
+    if let Some(report) = seam_input::permission_report() {
+        println!("\n  permissions");
+        for (what, granted, where_to) in report {
+            if granted {
+                println!("    {what:<16} granted");
+            } else {
+                println!("    {what:<16} NOT GRANTED — {where_to}");
+            }
+        }
+    }
+
     let store = store::load_peers(dir);
     println!("\n  paired peers   {}", store.len());
     for (id, peer) in store.iter() {
@@ -166,9 +203,9 @@ fn doctor(dir: &std::path::Path, identity: &Identity) -> Result<()> {
     // Honesty over polish: the thing most likely to stop seam working is a platform
     // backend that does not exist yet, so say so rather than reporting a clean bill.
     println!("\n  input forwarding");
-    println!("    NOT IMPLEMENTED — no platform backend is built yet, so seam can");
-    println!("    discover peers, pair, and hold links, but cannot yet move your");
-    println!("    pointer or forward keystrokes.");
+    println!("    NOT IMPLEMENTED — screen geometry and permissions are in place, but");
+    println!("    capture and injection are not written yet, so seam cannot move your");
+    println!("    pointer or forward keystrokes between machines.");
 
     Ok(())
 }
@@ -263,9 +300,8 @@ async fn pair(
     discovery.advertise(&name, identity.peer_id(), identity.fingerprint(), port)?;
 
     let link = if let Some(address) = at {
-        let target: SocketAddr = address
-            .parse()
-            .with_context(|| format!("{address:?} is not a HOST:PORT address"))?;
+        let target: SocketAddr =
+            address.parse().with_context(|| format!("{address:?} is not a HOST:PORT address"))?;
         println!("Dialling {target} directly...");
         endpoint.connect(target).await.map_err(anyhow::Error::from)
     } else if let Some(query) = peer {

@@ -1,0 +1,143 @@
+//! # seam-input
+//!
+//! Platform input capture, injection and display geometry.
+//!
+//! This is the only crate in seam that contains `unsafe`. Everything else is
+//! `#![forbid(unsafe_code)]`, and the boundary is deliberate: FFI into the OS input stack
+//! is where a mistake stops being a wrong pixel and starts being a wedged machine.
+//!
+//! ## The governing rule: fail open
+//!
+//! On macOS, an active event tap whose permission is revoked mid-session can freeze all
+//! local input until a hard reboot. On Windows, `SendInput` blocked by UIPI fails
+//! **silently** — neither the return value nor `GetLastError` reports it. On Linux,
+//! `EVIOCGRAB` on the user's only keyboard locks them out if the process dies holding it.
+//!
+//! In every one of those cases the safe behaviour is the same: **give input back to the
+//! local machine**. Not forwarding a keystroke is a bug. Leaving someone unable to use
+//! their computer is not a bug, it is damage.
+
+#![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
+
+pub mod screen;
+
+#[cfg(target_os = "macos")]
+pub mod macos;
+
+pub use screen::{Desktop, Display, MM, Millis, PixelRect};
+
+/// A platform backend error.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("the operating system refused an input operation: {0}")]
+    Platform(String),
+
+    #[error(
+        "seam needs permission to {what} on this machine. Grant it in {where_to}, then \
+         restart seam — the permission does not apply to an already-running program."
+    )]
+    PermissionDenied { what: String, where_to: String },
+
+    #[error("input {0} is not implemented on this platform yet")]
+    Unsupported(&'static str),
+}
+
+/// Read this machine's display layout.
+///
+/// Detected, never configured (goal Z2), and callers are expected to re-read it on
+/// display reconfiguration rather than caching it at startup (goal F10).
+pub fn desktop() -> Result<Desktop, Error> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::desktop()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(Error::Unsupported("display enumeration"))
+    }
+}
+
+/// Where the pointer is, in this machine's pixel coordinates.
+pub fn cursor_position() -> Result<(i32, i32), Error> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::cursor_position()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(Error::Unsupported("cursor position"))
+    }
+}
+
+/// Move the pointer without generating input events.
+pub fn warp_cursor(x: i32, y: i32) -> Result<(), Error> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::warp_cursor(x, y)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (x, y);
+        Err(Error::Unsupported("cursor warping"))
+    }
+}
+
+/// Return input to the local machine unconditionally.
+///
+/// Safe to call at any time, including when seam never took control. This is the recovery
+/// path for a previous process that died holding OS input state — the exact failure that
+/// stranded the pointer on this machine when another KVM was killed mid-session.
+pub fn release_input() {
+    #[cfg(target_os = "macos")]
+    {
+        macos::force_restore_cursor();
+    }
+}
+
+/// What this machine will let seam do, as a human-readable report.
+///
+/// Used by `seam doctor`. Returns `None` where permissions are not a concept.
+#[must_use]
+pub fn permission_report() -> Option<Vec<(&'static str, bool, &'static str)>> {
+    #[cfg(target_os = "macos")]
+    {
+        let p = macos::Permissions::check();
+        Some(vec![
+            (
+                "capture input",
+                p.can_listen,
+                "System Settings > Privacy & Security > Input Monitoring",
+            ),
+            ("inject input", p.can_post, "System Settings > Privacy & Security > Accessibility"),
+        ])
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn releasing_input_is_safe_even_when_nothing_was_captured() {
+        // The recovery path must never require a prior capture, because it exists
+        // precisely for the case where the process that captured is already gone.
+        release_input();
+        release_input();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reports_its_permission_state() {
+        let report = permission_report().expect("macOS has permissions");
+        assert_eq!(report.len(), 2);
+        for (what, _granted, where_to) in report {
+            assert!(!what.is_empty());
+            assert!(where_to.contains("System Settings"), "must tell the user where to go");
+        }
+    }
+}
