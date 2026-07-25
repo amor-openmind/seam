@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/seam-proto"]
+members = ["crates/seam-proto", "crates/seam-transport"]
 
 [workspace.package]
 version = "0.1.0"

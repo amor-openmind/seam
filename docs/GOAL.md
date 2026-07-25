@@ -23,10 +23,24 @@ Three properties are the product. Everything else is table stakes:
 2. **Never interrupt.** No stuck modifier keys. No cursor trapped on a dead machine.
    No silent disconnect. No crash. Recovery from sleep/wake, IP change and peer death
    is automatic and invisible.
-3. **First connection works the first time.** Reported directly by the user of this
-   repo: getting two machines to talk for the first time in Barrier takes many
-   attempts and a lot of trial and error. That is a design failure, not a user error —
-   see §4a for the specific causes and §5 D8 for the fix.
+3. **Near-zero configuration.** Reported directly by the user of this repo: getting two
+   machines to talk for the first time in Barrier takes many attempts and a lot of trial
+   and error. That is a design failure, not a user error — see §4a for the causes and
+   §5 D8 for the fix.
+
+   The standing rule, applied to every feature from here on:
+
+   > **Every setting is a bug until proven otherwise.** If seam can detect it, seam
+   > detects it. If it can be derived, it is derived. If a value must be chosen, seam
+   > chooses a good default and the option only exists to override it. A setting is added
+   > only when a *correct* automatic answer genuinely does not exist — never because it
+   > was easier to ask the user than to work it out.
+
+   This is not just onboarding polish. Configuration is where this software category
+   fails: a screen name that must match a hostname exactly, a hand-edited layout file, an
+   IP address, a port, a server/client role, a fingerprint dialog, a DPI-scaling
+   workaround. **Each one is both an effort and an opportunity to get it wrong**, and
+   several of them produce silent failures rather than error messages.
 
 ## 2. Scope
 
@@ -88,6 +102,31 @@ Three properties are the product. Everything else is table stakes:
       cause (not paired / version mismatch / permission missing / peer unreachable) —
       never a silent drop, and never a generic "connection failed"
 - [ ] O6 `seam doctor` diagnoses a broken setup end to end and says what to fix
+
+### Zero-configuration (standing requirement, applies to every feature)
+- [ ] Z1 **A working two-machine setup requires zero config values from the user** — no
+      IP, no port, no role, no screen name, no config file. The only input is confirming
+      a 6-digit pairing code.
+- [ ] Z2 **Everything detectable is detected**, never asked: screen count, resolution,
+      DPI/scale, refresh rate, monitor arrangement, keyboard layout(s), OS, architecture,
+      hostname, network interfaces. Re-detected on change, never cached at startup.
+- [ ] Z3 **The screen layout is inferred, not drawn.** The first edge crossing a user
+      performs teaches seam the arrangement; it is confirmed, not authored. A layout
+      editor may exist to *correct* the inference — it is never required to reach a
+      working state.
+- [ ] Z4 **No setting may be required to make an advertised feature work.** Any feature
+      that only functions after tuning is unfinished, not configurable.
+- [ ] Z5 **Every remaining setting has a correct default and is documented with why it
+      exists.** New settings need a written justification of why no automatic answer is
+      possible. The count of required settings is tracked as a metric and must stay at 0.
+- [ ] Z6 **Misconfiguration must be impossible or self-correcting**, not merely
+      diagnosable. Preferred order: make the value automatic → make an invalid value
+      unrepresentable → detect and self-heal → fail loudly with the fix. Silent
+      degradation (Barrier's "unknown client", Windows UIPI's invisible `SendInput`
+      failure) is never acceptable.
+- [ ] Z7 **Installing seam is the whole install.** No separate driver, no daemon to
+      register by hand, no firewall rule to add, no PATH edit, no elevation prompt on the
+      happy path.
 
 ### Reliability (the hard requirements)
 - [ ] R1 **Zero stuck modifiers** — verified by a fuzz test that kills the link mid-chord

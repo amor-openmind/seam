@@ -342,3 +342,49 @@ to batch without adding delay.
 - The §"Realistic budget" figures are **targets derived from component measurements**, not
   end-to-end results. Validate with the differential hardware method before committing.
 - Apple Universal Control's transport is undocumented; BLE→AWDL is structural inference.
+
+---
+
+## Addendum: a cross-platform clock trap (verified 2026-07-25)
+
+**Windows `QueryPerformanceCounter` keeps counting while the machine is asleep.** MS Learn,
+verbatim: it returns ticks since boot *"including the time when the machine was in a sleep
+state such as standby, hibernate, or connected standby."*
+
+So QPC behaves like `CLOCK_BOOTTIME` / `mach_continuous_time`, **not** like
+`CLOCK_MONOTONIC` / `mach_absolute_time`. "Use the monotonic clock everywhere" therefore
+gives *different suspend semantics per platform* — and a laptop peer sleeping mid-session
+is exactly the case seam must survive (R3).
+
+| Purpose | Linux | macOS | Windows |
+|---|---|---|---|
+| Latency measurement (short spans, never crosses sleep) | `CLOCK_MONOTONIC` | `mach_absolute_time` | `QueryPerformanceCounter` |
+| Offset tracking (must survive suspend) | `CLOCK_BOOTTIME` | `mach_continuous_time` | `QueryPerformanceCounter` |
+
+Windows' `CLOCK_MONOTONIC` analogue is `QueryUnbiasedInterruptTime`, but its resolution is
+affected by `timeBeginPeriod`, so it is unsuitable for measurement.
+
+**Suspend detection without an OS notification API:** track `BOOTTIME − MONOTONIC` (Linux)
+or `continuous − absolute` (macOS). A jump in the difference *is* a suspend.
+
+**On resume, discard the entire clock-sync state and re-converge.** A skew estimate from
+before a suspend is worse than none: the crystal was at a different temperature and the
+peer's clock may not have advanced at all.
+
+Two more findings that change platform code:
+
+- **`timeBeginPeriod` no longer has a global effect** (Windows 10 2004+), and on **Windows
+  11 a process that is occluded or minimised loses its high timer resolution**. A KVM
+  forwarding input is almost always occluded. Budget for the timer silently reverting to
+  ~15.6 ms.
+- **Windows Wi-Fi: `wlan_intf_opcode_power_setting` does not exist.** The settable opcodes
+  are `autoconf_enabled`, `background_scan_enabled`, `radio_state`, `bss_type`,
+  `media_streaming_mode`, `current_operation_mode`. The two worth using are
+  **`media_streaming_mode = TRUE`** and **`background_scan_enabled = FALSE`** (off-channel
+  background scans are a large, under-appreciated source of 100 ms+ jitter). Both reset on
+  disconnect — **re-apply on every reconnect**.
+- **macOS has no radio power-save API.** `kIOPMAssertNetworkClientActive` is about *system*
+  sleep, not the radio. Confirmed from Apple's `IOPMLib.h`.
+- ⚠️ **The keepalive-keeps-the-radio-awake hypothesis is unmeasured.** Mechanically
+  plausible (PSM/U-APSD use inactivity timers) but no measurement was found. Treat as a
+  hypothesis to settle with our own differential rig, not an established fact.

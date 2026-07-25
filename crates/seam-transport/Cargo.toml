@@ -1,0 +1,39 @@
+[package]
+name = "seam-transport"
+description = "QUIC transport, identity and pairing for seam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+seam-proto = { path = "../seam-proto" }
+
+# QUIC. `ring` rather than the default `aws-lc-rs`: aws-lc-sys needs cmake and a C
+# toolchain (plus NASM on Windows), which would make "install seam" mean "install a build
+# environment first" for anyone building from source, and complicates cross-compiling to
+# three platforms. ring builds everywhere with no system dependencies. See goal Z7.
+quinn = { version = "0.11.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.15"
+
+# Self-signed certificate generation for peer identity.
+rcgen = { version = "0.14.8", default-features = false, features = ["ring", "pem"] }
+
+rand = "0.10.2"
+sha2 = "0.11.0"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt", "time", "sync", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[lints]
+workspace = true
