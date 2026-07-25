@@ -749,3 +749,44 @@ Pages notice. A page whose daemon stops answering for four polls says so rather 
 polling a port that may now belong to a different seam. Clicking a download on the update
 page stops the running seam first, so the old copy is not holding the port or the input tap
 when the new one starts.
+
+---
+
+## 14. /goal — application logo system (implementation complete; release pending)
+
+**Objective:** establish one approved Seam mark, publish production-ready platform sizes,
+author its usage in the Claude Design System and Pages projects, and serve the synced
+assets from the real application.
+
+**Design source of truth**
+
+- Design System `22ae8beb-c703-4b1c-aa6d-ae63e84ef135` owns the master logo assets and
+  `guidelines/brand-wordmark.card.html`.
+- Pages `e3000f2f-209b-434d-b7a8-4ca8813e66d0` consumes the logo under
+  `_ds/assets/logo/`. Every page uses the 32 px favicon; the fleet, onboarding, and
+  licence pages use the full lockup; the menu-bar/tray study uses the compact symbol.
+- The application mirror matches the generated visible HTML/CSS. Its only additions are
+  the existing runtime-binding script tags.
+
+**Production assets**
+
+- Transparent PNG: 16, 32, 48, 64, 128, 256, 512, and 1024 px.
+- Windows ICO and macOS ICNS.
+- The binary embeds the 32 and 128 px PNGs and serves their exact bytes from both the
+  normal fleet server and the activation-only server.
+
+**Verification evidence for commit `4693ca1`**
+
+- Claude Design previews: desktop 1280 px and compact 390 × 844; no horizontal overflow,
+  missing logo images, or breakpoint drift.
+- Local runtime: activation page rendered at both widths; 32 and 128 px responses were
+  `200 image/png`, byte-identical to the committed files; a foreign Origin received 403.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+- `cargo test --workspace`: 174 passed, 2 intentionally ignored.
+- LLVM changed-code coverage: every executable line in the new asset response helper and
+  both server integration branches executed.
+- Branch `codex/seam-logo-assets` is pushed to origin at `4693ca1`.
+
+**Remaining release step:** merge the reviewed branch and publish a newly tagged signed
+macOS/Windows release. No tag is chosen here: overwriting an existing public release is
+not an implementation detail and requires an explicit version decision.
