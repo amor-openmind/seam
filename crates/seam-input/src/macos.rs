@@ -470,6 +470,7 @@ unsafe extern "C" {
         user_info: *mut c_void,
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: Boolean);
+    fn CGEventTapIsEnabled(tap: CFMachPortRef) -> Boolean;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -839,6 +840,31 @@ unsafe extern "C" fn on_event(
     event
 }
 
+/// The live tap, so its health can be asked about from outside the callback.
+static TAP: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Is capture still alive?
+///
+/// The honest question for a watchdog. The previous one asked "have any events arrived
+/// recently", which cannot tell a broken tap from a person who is reading rather than
+/// moving the mouse — and it guessed wrong, handing input back to this machine two
+/// seconds after the pointer moved to another screen. That reattached the cursor and
+/// cleared suppression, so the cursor tracked the mouse again and keystrokes landed here
+/// as well as on the remote machine.
+///
+/// `CGEventTapIsEnabled` answers the real question and does not depend on user activity.
+/// `None` means no tap has been created yet, which is not a failure.
+#[must_use]
+pub fn capture_is_alive() -> Option<bool> {
+    let tap = TAP.load(std::sync::atomic::Ordering::Relaxed);
+    if tap.is_null() {
+        return None;
+    }
+    // SAFETY: `tap` is the leaked, still-live tap stored when it was created.
+    Some(unsafe { CGEventTapIsEnabled(tap.cast()) } != 0)
+}
+
 /// Start observing local input, with the ability to withhold it.
 ///
 /// The tap can discard events, but only ever does so while [`set_suppress_local`] is true
@@ -916,6 +942,7 @@ pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
                     state.cast::<c_void>(),
                 )
             };
+            TAP.store(tap.cast(), std::sync::atomic::Ordering::Relaxed);
             if tap.is_null() {
                 // NULL means the permission is missing, not that the API is broken.
                 let _ = ready_tx.send(Err(
@@ -1017,6 +1044,28 @@ mod tap_behaviour {
             }
         }
         seen
+    }
+
+    /// The watchdog's new signal must actually report a live tap as live.
+    ///
+    /// The old signal - "have events arrived recently" - could not tell a broken tap from
+    /// a person who was reading rather than moving the mouse, and it guessed wrong: it
+    /// handed input back two seconds after the pointer moved to another screen, which
+    /// reattached the cursor and cleared suppression. If this ever returns false for a
+    /// healthy tap, that whole failure comes straight back.
+    #[test]
+    fn a_live_tap_reports_itself_alive() {
+        assert_eq!(capture_is_alive(), None, "no tap has been created yet");
+        let Ok(_rx) = observe_pointer() else {
+            eprintln!("skipped: Input Monitoring permission not granted");
+            return;
+        };
+        assert_eq!(
+            capture_is_alive(),
+            Some(true),
+            "a tap that was just created and is delivering events must report alive, or \
+             the watchdog will release input from a machine that is working perfectly"
+        );
     }
 
     /// Does detaching actually WORK from a daemon, or merely return success?
