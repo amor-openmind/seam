@@ -21,8 +21,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEINPUT, SendInput,
+    INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetSystemMetrics, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
@@ -215,4 +217,94 @@ mod tests {
         let (x, y) = cursor_position().expect("GetCursorPos should succeed");
         assert!(desktop().unwrap().contains(x, y), "cursor at ({x}, {y}) is on no display");
     }
+}
+
+/// One notch of wheel movement, as Windows defines it.
+const WHEEL_DELTA: i32 = 120;
+
+fn send_one(input: INPUT) -> Result<(), Error> {
+    // SAFETY: one correctly initialised INPUT, with the size the API requires.
+    let sent =
+        unsafe { SendInput(1, &raw const input, i32::try_from(size_of::<INPUT>()).unwrap_or(0)) };
+    if sent == 1 { Ok(()) } else { Err(Error::Platform("SendInput accepted no events".into())) }
+}
+
+fn mouse_input(flags: u32, data: i32) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        // SAFETY: INPUT is a union of POD; zeroing is a valid initial state.
+        Anonymous: unsafe { core::mem::zeroed() },
+    }
+    .tap_mouse(flags, data)
+}
+
+trait TapMouse {
+    fn tap_mouse(self, flags: u32, data: i32) -> Self;
+}
+
+impl TapMouse for INPUT {
+    fn tap_mouse(mut self, flags: u32, data: i32) -> Self {
+        self.Anonymous.mi = MOUSEINPUT {
+            dx: 0,
+            dy: 0,
+            // `mouseData` is signed for wheels but the field is unsigned; the cast is the
+            // documented way to pass a negative scroll amount.
+            mouseData: data.cast_unsigned(),
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        self
+    }
+}
+
+/// Press or release a mouse button. `button` follows the protocol's evdev numbering.
+pub fn inject_button(button: u8, down: bool) -> Result<(), Error> {
+    let flags = match (button, down) {
+        (1, true) => MOUSEEVENTF_LEFTDOWN,
+        (1, false) => MOUSEEVENTF_LEFTUP,
+        (2, true) => MOUSEEVENTF_RIGHTDOWN,
+        (2, false) => MOUSEEVENTF_RIGHTUP,
+        (3, true) => MOUSEEVENTF_MIDDLEDOWN,
+        (3, false) => MOUSEEVENTF_MIDDLEUP,
+        _ => return Err(Error::Unsupported("that mouse button")),
+    };
+    send_one(mouse_input(flags, 0))
+}
+
+/// Scroll. Positive `dy` is away from the user, matching the protocol.
+pub fn inject_scroll(dx: i32, dy: i32) -> Result<(), Error> {
+    if dy != 0 {
+        send_one(mouse_input(MOUSEEVENTF_WHEEL, dy.saturating_mul(WHEEL_DELTA)))?;
+    }
+    if dx != 0 {
+        send_one(mouse_input(MOUSEEVENTF_HWHEEL, dx.saturating_mul(WHEEL_DELTA)))?;
+    }
+    Ok(())
+}
+
+/// Type text, by Unicode code unit rather than by key.
+///
+/// `KEYEVENTF_UNICODE` bypasses the keyboard layout entirely, which is exactly what
+/// mismatched layouts need: the sender already resolved `Option+L` to `@` using *its*
+/// layout, and this reproduces that character without the receiver having to agree about
+/// which physical key it lives on. Non-BMP characters arrive as surrogate pairs and are
+/// sent as two events, which is what Windows expects.
+pub fn inject_text(text: &str, down: bool) -> Result<(), Error> {
+    for unit in text.encode_utf16() {
+        let mut input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            // SAFETY: INPUT is a union of POD; zeroing is a valid initial state.
+            Anonymous: unsafe { core::mem::zeroed() },
+        };
+        input.Anonymous.ki = KEYBDINPUT {
+            wVk: 0,
+            wScan: unit,
+            dwFlags: KEYEVENTF_UNICODE | if down { 0 } else { KEYEVENTF_KEYUP },
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        send_one(input)?;
+    }
+    Ok(())
 }

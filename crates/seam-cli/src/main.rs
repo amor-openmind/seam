@@ -547,11 +547,16 @@ async fn daemon(
 
 /// Receive motion from a peer and reproduce it on this machine.
 async fn receive_from(link: Arc<Link>) {
+    tokio::spawn(receive_reliable(Arc::clone(&link)));
     let peer = link.peer_id();
     let Ok(desktop) = seam_input::desktop() else {
         tracing::warn!(%peer, "cannot read this machine's displays, so incoming motion is ignored");
         return;
     };
+
+    let mut received: u64 = 0;
+    let mut rejected: u64 = 0;
+    tracing::info!(%peer, "ready to receive input from this peer");
 
     loop {
         match link.recv_datagram().await {
@@ -560,13 +565,145 @@ async fn receive_from(link: Arc<Link>) {
                 // The sender's coordinates are its own; clamp onto a real display here so
                 // a mismatched resolution can never strand the pointer somewhere invisible.
                 let (x, y) = desktop.clamp_onto_a_display(px, py);
-                if let Err(e) = seam_input::inject_motion(x, y) {
-                    tracing::warn!(%peer, "could not move the pointer: {e}");
+                match seam_input::inject_motion(x, y) {
+                    Ok(()) => {
+                        received = received.wrapping_add(1);
+                        if received == 1 {
+                            tracing::info!(%peer, x, y, "moving this machine's pointer");
+                        }
+                    }
+                    Err(e) => {
+                        rejected = rejected.wrapping_add(1);
+                        if rejected == 1 || rejected.is_multiple_of(500) {
+                            tracing::warn!(%peer, rejected, "could not move the pointer: {e}");
+                        }
+                    }
                 }
+            }
+            Ok(seam_proto::Frame::Button(b)) => {
+                if let Err(e) = seam_input::inject_button(b.button.to_u8(), b.press.is_down()) {
+                    tracing::warn!(%peer, "could not press a mouse button: {e}");
+                }
+            }
+            Ok(seam_proto::Frame::Scroll(sc)) => {
+                if let Err(e) = seam_input::inject_scroll(sc.dx, sc.dy) {
+                    tracing::warn!(%peer, "could not scroll: {e}");
+                }
+            }
+            Ok(seam_proto::Frame::Key(k)) => {
+                // Key events arrive on a reliable stream, not here; handled in the
+                // reliable loop below.
+                let _ = k;
             }
             Ok(_) => {}
             Err(e) => {
                 tracing::info!(%peer, "link closed: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Turn a captured event into a protocol frame.
+#[cfg(target_os = "macos")]
+fn to_frame(
+    event: seam_input::macos::Observed,
+    seq: u32,
+    travel: &mut (i32, i32),
+    last: &mut Option<(i32, i32)>,
+) -> Option<seam_proto::Frame> {
+    use seam_input::macos::Observed;
+    Some(match event {
+        Observed::Motion { x, y } => {
+            if let Some((lx, ly)) = *last {
+                travel.0 = travel.0.wrapping_add(x - lx);
+                travel.1 = travel.1.wrapping_add(y - ly);
+            }
+            *last = Some((x, y));
+            seam_proto::Frame::Motion(seam_proto::Motion {
+                seq,
+                cursor: seam_proto::Point::from_px(x, y),
+                travel_x: travel.0,
+                travel_y: travel.1,
+            })
+        }
+        Observed::Button { button, down } => seam_proto::Frame::Button(seam_proto::ButtonEvent {
+            seq,
+            button: seam_proto::Button::try_from_u8(button).ok()?,
+            press: press(down),
+            modifiers: seam_proto::Modifiers::NONE,
+        }),
+        Observed::Scroll { dx, dy } => seam_proto::Frame::Scroll(seam_proto::ScrollEvent {
+            seq,
+            dx,
+            dy,
+            unit: seam_proto::ScrollUnit::Detent,
+            end_of_gesture: false,
+        }),
+        Observed::Key { text, down } => seam_proto::Frame::Key(seam_proto::KeyEvent {
+            seq,
+            physical: seam_proto::PhysicalKey::UNKNOWN,
+            logical: text,
+            press: press(down),
+            modifiers: seam_proto::Modifiers::NONE,
+        }),
+    })
+}
+
+#[cfg(target_os = "macos")]
+const fn press(down: bool) -> seam_proto::Press {
+    if down { seam_proto::Press::Down } else { seam_proto::Press::Up }
+}
+
+/// Log one forwarded event.
+///
+/// Motion is logged at `debug` and everything else at `info`: a 1000 Hz mouse would bury
+/// every other line at `info`, whereas a click or a keystroke is exactly what someone
+/// watching the log wants to see. `SEAM_LOG=seam=debug` shows movement too.
+#[cfg(target_os = "macos")]
+fn log_event(frame: &seam_proto::Frame) {
+    match frame {
+        seam_proto::Frame::Motion(m) => {
+            let (x, y) = m.cursor.to_px();
+            tracing::debug!(x, y, seq = m.seq, "pointer");
+        }
+        seam_proto::Frame::Button(b) => {
+            tracing::info!(button = ?b.button, down = b.press.is_down(), "button");
+        }
+        seam_proto::Frame::Scroll(s) => tracing::info!(dx = s.dx, dy = s.dy, "scroll"),
+        seam_proto::Frame::Key(k) => {
+            tracing::info!(text = k.logical.as_str(), down = k.press.is_down(), "key");
+        }
+        _ => {}
+    }
+}
+
+/// Receive buttons, scroll and keystrokes, which travel reliably.
+async fn receive_reliable(link: Arc<Link>) {
+    let peer = link.peer_id();
+    loop {
+        match link.recv_reliable().await {
+            Ok(seam_proto::Frame::Key(k)) => {
+                if k.logical.is_empty() {
+                    continue;
+                }
+                if let Err(e) = seam_input::inject_text(k.logical.as_str(), k.press.is_down()) {
+                    tracing::warn!(%peer, "could not type: {e}");
+                }
+            }
+            Ok(seam_proto::Frame::Button(b)) => {
+                if let Err(e) = seam_input::inject_button(b.button.to_u8(), b.press.is_down()) {
+                    tracing::warn!(%peer, "could not press a mouse button: {e}");
+                }
+            }
+            Ok(seam_proto::Frame::Scroll(sc)) => {
+                if let Err(e) = seam_input::inject_scroll(sc.dx, sc.dy) {
+                    tracing::warn!(%peer, "could not scroll: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(%peer, "reliable stream ended: {e}");
                 return;
             }
         }
@@ -592,41 +729,54 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>) {
 
         // The blocking receiver lives on its own thread so nothing on the async runtime
         // can stall the input path.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(i32, i32)>(256);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<seam_input::macos::Observed>(512);
         std::thread::spawn(move || {
-            while let Ok(p) = observed.recv() {
-                // Drop rather than block: motion is self-correcting, and a stalled input
-                // thread is what makes macOS disable the tap.
-                let _ = tx.try_send((p.x, p.y));
+            while let Ok(event) = observed.recv() {
+                // Drop rather than block: a stalled input thread is what makes macOS
+                // disable the tap, and motion is self-correcting.
+                let _ = tx.try_send(event);
             }
         });
 
         tokio::spawn(async move {
             let mut buf = Vec::with_capacity(64);
             let mut seq: u32 = 0;
-            let mut travel_x: i32 = 0;
-            let mut travel_y: i32 = 0;
+            let mut travel = (0i32, 0i32);
             let mut last: Option<(i32, i32)> = None;
+            let mut sent: u64 = 0;
+            let mut failed: u64 = 0;
 
-            while let Some((x, y)) = rx.recv().await {
-                if let Some((lx, ly)) = last {
-                    travel_x = travel_x.wrapping_add(x - lx);
-                    travel_y = travel_y.wrapping_add(y - ly);
-                }
-                last = Some((x, y));
+            while let Some(event) = rx.recv().await {
                 seq = seq.wrapping_add(1);
 
-                let frame = seam_proto::Frame::Motion(seam_proto::Motion {
-                    seq,
-                    cursor: seam_proto::Point::from_px(x, y),
-                    travel_x,
-                    travel_y,
-                });
+                let Some(frame) = to_frame(event, seq, &mut travel, &mut last) else {
+                    continue;
+                };
+                log_event(&frame);
 
                 let peers = links.lock().await;
                 for link in peers.iter() {
-                    if let Err(e) = link.send_datagram(&frame, &mut buf) {
-                        tracing::debug!(peer = %link.peer_id(), "dropped a motion frame: {e}");
+                    // Motion rides an unreliable datagram; everything else must be
+                    // reliable, because a lost button-up is a stuck drag and a lost
+                    // key-up is a stuck modifier.
+                    let result = if frame.is_datagram_safe() {
+                        link.send_datagram(&frame, &mut buf)
+                    } else {
+                        link.send_reliable(&frame).await
+                    };
+                    match result {
+                        Ok(()) => {
+                            sent = sent.wrapping_add(1);
+                            if sent == 1 || sent.is_multiple_of(2000) {
+                                tracing::info!(peer = %link.peer_id(), sent, "forwarding input");
+                            }
+                        }
+                        Err(e) => {
+                            failed = failed.wrapping_add(1);
+                            if failed == 1 || failed.is_multiple_of(500) {
+                                tracing::warn!(peer = %link.peer_id(), failed, "cannot forward input: {e}");
+                            }
+                        }
                     }
                 }
             }

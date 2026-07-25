@@ -132,6 +132,45 @@ pub fn inject_motion(x: i32, y: i32) -> Result<(), Error> {
     }
 }
 
+/// Press or release a mouse button on this machine.
+pub fn inject_button(button: u8, down: bool) -> Result<(), Error> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::inject_button(button, down)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (button, down);
+        Err(Error::Unsupported("button injection"))
+    }
+}
+
+/// Scroll on this machine.
+pub fn inject_scroll(dx: i32, dy: i32) -> Result<(), Error> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::inject_scroll(dx, dy)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (dx, dy);
+        Err(Error::Unsupported("scroll injection"))
+    }
+}
+
+/// Type text on this machine, reproducing the glyph the sender's layout produced.
+pub fn inject_text(text: &str, down: bool) -> Result<(), Error> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::inject_text(text, down)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (text, down);
+        Err(Error::Unsupported("text injection"))
+    }
+}
+
 /// What this machine will let seam do, as a human-readable report.
 ///
 /// Used by `seam doctor`. Returns `None` where permissions are not a concept.

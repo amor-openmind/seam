@@ -154,7 +154,17 @@ pub enum Button {
 }
 
 impl Button {
-    pub(crate) const fn to_u8(self) -> u8 {
+    /// Map a platform backend's button index onto the protocol's numbering.
+    ///
+    /// Rejects 0, which every backend uses to mean "no button" — silently turning that
+    /// into a real click would be worse than dropping the event.
+    pub const fn try_from_u8(v: u8) -> Result<Self, Error> {
+        Self::from_u8(v)
+    }
+
+    /// The protocol's numbering, for a platform backend to map onto its own.
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
         match self {
             Self::Left => 1,
             Self::Right => 2,

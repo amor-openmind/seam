@@ -21,6 +21,7 @@ use core::ffi::c_void;
 
 use crate::Error;
 use crate::screen::{Desktop, Display, MM, PixelRect};
+use seam_proto::LogicalText;
 
 type CGDirectDisplayID = u32;
 type CGError = i32;
@@ -379,7 +380,21 @@ const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 /// `kCGEventTapOptionListenOnly` — observe without the ability to modify or discard.
 const K_CG_EVENT_TAP_OPTION_LISTEN_ONLY: u32 = 1;
 
+const K_CG_EVENT_LEFT_MOUSE_DOWN: CGEventType = 1;
+const K_CG_EVENT_LEFT_MOUSE_UP: CGEventType = 2;
+const K_CG_EVENT_RIGHT_MOUSE_DOWN: CGEventType = 3;
+const K_CG_EVENT_RIGHT_MOUSE_UP: CGEventType = 4;
 const K_CG_EVENT_MOUSE_MOVED: CGEventType = 5;
+const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
+const K_CG_EVENT_KEY_UP: CGEventType = 11;
+const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
+const K_CG_EVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
+const K_CG_EVENT_OTHER_MOUSE_UP: CGEventType = 26;
+
+/// `kCGScrollWheelEventDeltaAxis1` — vertical, in wheel notches.
+const K_CG_SCROLL_DELTA_AXIS1: u32 = 11;
+/// `kCGScrollWheelEventDeltaAxis2` — horizontal.
+const K_CG_SCROLL_DELTA_AXIS2: u32 = 12;
 const K_CG_EVENT_LEFT_MOUSE_DRAGGED: CGEventType = 6;
 const K_CG_EVENT_RIGHT_MOUSE_DRAGGED: CGEventType = 7;
 const K_CG_EVENT_OTHER_MOUSE_DRAGGED: CGEventType = 27;
@@ -397,6 +412,13 @@ type CGEventTapCallBack = unsafe extern "C" fn(
 // the macOS 26.5 SDK headers.
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
+    fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    fn CGEventKeyboardGetUnicodeString(
+        event: CGEventRef,
+        max_length: usize,
+        actual_length: *mut usize,
+        unicode_string: *mut u16,
+    );
     fn CGEventTapCreate(
         tap: u32,
         place: u32,
@@ -425,11 +447,21 @@ const fn mask_for(event_type: CGEventType) -> CGEventMask {
     1u64 << event_type
 }
 
-/// A pointer position observed on this machine.
+/// Something the user did on this machine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Observed {
-    pub x: i32,
-    pub y: i32,
+pub enum Observed {
+    /// Pointer moved to an absolute position.
+    Motion { x: i32, y: i32 },
+    /// A mouse button changed state. `button` follows the evdev numbering the protocol uses.
+    Button { button: u8, down: bool },
+    /// Scrolled. Positive `dy` is away from the user, matching the protocol's convention.
+    Scroll { dx: i32, dy: i32 },
+    /// A key changed state, carrying the text the *local* layout produced.
+    ///
+    /// The text is what makes mismatched layouts work: a German Apple keyboard types `@`
+    /// as `Option+L`, and sending the resulting glyph is the only way the receiver can
+    /// reproduce it without knowing anything about the sender's layout.
+    Key { text: LogicalText, down: bool },
 }
 
 /// State shared with the tap callback. Boxed and leaked deliberately: the callback may
@@ -442,6 +474,77 @@ struct TapState {
 // SAFETY: the only field touched from the callback thread is `sender`, which is Send, and
 // `tap`, which is only compared and passed back to CoreGraphics.
 unsafe impl Send for TapState {}
+
+/// Turn a CoreGraphics event into something the protocol can carry.
+///
+/// # Safety
+/// `event` must be a valid `CGEventRef` for the duration of the call.
+unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observed> {
+    match event_type {
+        K_CG_EVENT_MOUSE_MOVED
+        | K_CG_EVENT_LEFT_MOUSE_DRAGGED
+        | K_CG_EVENT_RIGHT_MOUSE_DRAGGED
+        | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
+            // SAFETY: valid event, by-value getter.
+            let p = unsafe { CGEventGetLocation(event) };
+            #[expect(clippy::cast_possible_truncation, reason = "screen coordinates fit i32")]
+            Some(Observed::Motion { x: p.x.round() as i32, y: p.y.round() as i32 })
+        }
+
+        K_CG_EVENT_LEFT_MOUSE_DOWN => Some(Observed::Button { button: 1, down: true }),
+        K_CG_EVENT_LEFT_MOUSE_UP => Some(Observed::Button { button: 1, down: false }),
+        K_CG_EVENT_RIGHT_MOUSE_DOWN => Some(Observed::Button { button: 2, down: true }),
+        K_CG_EVENT_RIGHT_MOUSE_UP => Some(Observed::Button { button: 2, down: false }),
+        K_CG_EVENT_OTHER_MOUSE_DOWN => Some(Observed::Button { button: 3, down: true }),
+        K_CG_EVENT_OTHER_MOUSE_UP => Some(Observed::Button { button: 3, down: false }),
+
+        K_CG_EVENT_SCROLL_WHEEL => {
+            // SAFETY: valid event; these fields exist on every scroll event.
+            let (dy, dx) = unsafe {
+                (
+                    CGEventGetIntegerValueField(event, K_CG_SCROLL_DELTA_AXIS1),
+                    CGEventGetIntegerValueField(event, K_CG_SCROLL_DELTA_AXIS2),
+                )
+            };
+            if dx == 0 && dy == 0 {
+                // A Magic Mouse emits a stream of zero-delta events at the end of an
+                // inertial scroll; forwarding them is pure noise.
+                return None;
+            }
+            Some(Observed::Scroll {
+                dx: i32::try_from(dx).unwrap_or(0),
+                dy: i32::try_from(dy).unwrap_or(0),
+            })
+        }
+
+        K_CG_EVENT_KEY_DOWN | K_CG_EVENT_KEY_UP => {
+            let mut buffer = [0u16; 8];
+            let mut length: usize = 0;
+            // SAFETY: `buffer` has 8 elements and that bound is passed, so CoreGraphics
+            // cannot overrun it; `length` is a valid out-parameter.
+            unsafe {
+                CGEventKeyboardGetUnicodeString(
+                    event,
+                    buffer.len(),
+                    &raw mut length,
+                    buffer.as_mut_ptr(),
+                );
+            }
+            let length = length.min(buffer.len());
+            let text = String::from_utf16_lossy(&buffer[..length]);
+            // Control characters are what Ctrl+letter produces; they are a *command*, not
+            // text, so they must not be replayed as a glyph.
+            let text: String = text.chars().filter(|c| !c.is_control()).collect();
+            let logical = LogicalText::new(&text).unwrap_or(LogicalText::NONE);
+            if logical.is_empty() {
+                return None;
+            }
+            Some(Observed::Key { text: logical, down: event_type == K_CG_EVENT_KEY_DOWN })
+        }
+
+        _ => None,
+    }
+}
 
 unsafe extern "C" fn on_event(
     _proxy: CGEventTapProxy,
@@ -466,10 +569,10 @@ unsafe extern "C" fn on_event(
         return event;
     }
 
-    // SAFETY: `event` is a valid event for the duration of the callback.
-    let location = unsafe { CGEventGetLocation(event) };
-    #[expect(clippy::cast_possible_truncation, reason = "screen coordinates fit in i32")]
-    let observed = Observed { x: location.x.round() as i32, y: location.y.round() as i32 };
+    // SAFETY: `event` is valid for the duration of the callback. Every read below is a
+    // by-value getter on it.
+    let observed = unsafe { classify(event_type, event) };
+    let Some(observed) = observed else { return event };
 
     // Never block: the callback runs on the input path, and a slow callback is exactly
     // what makes macOS disable the tap. A full channel drops the sample, which is
@@ -482,7 +585,7 @@ unsafe extern "C" fn on_event(
     event
 }
 
-/// Start observing pointer motion.
+/// Start observing local input.
 ///
 /// **Listen-only.** The tap cannot modify or discard events, so it cannot suppress local
 /// input and therefore cannot cause the freeze-until-reboot failure that an active tap
@@ -508,7 +611,16 @@ pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
             let mask = mask_for(K_CG_EVENT_MOUSE_MOVED)
                 | mask_for(K_CG_EVENT_LEFT_MOUSE_DRAGGED)
                 | mask_for(K_CG_EVENT_RIGHT_MOUSE_DRAGGED)
-                | mask_for(K_CG_EVENT_OTHER_MOUSE_DRAGGED);
+                | mask_for(K_CG_EVENT_OTHER_MOUSE_DRAGGED)
+                | mask_for(K_CG_EVENT_LEFT_MOUSE_DOWN)
+                | mask_for(K_CG_EVENT_LEFT_MOUSE_UP)
+                | mask_for(K_CG_EVENT_RIGHT_MOUSE_DOWN)
+                | mask_for(K_CG_EVENT_RIGHT_MOUSE_UP)
+                | mask_for(K_CG_EVENT_OTHER_MOUSE_DOWN)
+                | mask_for(K_CG_EVENT_OTHER_MOUSE_UP)
+                | mask_for(K_CG_EVENT_SCROLL_WHEEL)
+                | mask_for(K_CG_EVENT_KEY_DOWN)
+                | mask_for(K_CG_EVENT_KEY_UP);
 
             let state = Box::into_raw(Box::new(TapState { sender, tap: core::ptr::null_mut() }));
 
