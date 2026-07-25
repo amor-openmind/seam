@@ -200,6 +200,19 @@ pub enum Frame {
         text: String,
     },
 
+    /// A bitmap on the clipboard: RGBA8, row-major, no padding.
+    ///
+    /// Raw rather than compressed, deliberately: this travels a LAN, where 50 MB is
+    /// under half a second, and decoding untrusted compressed images is a much larger
+    /// attack surface than checking `width * height * 4 == rgba.len()`.
+    ClipboardImage {
+        seq: u32,
+        generation: u64,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+
     /// Liveness probe. `t_send_us` is the sender's clock in microseconds.
     Ping {
         nonce: u64,
@@ -233,6 +246,7 @@ mod kind {
     pub(super) const KEY_STATE_FULL: u8 = 0x32;
 
     pub(super) const CLIPBOARD_TEXT: u8 = 0x50;
+    pub(super) const CLIPBOARD_IMAGE: u8 = 0x51;
 
     pub(super) const PING: u8 = 0x40;
     pub(super) const PONG: u8 = 0x41;
@@ -241,6 +255,10 @@ mod kind {
     //   0x51..=0x5F  clipboard images and file lists
     //   0x60..=0x6F  file transfer
 }
+
+/// Largest clipboard image accepted on the wire: bigger than any screenshot on this
+/// project's fleet, small enough that a hostile length cannot balloon memory.
+const MAX_IMAGE_BYTES: usize = 128 * 1024 * 1024;
 
 impl Frame {
     /// Whether this frame may travel on an unreliable datagram.
@@ -336,6 +354,9 @@ impl Frame {
                 w.u64(*generation);
                 w.string(text)?;
             }
+            Self::ClipboardImage { seq, generation, width, height, rgba } => {
+                encode_clipboard_image(&mut w, *seq, *generation, *width, *height, rgba)?;
+            }
             Self::Ping { nonce, t_send_us } => {
                 w.u8(kind::PING);
                 w.u64(*nonce);
@@ -418,6 +439,21 @@ impl Frame {
                 generation: r.u64()?,
                 text: r.string()?.to_owned(),
             },
+            kind::CLIPBOARD_IMAGE => {
+                let seq = r.u32()?;
+                let generation = r.u64()?;
+                let width = r.u32()?;
+                let height = r.u32()?;
+                let len = r.u32()? as usize;
+                // Reject before allocating, and require the byte count to match the
+                // dimensions exactly — an image is not a bag of bytes.
+                let expected =
+                    u64::from(width).checked_mul(u64::from(height)).and_then(|p| p.checked_mul(4));
+                if len > MAX_IMAGE_BYTES || expected != Some(len as u64) {
+                    return Err(Error::TooLong);
+                }
+                Self::ClipboardImage { seq, generation, width, height, rgba: r.bytes(len)?.to_vec() }
+            }
             kind::PING => Self::Ping { nonce: r.u64()?, t_send_us: r.u64()? },
             kind::PONG => Self::Pong { nonce: r.u64()?, t_send_us: r.u64()?, t_echo_us: r.u64()? },
             other => return Err(Error::UnknownFrameKind(other)),
@@ -461,6 +497,24 @@ fn read_peer_id(r: &mut Reader<'_>) -> Result<[u8; 16], Error> {
     let mut out = [0u8; 16];
     out.copy_from_slice(b);
     Ok(out)
+}
+
+fn encode_clipboard_image(
+    w: &mut Writer<'_>,
+    seq: u32,
+    generation: u64,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), Error> {
+    w.u8(kind::CLIPBOARD_IMAGE);
+    w.u32(seq);
+    w.u64(generation);
+    w.u32(width);
+    w.u32(height);
+    w.u32(u32::try_from(rgba.len()).map_err(|_| Error::TooLong)?);
+    w.bytes(rgba);
+    Ok(())
 }
 
 fn encode_key_state(w: &mut Writer<'_>, s: &KeyState) {
@@ -543,6 +597,13 @@ mod tests {
                 generation: 7,
                 // Non-Latin text, because a clipboard that mangles it is useless here.
                 text: "سلام — hello — @€".into(),
+            },
+            Frame::ClipboardImage {
+                seq: 13,
+                generation: 8,
+                width: 2,
+                height: 1,
+                rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
             },
             Frame::Ping { nonce: 0x1234, t_send_us: 1_700_000_000_000_000 },
             Frame::Pong { nonce: 0x1234, t_send_us: 1, t_echo_us: 2 },

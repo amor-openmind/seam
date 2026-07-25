@@ -258,6 +258,40 @@ pub mod clipboard {
         }
     }
 
+    /// Read the clipboard's image, if it currently holds one. RGBA8, row-major.
+    ///
+    /// `None` for an empty clipboard or one holding text/files — the same contract as
+    /// [`read_text`]. The bytes are copied out; an image poll is not free, which is why
+    /// the caller only tries this when there is no text.
+    pub fn read_image() -> Result<Option<(u32, u32, Vec<u8>)>, Error> {
+        let mut board = arboard::Clipboard::new()
+            .map_err(|e| Error::Platform(format!("clipboard unavailable: {e}")))?;
+        match board.get_image() {
+            Ok(image) => {
+                let (Ok(width), Ok(height)) =
+                    (u32::try_from(image.width), u32::try_from(image.height))
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((width, height, image.bytes.into_owned())))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Replace the clipboard with an image. RGBA8, row-major, dimensions must match.
+    pub fn write_image(width: u32, height: u32, rgba: &[u8]) -> Result<(), Error> {
+        let mut board = arboard::Clipboard::new()
+            .map_err(|e| Error::Platform(format!("clipboard unavailable: {e}")))?;
+        board
+            .set_image(arboard::ImageData {
+                width: width as usize,
+                height: height as usize,
+                bytes: rgba.into(),
+            })
+            .map_err(|e| Error::Platform(format!("could not set the clipboard image: {e}")))
+    }
+
     /// Replace the clipboard's text.
     pub fn write_text(text: &str) -> Result<(), Error> {
         let mut board = arboard::Clipboard::new()
@@ -271,6 +305,23 @@ pub mod clipboard {
 #[cfg(test)]
 mod clipboard_tests {
     use super::clipboard;
+
+    #[test]
+    fn an_image_round_trips_through_the_real_clipboard() {
+        // Restores nothing: images replace the clipboard, same as a real screenshot.
+        let pixels: Vec<u8> = (0..16).flat_map(|i| [i * 16, 255 - i * 16, 128, 255]).collect();
+        if clipboard::write_image(4, 4, &pixels).is_err() {
+            eprintln!("skipped: clipboard is not writable here");
+            return;
+        }
+        match clipboard::read_image() {
+            Ok(Some((w, h, bytes))) => {
+                assert_eq!((w, h), (4, 4), "dimensions must survive the pasteboard");
+                assert_eq!(bytes.len(), 64, "RGBA byte count must match 4x4");
+            }
+            other => panic!("wrote an image but read back {other:?}"),
+        }
+    }
 
     #[test]
     fn text_round_trips_through_the_real_clipboard() {

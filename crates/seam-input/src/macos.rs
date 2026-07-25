@@ -498,6 +498,9 @@ const K_CG_EVENT_MOUSE_MOVED: CGEventType = 5;
 const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
 const K_CG_EVENT_KEY_UP: CGEventType = 11;
 const K_CG_EVENT_FLAGS_CHANGED: CGEventType = 12;
+/// `NX_SYSDEFINED`: where macOS puts volume, mute, media and brightness keys. They are
+/// NOT keyboard events — a tap masking only key-down/up never sees them.
+const K_CG_EVENT_SYSTEM_DEFINED: CGEventType = 14;
 const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
 const K_CG_EVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
 const K_CG_EVENT_OTHER_MOUSE_UP: CGEventType = 26;
@@ -714,6 +717,93 @@ const fn hid_usage_for(keycode: u16) -> seam_proto::PhysicalKey {
     seam_proto::PhysicalKey(usage)
 }
 
+// SAFETY CONTRACT: the Objective-C runtime plus AppKit, used for exactly one job:
+// reading the `subtype` and `data1` of a system-defined event. CGEvent has no public
+// accessor for those fields; NSEvent does, and `eventWithCGEvent:` is the documented
+// bridge between the two. This is how Barrier and deskflow read media keys as well.
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    fn objc_getClass(name: *const core::ffi::c_char) -> *mut c_void;
+    fn sel_registerName(name: *const core::ffi::c_char) -> *mut c_void;
+    fn objc_msgSend();
+    fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn objc_autoreleasePoolPop(pool: *mut c_void);
+}
+
+// Empty on purpose: forces AppKit to be linked so the NSEvent class exists at runtime.
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {}
+
+/// The `NSEvent` subtype carrying media and volume keys.
+const NX_SUBTYPE_AUX_CONTROL_BUTTONS: i16 = 8;
+
+/// Decode a media key out of an `NX_SYSDEFINED` event, if that is what it holds.
+///
+/// The key lives in `data1`: bits 16-31 are the key code, bits 8-15 are 0x0A for down
+/// and 0x0B for up. Key codes are the `NX_KEYTYPE_*` family. Anything that is not a
+/// media key — and plenty of other system traffic uses this event type — returns `None`
+/// so the event passes through untouched; swallowing unknown system events is how a
+/// machine's volume HUD or power management quietly breaks.
+unsafe fn decode_media_key(event: CGEventRef) -> Option<Observed> {
+    type MsgSendEvent =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, CGEventRef) -> *mut c_void;
+    type MsgSendI16 = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i16;
+    type MsgSendIsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
+
+    // SAFETY: standard objc runtime calls; the pool balances push/pop on every path,
+    // because `eventWithCGEvent:` returns an autoreleased object and this thread has no
+    // pool of its own — without one, every media key would leak an NSEvent.
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        let decoded = 'decode: {
+            let class = objc_getClass(c"NSEvent".as_ptr());
+            if class.is_null() {
+                break 'decode None;
+            }
+            let with_cg: MsgSendEvent = core::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            let ns = with_cg(class, sel_registerName(c"eventWithCGEvent:".as_ptr()), event);
+            if ns.is_null() {
+                break 'decode None;
+            }
+            let get_subtype: MsgSendI16 = core::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            if get_subtype(ns, sel_registerName(c"subtype".as_ptr()))
+                != NX_SUBTYPE_AUX_CONTROL_BUTTONS
+            {
+                break 'decode None;
+            }
+            let get_data1: MsgSendIsize = core::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            let data1 = get_data1(ns, sel_registerName(c"data1".as_ptr()));
+
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "masked")]
+            let key = ((data1 >> 16) & 0xFFFF) as u16;
+            let down = ((data1 >> 8) & 0xFF) == 0x0A;
+
+            // NX_KEYTYPE_* → HID Consumer-page usage. Brightness is carried too, so a
+            // client that can act on it may; Windows has no virtual key for it and
+            // drops it at injection.
+            let usage: u16 = match key {
+                0 => 0xE9,       // volume up
+                1 => 0xEA,       // volume down
+                7 => 0xE2,       // mute
+                16 => 0xCD,      // play/pause
+                17 | 19 => 0xB5, // next / fast
+                18 | 20 => 0xB6, // previous / rewind
+                2 => 0x6F,       // brightness up
+                3 => 0x70,       // brightness down
+                _ => break 'decode None,
+            };
+            Some(Observed::Key {
+                text: seam_proto::LogicalText::NONE,
+                physical: seam_proto::PhysicalKey::consumer(usage),
+                modifiers: seam_proto::Modifiers::NONE,
+                down,
+            })
+        };
+        objc_autoreleasePoolPop(pool);
+        decoded
+    }
+}
+
 /// Turn a CoreGraphics event into something the protocol can carry.
 ///
 /// # Safety
@@ -818,6 +908,8 @@ unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observe
         // A modifier key changing state. macOS reports these as flag changes rather than
         // key presses, and without them a receiver can never be told that Cmd is held —
         // so no shortcut can ever be reproduced.
+        K_CG_EVENT_SYSTEM_DEFINED => unsafe { decode_media_key(event) },
+
         K_CG_EVENT_FLAGS_CHANGED => {
             // SAFETY: valid event; both are by-value getters.
             let (keycode, flags) = unsafe {
@@ -1029,7 +1121,8 @@ pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
                 | mask_for(K_CG_EVENT_SCROLL_WHEEL)
                 | mask_for(K_CG_EVENT_KEY_DOWN)
                 | mask_for(K_CG_EVENT_KEY_UP)
-                | mask_for(K_CG_EVENT_FLAGS_CHANGED);
+                | mask_for(K_CG_EVENT_FLAGS_CHANGED)
+                | mask_for(K_CG_EVENT_SYSTEM_DEFINED);
 
             let state = Box::into_raw(Box::new(TapState { sender, tap: core::ptr::null_mut() }));
 

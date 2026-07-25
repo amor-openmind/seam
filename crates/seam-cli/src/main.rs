@@ -743,6 +743,50 @@ async fn receive_from(
     }
 }
 
+/// Apply a clipboard image from a peer, then relay it around the star.
+///
+/// The mirror of the text arm above it, split out only for length: generation check,
+/// write, remember-what-was-written so the poller does not echo it, then forward to
+/// every peer except the one it came from, generation unchanged so it cannot loop.
+async fn apply_clipboard_image(
+    peer: seam_proto::PeerId,
+    generation: u64,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    clipboard: &Clipboard,
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+) {
+    let mut state = clipboard.lock().await;
+    if generation <= state.applied_generation {
+        return;
+    }
+    match seam_input::clipboard::write_image(width, height, &rgba) {
+        Ok(()) => {
+            tracing::info!(%peer, width, height, bytes = rgba.len(), "clipboard image received");
+            state.applied_generation = generation;
+            state.image_sig = Some(image_signature(width, height, &rgba));
+            state.last_seen = None;
+            drop(state);
+
+            let relay =
+                seam_proto::Frame::ClipboardImage { seq: 0, generation, width, height, rgba };
+            for other in links.lock().await.iter() {
+                if other.peer_id() == peer {
+                    continue;
+                }
+                if let Err(e) = other.send_reliable(&relay).await {
+                    tracing::warn!(
+                        peer = %other.peer_id(),
+                        "could not relay the clipboard image: {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(%peer, "could not set the clipboard image: {e}"),
+    }
+}
+
 /// The moment input was last seen. Used by the watchdog.
 #[cfg(target_os = "macos")]
 static LAST_INPUT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
@@ -816,6 +860,36 @@ struct ClipboardState {
     applied_generation: u64,
     /// This machine's own change counter.
     generation: u64,
+    /// Signature of the last image seen or applied, so an echo is recognised without
+    /// keeping megabytes of pixels around.
+    image_sig: Option<u64>,
+}
+
+/// Cheap identity for clipboard images: dimensions plus a streaming hash of the pixels.
+/// Collisions would only cost a skipped share of a near-identical image.
+fn image_signature(width: u32, height: u32, rgba: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    (width, height, rgba).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Send one frame to every connected peer, logging once.
+async fn share_with_all(
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    frame: &seam_proto::Frame,
+    what: &str,
+) {
+    let peers = links.lock().await;
+    if peers.is_empty() {
+        return;
+    }
+    tracing::info!(peers = peers.len(), kind = what, "clipboard changed; sharing");
+    for link in peers.iter() {
+        if let Err(e) = link.send_reliable(frame).await {
+            tracing::warn!(peer = %link.peer_id(), kind = what, "could not share the clipboard: {e}");
+        }
+    }
 }
 
 /// Watch this machine's clipboard and share every change with all peers.
@@ -835,31 +909,52 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
         if let Ok(text) = seam_input::clipboard::read_text() {
             clipboard.lock().await.last_seen = text;
         }
+        if let Ok(Some((w, h, rgba))) = seam_input::clipboard::read_image() {
+            clipboard.lock().await.image_sig = Some(image_signature(w, h, &rgba));
+        }
 
         loop {
             ticker.tick().await;
-            let Ok(Some(text)) = seam_input::clipboard::read_text() else { continue };
 
-            let frame = {
-                let mut state = clipboard.lock().await;
-                if state.last_seen.as_deref() == Some(text.as_str()) {
-                    continue;
-                }
-                state.last_seen = Some(text.clone());
-                state.generation += 1;
-                seam_proto::Frame::ClipboardText { seq: 0, generation: state.generation, text }
-            };
-
-            let peers = links.lock().await;
-            if peers.is_empty() {
+            // Text first: cheapest to read, and a clipboard holds one thing at a time,
+            // so when text is present there is nothing else to poll.
+            if let Ok(Some(text)) = seam_input::clipboard::read_text() {
+                let frame = {
+                    let mut state = clipboard.lock().await;
+                    if state.last_seen.as_deref() == Some(text.as_str()) {
+                        continue;
+                    }
+                    state.last_seen = Some(text.clone());
+                    state.generation += 1;
+                    seam_proto::Frame::ClipboardText { seq: 0, generation: state.generation, text }
+                };
+                share_with_all(&links, &frame, "text").await;
                 continue;
             }
-            tracing::info!(peers = peers.len(), "clipboard changed; sharing");
-            for link in peers.iter() {
-                if let Err(e) = link.send_reliable(&frame).await {
-                    tracing::warn!(peer = %link.peer_id(), "could not share the clipboard: {e}");
+
+            // No text — perhaps an image; a screenshot replaces text on the clipboard.
+            // Reading an image copies the pixels out, which is why it is only tried
+            // when text is absent, and why identity is a hash rather than the bytes.
+            let Ok(Some((width, height, rgba))) = seam_input::clipboard::read_image() else {
+                continue;
+            };
+            let sig = image_signature(width, height, &rgba);
+            let frame = {
+                let mut state = clipboard.lock().await;
+                if state.image_sig == Some(sig) {
+                    continue;
                 }
-            }
+                state.image_sig = Some(sig);
+                state.generation += 1;
+                seam_proto::Frame::ClipboardImage {
+                    seq: 0,
+                    generation: state.generation,
+                    width,
+                    height,
+                    rgba,
+                }
+            };
+            share_with_all(&links, &frame, "image").await;
         }
     });
 }
@@ -1228,6 +1323,10 @@ async fn receive_reliable(
                     }
                     Err(e) => tracing::warn!(%peer, "could not set the clipboard: {e}"),
                 }
+            }
+            Ok(seam_proto::Frame::ClipboardImage { generation, width, height, rgba, .. }) => {
+                apply_clipboard_image(peer, generation, width, height, rgba, &clipboard, &links)
+                    .await;
             }
             Ok(seam_proto::Frame::Hello(hello)) => {
                 let (w, h) = (

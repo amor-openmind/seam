@@ -315,6 +315,20 @@ pub fn inject_text(text: &str, down: bool) -> Result<(), Error> {
 /// that character with `KEYEVENTF_UNICODE`, which is layout-independent; these keys have
 /// no character, so they must be named by which key they are.
 const fn virtual_key_for(usage: u16) -> u16 {
+    // Consumer-page usages (volume and media keys) carry the page in the top bit — see
+    // `PhysicalKey::CONSUMER_FLAG`. They map to their own family of virtual keys.
+    if usage & 0x8000 != 0 {
+        return match usage & 0x7FFF {
+            0xE9 => 0xAF, // VK_VOLUME_UP
+            0xEA => 0xAE, // VK_VOLUME_DOWN
+            0xE2 => 0xAD, // VK_VOLUME_MUTE
+            0xCD => 0xB3, // VK_MEDIA_PLAY_PAUSE
+            0xB5 => 0xB0, // VK_MEDIA_NEXT_TRACK
+            0xB6 => 0xB1, // VK_MEDIA_PREV_TRACK
+            // Brightness has no Windows virtual key; dropped is better than guessed.
+            _ => 0,
+        };
+    }
     match usage {
         0x2A => 0x08, // Backspace
         0x28 => 0x0D, // Return

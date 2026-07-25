@@ -33,6 +33,25 @@ impl PhysicalKey {
     /// A key the sender could not map to a HID usage code.
     pub const UNKNOWN: Self = Self(0);
 
+    /// Bit marking a **Consumer-page** usage (HID page 0x0C) rather than a Keyboard-page
+    /// one. Volume and media keys live on a different HID page from letters, and the
+    /// pages' numbers collide — 0xE2 is Mute on Consumer but Left-Alt on Keyboard — so
+    /// the page must travel with the number. Keyboard usages stay far below 0x8000, so
+    /// the top bit is free to carry it in the same u16.
+    pub const CONSUMER_FLAG: u16 = 0x8000;
+
+    /// A Consumer-page usage: volume, mute, play/pause, track skip, brightness.
+    #[must_use]
+    pub const fn consumer(usage: u16) -> Self {
+        Self(usage | Self::CONSUMER_FLAG)
+    }
+
+    /// Is this a Consumer-page usage?
+    #[must_use]
+    pub const fn is_consumer(self) -> bool {
+        self.0 & Self::CONSUMER_FLAG != 0
+    }
+
     // Letters are named by their *US* engraving purely as a mnemonic. The value is the
     // physical position; on an AZERTY keyboard `A` is the key US calls `Q`.
     pub const A: Self = Self(0x04);
