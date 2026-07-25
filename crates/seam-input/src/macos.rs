@@ -70,6 +70,7 @@ unsafe extern "C" {
     fn CGDisplayIsMain(display: CGDirectDisplayID) -> Boolean;
 
     fn CGWarpMouseCursorPosition(new_position: CGPoint) -> CGError;
+    fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> CGError;
     fn CGAssociateMouseAndMouseCursorPosition(connected: Boolean) -> CGError;
     fn CGDisplayHideCursor(display: CGDirectDisplayID) -> CGError;
     fn CGDisplayShowCursor(display: CGDirectDisplayID) -> CGError;
@@ -207,6 +208,15 @@ impl CursorGuard {
     /// Decouple the cursor from the mouse, optionally hiding it.
     pub fn detach(hide: bool) -> Result<Self, Error> {
         // SAFETY: both take a plain boolean and affect only process-visible cursor state.
+        // Warping the cursor makes macOS suppress local hardware events for about a
+        // quarter of a second by default, which would swallow the very movement seam needs
+        // to keep capturing. Barrier zeroes this for the same reason (OSXScreen.mm,
+        // setZeroSuppressionInterval). Without it, pinning the cursor below would blind
+        // the tap four times a second.
+        //
+        // SAFETY: documented CoreGraphics call taking a plain double.
+        unsafe { CGSetLocalEventsSuppressionInterval(0.0) };
+
         let status = unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
         if status != K_CG_ERROR_SUCCESS {
             return Err(Error::Platform(format!(

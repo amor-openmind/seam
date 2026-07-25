@@ -1287,6 +1287,8 @@ fn start_pointer_forwarding(
             let mut seq: u32 = 0;
             // Holds the cursor still on this machine while a peer owns the pointer.
             let mut detached: Option<seam_input::macos::CursorGuard> = None;
+            // Where the local cursor is held while a peer owns the pointer.
+            let mut parked: Option<(i32, i32)> = None;
 
             while let Some(event) = rx.recv().await {
                 if let Ok(mut last) = LAST_INPUT.lock() {
@@ -1322,6 +1324,36 @@ fn start_pointer_forwarding(
                     && u.changed
                 {
                     detached = handover(u, detached);
+                    parked = match u.focus {
+                        // Remember where the cursor was left, and hold it there.
+                        Focus::Remote(_) => parked.or_else(|| seam_input::cursor_position().ok()),
+                        Focus::Local => None,
+                    };
+                }
+
+                // Pin the local cursor while a peer owns the pointer.
+                //
+                // `CGAssociateMouseAndMouseCursorPosition(0)` returns success from a daemon
+                // but does not take effect without foreground status, so the cursor kept
+                // tracking the mouse on this machine even though every event was being
+                // withheld correctly. Warping it back on each movement does not depend on
+                // foreground status and is what Barrier does.
+                //
+                // This is safe now in a way it was not before: an earlier attempt
+                // (`park_cursor`) fed back, because the graph adopted the warped position
+                // and immediately re-crossed the boundary. `Graph::sync_local_cursor`
+                // returns early while focus is remote, so the warp cannot reach the graph.
+                // Warping also generates no events, so it cannot reach the tap either.
+                // Belt and braces: check the graph, not just the stored point. A stale
+                // `parked` while focus is local would pin the cursor and leave this
+                // machine unusable, which is the exact failure the earlier `park_cursor`
+                // caused twice. Two independent conditions must agree before any warp.
+                if graph.focus() != Focus::Local
+                    && let (Some((px, py)), true) =
+                        (parked, matches!(event, Observed::Motion { .. }))
+                    && let Err(e) = seam_input::warp_cursor(px, py)
+                {
+                    tracing::debug!("could not hold the local cursor still: {e}");
                 }
 
                 // Log the captured event and the resulting focus *before* deciding
