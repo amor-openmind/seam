@@ -643,3 +643,80 @@ mod round_trip {
         assert!(update.y >= 0 && update.y < 1080, "landed off-screen at y={}", update.y);
     }
 }
+
+#[cfg(test)]
+mod entry_position {
+    //! Where the pointer lands on arrival, and whether it can get back out.
+    //!
+    //! Crossing carries the overshoot, so arriving with a large one can place the pointer
+    //! deep inside the neighbour — or, with the wrong sign, right back at the edge it came
+    //! from. Either makes returning feel broken in a way the graph tests above do not
+    //! reveal, because they only assert which machine holds focus.
+
+    use super::*;
+
+    fn imac() -> PeerId {
+        PeerId([1; 16])
+    }
+
+    fn pair() -> Graph {
+        let mut g = Graph::new(2560, 1080);
+        g.place(imac(), Edge::Left, None, 1920, 1080);
+        g
+    }
+
+    #[test]
+    fn a_gentle_crossing_lands_just_inside_the_neighbour() {
+        let mut g = pair();
+        g.sync_local_cursor(0, 540);
+        let update = g.apply_motion(-1, 0);
+        assert_eq!(update.focus, Focus::Remote(imac()));
+        assert_eq!(update.x, 1919, "should arrive at the neighbour's far edge");
+    }
+
+    #[test]
+    fn a_fast_crossing_lands_deep_inside_rather_than_at_the_edge() {
+        // A flick carries its overshoot, so the pointer ends up well inside the
+        // neighbour — and therefore has to travel back before it can return.
+        let mut g = pair();
+        g.sync_local_cursor(0, 540);
+        let update = g.apply_motion(-800, 0);
+        assert_eq!(update.focus, Focus::Remote(imac()));
+        assert_eq!(update.x, 1120, "1920 - 800");
+    }
+
+    #[test]
+    fn returning_needs_only_the_distance_actually_travelled_in() {
+        // The pointer must not require more movement to get out than it took to get in.
+        let mut g = pair();
+        g.sync_local_cursor(0, 540);
+        g.apply_motion(-800, 0);
+        assert_eq!(g.focus(), Focus::Remote(imac()));
+
+        // 800 in, so 800 out must reach the boundary exactly.
+        let update = g.apply_motion(800, 0);
+        assert_eq!(update.focus, Focus::Local, "the same distance back must return it");
+    }
+
+    #[test]
+    fn arriving_at_the_far_edge_can_leave_again_immediately() {
+        // Entering at x = width-1 means one step right is enough to go back, which is what
+        // makes a brief overshoot feel like a bounce rather than a trap.
+        let mut g = pair();
+        g.sync_local_cursor(0, 540);
+        g.apply_motion(-1, 0);
+        assert_eq!(g.apply_motion(1, 0).focus, Focus::Local);
+    }
+
+    #[test]
+    fn a_peer_reporting_an_enormous_screen_is_still_escapable() {
+        // If geometry were ever wrong or stale, the pointer must still be able to get out
+        // rather than being trapped behind a boundary that is thousands of pixels away.
+        let mut g = Graph::new(2560, 1080);
+        g.place(imac(), Edge::Left, None, 30_000, 1080);
+        g.sync_local_cursor(0, 540);
+        g.apply_motion(-1, 0);
+        assert_eq!(g.focus(), Focus::Remote(imac()));
+        assert_eq!(g.apply_motion(1, 0).focus, Focus::Local, "one step must still return it");
+    }
+}

@@ -990,3 +990,94 @@ mod tests {
         assert!(connect.is_empty(), "dialling out is opt-in, never required");
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod handover_state {
+    //! The suppression flag across sequences of handovers.
+    //!
+    //! "The pointer will not come back" and "the pointer came back but the Mac stays
+    //! muted" are indistinguishable from the user's chair, and only the second is about
+    //! this flag. It is a process-wide global, so it is the one piece of state that can
+    //! survive a wrong sequence and leave the machine unusable — which is exactly the
+    //! regression that shipped when a refactor changed a drop order.
+
+    use super::*;
+    use focus::{Focus, Update};
+
+    fn to(focus: Focus) -> Update {
+        Update { focus, changed: true, x: 100, y: 100 }
+    }
+
+    /// Serialised: the flag is global, so these cannot run concurrently.
+    fn with_clean_state(body: impl FnOnce()) {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        seam_input::macos::set_suppress_local(false);
+        body();
+        seam_input::macos::set_suppress_local(false);
+        seam_input::release_input();
+    }
+
+    #[test]
+    fn leaving_mutes_this_machine_and_returning_unmutes_it() {
+        with_clean_state(|| {
+            let guard = handover(to(Focus::Remote(seam_proto::PeerId([1; 16]))), None);
+            assert!(seam_input::macos::is_suppressing_local(), "should be muted while away");
+
+            let guard = handover(to(Focus::Local), guard);
+            assert!(!seam_input::macos::is_suppressing_local(), "should respond again");
+            assert!(guard.is_none());
+        });
+    }
+
+    #[test]
+    fn moving_between_two_peers_keeps_this_machine_muted() {
+        // The regression that shipped: the incoming guard was dropped *after* the new one
+        // was made, and its Drop cleared suppression — so hopping peers silently switched
+        // this machine's input back on while a peer still owned the pointer.
+        with_clean_state(|| {
+            let guard = handover(to(Focus::Remote(seam_proto::PeerId([1; 16]))), None);
+            assert!(seam_input::macos::is_suppressing_local());
+
+            let guard = handover(to(Focus::Remote(seam_proto::PeerId([2; 16]))), guard);
+            assert!(
+                seam_input::macos::is_suppressing_local(),
+                "hopping between peers must not unmute this machine"
+            );
+
+            handover(to(Focus::Local), guard);
+            assert!(!seam_input::macos::is_suppressing_local());
+        });
+    }
+
+    #[test]
+    fn repeated_round_trips_always_end_unmuted() {
+        // A one-way leak passes a single trip and strands the machine on a later one.
+        with_clean_state(|| {
+            let mut guard = None;
+            for trip in 0..5 {
+                guard = handover(to(Focus::Remote(seam_proto::PeerId([1; 16]))), guard);
+                assert!(seam_input::macos::is_suppressing_local(), "trip {trip}: not muted");
+
+                guard = handover(to(Focus::Local), guard);
+                assert!(
+                    !seam_input::macos::is_suppressing_local(),
+                    "trip {trip}: this machine was left muted"
+                );
+            }
+            assert!(guard.is_none());
+        });
+    }
+
+    #[test]
+    fn returning_twice_is_harmless() {
+        // sync_peers can hand focus back on its own, so `Local` can arrive without a
+        // matching `Remote`. It must never leave the machine muted.
+        with_clean_state(|| {
+            let guard = handover(to(Focus::Local), None);
+            assert!(!seam_input::macos::is_suppressing_local());
+            handover(to(Focus::Local), guard);
+            assert!(!seam_input::macos::is_suppressing_local());
+        });
+    }
+}

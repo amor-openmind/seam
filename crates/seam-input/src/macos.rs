@@ -808,3 +808,118 @@ pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
         Err(_) => Err(Error::Platform("the input thread stopped before starting".into())),
     }
 }
+
+#[cfg(test)]
+mod tap_behaviour {
+    //! Live experiments against a real event tap.
+    //!
+    //! These exist because the return-crossing bug could not be settled by reasoning: the
+    //! question is what CoreGraphics actually reports while the cursor is detached and the
+    //! tap is discarding events, and Apple documents the first half of that but not the
+    //! combination. Guessing produced three wrong fixes in a row.
+
+    use super::*;
+    use std::time::Duration;
+
+    // SAFETY CONTRACT: documented CoreGraphics event-construction API.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreateMouseEvent(
+            source: *const c_void,
+            mouse_type: CGEventType,
+            cursor_position: CGPoint,
+            mouse_button: u32,
+        ) -> CGEventRef;
+        fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+        fn CGEventPost(tap: u32, event: CGEventRef);
+    }
+
+    /// Post a synthetic mouse movement carrying the given deltas.
+    fn post_move(x: f64, y: f64, dx: i64, dy: i64) {
+        // SAFETY: a NULL source is the documented default; the event is released on the
+        // single exit path.
+        unsafe {
+            let event = CGEventCreateMouseEvent(
+                core::ptr::null(),
+                K_CG_EVENT_MOUSE_MOVED,
+                CGPoint { x, y },
+                0,
+            );
+            if event.is_null() {
+                return;
+            }
+            CGEventSetIntegerValueField(event, K_CG_MOUSE_DELTA_X, dx);
+            CGEventSetIntegerValueField(event, K_CG_MOUSE_DELTA_Y, dy);
+            CGEventPost(K_CG_SESSION_EVENT_TAP, event);
+            CFRelease(event.cast_const());
+        }
+    }
+
+    /// Collect whatever the tap reports over a short window.
+    fn drain(rx: &std::sync::mpsc::Receiver<Observed>, window: Duration) -> Vec<Observed> {
+        let deadline = std::time::Instant::now() + window;
+        let mut seen = Vec::new();
+        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match rx.recv_timeout(remaining) {
+                Ok(event) => seen.push(event),
+                Err(_) => break,
+            }
+        }
+        seen
+    }
+
+    /// The decisive question: does movement still reach the tap while the cursor is
+    /// detached **and** events are being discarded?
+    ///
+    /// If it does not, the pointer can never be brought back from a peer, because the very
+    /// events that would return it are the ones being withheld.
+    #[test]
+    fn movement_is_still_observed_while_detached_and_suppressing() {
+        let Ok(rx) = observe_pointer() else {
+            eprintln!("skipped: Input Monitoring permission not granted");
+            return;
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = drain(&rx, Duration::from_millis(100));
+
+        let guard = CursorGuard::detach(false).ok();
+        set_suppress_local(true);
+
+        for i in 0..10 {
+            post_move(500.0, 500.0, 7, 0);
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = i;
+        }
+        let seen = drain(&rx, Duration::from_millis(400));
+
+        set_suppress_local(false);
+        drop(guard);
+        force_restore_cursor();
+
+        let moved: Vec<_> = seen
+            .iter()
+            .filter_map(|e| match e {
+                Observed::Motion { dx, dy, .. } if *dx != 0 || *dy != 0 => Some((*dx, *dy)),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !moved.is_empty(),
+            "no movement reached the tap while detached and suppressing — the pointer could \
+             never be brought back from a peer. Saw {} events total.",
+            seen.len()
+        );
+    }
+
+    /// Suppression must not outlive the guard, whatever happens.
+    #[test]
+    fn dropping_the_guard_always_restores_local_input() {
+        let guard = CursorGuard::detach(false).ok();
+        set_suppress_local(true);
+        assert!(is_suppressing_local());
+        drop(guard);
+        assert!(!is_suppressing_local(), "the Mac would have been left unable to respond");
+        force_restore_cursor();
+    }
+}
