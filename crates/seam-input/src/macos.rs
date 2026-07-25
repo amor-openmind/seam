@@ -1078,6 +1078,37 @@ mod tap_behaviour {
         );
     }
 
+    /// Does warping actually move the cursor from this process?
+    ///
+    /// Needs no human: warp somewhere known, then read the position back. If the read
+    /// does not match, `CGWarpMouseCursorPosition` is being ignored, and pinning the
+    /// cursor by warping cannot work however often it is called.
+    #[test]
+    fn warping_actually_moves_the_cursor() {
+        let Ok(before) = cursor_position() else {
+            eprintln!("skipped: no cursor");
+            return;
+        };
+        let guard = CursorGuard::detach(true);
+        let target = (600, 400);
+        let warped = warp_cursor(target.0, target.1);
+        std::thread::sleep(Duration::from_millis(80));
+        let after = cursor_position();
+        drop(guard);
+        let _ = warp_cursor(before.0, before.1);
+
+        eprintln!("warp call: {warped:?}");
+        eprintln!("asked for {target:?}, cursor reads {after:?}");
+        eprintln!(
+            "{}",
+            if after.map(|p| p == target).unwrap_or(false) {
+                "WARP WORKS: pinning is viable; if the cursor still moves, the pin is not running"
+            } else {
+                "WARP IGNORED: warping cannot pin the cursor from this process"
+            }
+        );
+    }
+
     /// Does detaching actually WORK from a daemon, or merely return success?
     ///
     /// Run with `--ignored --nocapture` and move the mouse for five seconds. Everything
