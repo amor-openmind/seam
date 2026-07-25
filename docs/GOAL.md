@@ -493,10 +493,10 @@ authored ✓ / to ask Claude Design for ✗):
 | Pairing flow incl. SAS verify + refusal | ✓ pairing.html |
 | Settings (sharing, behaviour, notifications, diagnostics, danger) | ✓ settings.html |
 | Onboarding + macOS permission walkthrough (the per-binary re-grant pain) | ✗ |
-| Menu-bar dropdown (macOS) / tray popover (Windows) — the everyday chrome | ✗ |
-| Toasts/notifications (peer joined/dropped, transfer done/failed, update) | ✗ |
+| Menu-bar dropdown (macOS) / tray popover (Windows) — the everyday chrome | ✓ chrome.html |
+| Toasts/notifications (peer joined/dropped, transfer done/failed, update) | ✓ notifications.html |
 | Doctor report as a full page (what's wrong and the exact fix) | ✗ |
-| Degraded states: tap disabled, UIPI elevated-window warning, mirrors-not-switching | ✗ |
+| Degraded states: tap disabled, UIPI elevated-window warning, mirrors-not-switching | ✓ in chrome.html + notifications.html |
 | Empty states: no peers yet, nothing transferred yet | ✗ |
 | Update flow (new version available → restart → re-grant reminder) | ✗ |
 | Compact/mobile-width variants of all of the above | ✗ |
@@ -554,7 +554,7 @@ hand-touched; and chunked, resumable streaming for clipboard payloads over the 6
   implementation item. Until then, over-cap copies are refused with a log line.
 
 **Honest phase status (per the completion contract)**
-1. Design authored + render-verified: PARTIAL (4 pages of ~6; desktop only).
+1. Design authored + render-verified: PARTIAL (6 page groups; outstanding: onboarding/permissions walkthrough, doctor page, empty states, update flow, compact variants).
 2. Sync/mapping into the app: NOT STARTED.
 3. Frontend shells (menu-bar app on macOS, tray app on Windows) rendering the design 1:1:
    NOT STARTED — the daemon currently has no GUI at all.
