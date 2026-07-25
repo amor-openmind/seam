@@ -83,7 +83,9 @@ async fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Doctor => doctor(&dir, &identity),
-        Command::Discover { r#for } => discover(Duration::from_secs(r#for)).await,
+        Command::Discover { r#for } => {
+            discover(Duration::from_secs(r#for), identity.peer_id()).await
+        }
         Command::Pair { peer, timeout } => {
             pair(&dir, identity, peer, Duration::from_secs(timeout)).await
         }
@@ -160,8 +162,13 @@ fn doctor(dir: &std::path::Path, identity: &Identity) -> Result<()> {
 // ---------------------------------------------------------------- discover
 
 /// Collect peers for `window`, reporting each as it appears.
+///
+/// `exclude` drops this machine's own advertisement. A browse handle only knows to filter
+/// itself out when the *same* handle is also advertising, and the dialler's handle is a
+/// separate one — so without this a machine discovers itself and offers to pair with it.
 async fn collect_peers(
     window: Duration,
+    exclude: Option<seam_proto::PeerId>,
     on_found: impl Fn(&DiscoveredPeer),
 ) -> Vec<DiscoveredPeer> {
     let Ok(discovery) = Discovery::new() else {
@@ -181,6 +188,9 @@ async fn collect_peers(
         }
         match tokio::time::timeout(remaining, stream.next()).await {
             Ok(Some(DiscoveryEvent::Found(peer))) => {
+                if peer.advertised_peer_id.is_some() && peer.advertised_peer_id == exclude {
+                    continue;
+                }
                 if !found.iter().any(|p| p.instance == peer.instance) {
                     on_found(&peer);
                     found.push(*peer);
@@ -196,9 +206,9 @@ async fn collect_peers(
     found
 }
 
-async fn discover(window: Duration) -> Result<()> {
-    println!("Watching for seam machines for {}s...\n", window.as_secs());
-    let found = collect_peers(window, |peer| {
+async fn discover(window: Duration, own: seam_proto::PeerId) -> Result<()> {
+    println!("Watching for other seam machines for {}s...\n", window.as_secs());
+    let found = collect_peers(window, Some(own), |peer| {
         let version =
             peer.advertised_protocol.map_or_else(|| "unknown".to_owned(), |v| format!("v{v}"));
         let addresses: Vec<String> = peer.addresses.iter().map(ToString::to_string).collect();
@@ -238,7 +248,7 @@ async fn pair(
     discovery.advertise(&name, identity.peer_id(), identity.fingerprint(), port)?;
 
     let link = if let Some(query) = peer {
-        dial_for_pairing(&endpoint, &query, timeout).await
+        dial_for_pairing(&endpoint, identity.peer_id(), &query, timeout).await
     } else {
         {
             println!("Waiting for the other machine to run `seam pair {name}`...\n");
@@ -279,11 +289,16 @@ async fn pair(
     Ok(())
 }
 
-async fn dial_for_pairing(endpoint: &Endpoint, query: &str, timeout: Duration) -> Result<Link> {
+async fn dial_for_pairing(
+    endpoint: &Endpoint,
+    own: seam_proto::PeerId,
+    query: &str,
+    timeout: Duration,
+) -> Result<Link> {
     println!("Looking for {query:?} on the network...");
     let needle = query.trim().to_lowercase();
     let window = timeout.min(Duration::from_secs(10));
-    let found = collect_peers(window, |_| {}).await;
+    let found = collect_peers(window, Some(own), |_| {}).await;
 
     let candidate = found
         .iter()

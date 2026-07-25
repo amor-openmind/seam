@@ -89,7 +89,7 @@ Three properties are the product. Everything else is table stakes:
 - [ ] F13 Multi-monitor peers expose their **true non-rectangular** desktop shape, so the
       pointer cannot be sent to a coordinate that exists on no physical display
 - [ ] F14 The layout is a real 2-D edge graph — not a left/right chain. This fleet is
-      L-shaped (iMac and Mac-mini side by side, amor below the iMac), so Mac-mini's left
+      L-shaped (iMac and Mac-mini side by side, the laptop below the iMac), so Mac-mini's left
       edge borders the iMac along part of its length and **nothing** along the rest.
       Partial edge adjacency, diagonal corners and dead zones must all behave.
 
@@ -225,17 +225,17 @@ corresponding fix:
 
 | Host | Address | Platform | Physical position | Status |
 |---|---|---|---|---|
-| `Mac-mini` | 192.168.2.69 | macOS 26.5.2, arm64 (M4), LG 2560x1080 | right | ✅ up |
-| `AMorIMac-2` ("iMac") | 192.168.2.111 | **Windows** (135/139/445/5040/7680 open) | left, **same level as Mac-mini** | ✅ up |
-| `om-amorabbi23-2` ("amor") | 192.168.2.193 | **Windows**, Dell laptop (7680 open) | below the iMac | ✅ up |
-| `linux.local` | 192.168.2.109 | Linux | — | ✅ present (live ARP) |
+| `Mac-mini` | 192.0.2.10 | macOS 26.5.2, arm64 (M4), LG 2560x1080 | right | ✅ up |
+| `windows-desktop` ("iMac") | 192.0.2.11 | **Windows** (135/139/445/5040/7680 open) | left, **same level as Mac-mini** | ✅ up |
+| `windows-laptop` (laptop) | 192.0.2.12 | **Windows**, Dell laptop (7680 open) | below the iMac | ✅ up |
+| `linux.local` | 192.0.2.13 | Linux | — | ✅ present (live ARP) |
 
 ```
  [ iMac / Windows ]  [ Mac-mini / macOS ]
- [ amor  / Windows ]
+ [ the laptop  / Windows ]
 ```
 
-The layout is a genuine **2-D edge graph, not a row**. Note the corner: amor's right edge
+The layout is a genuine **2-D edge graph, not a row**. Note the corner: the laptop's right edge
 and Mac-mini's bottom-left corner touch only diagonally, so part of Mac-mini's left edge
 borders the iMac and part borders nothing at all. Barrier models this as per-edge links
 and gets corners wrong; seam must handle partial edge adjacency and dead zones (F13/F14).

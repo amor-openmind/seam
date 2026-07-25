@@ -143,8 +143,8 @@ impl Discovery {
         //      routable IPv4 at all — a record that looks healthy and that nothing can
         //      dial, because link-local needs a scope id that an mDNS record cannot carry.
         //   2. addr_auto *overrides* explicitly supplied addresses, and on a machine with
-        //      container bridges it chose a Docker bridge (192.168.155.0) over the real
-        //      LAN address (192.168.2.69).
+        //      container bridges it chose a Docker bridge (198.51.100.5) over the real
+        //      LAN address (192.0.2.10).
         // Announcing exactly what the routing table says is reachable is both correct and
         // the only version that a peer can act on.
         let routable = primary_local_address();
@@ -389,7 +389,7 @@ mod tests {
         assert!(!is_routable("fe80::1".parse().unwrap()));
         assert!(!is_routable("0.0.0.0".parse().unwrap()));
 
-        assert!(is_routable("192.168.2.69".parse().unwrap()));
+        assert!(is_routable("192.0.2.10".parse().unwrap()));
         assert!(is_routable("10.0.0.5".parse().unwrap()));
         assert!(is_routable("2001:db8::1".parse().unwrap()));
     }
