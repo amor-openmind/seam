@@ -9,66 +9,63 @@
 header.top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px;gap:16px;flex-wrap:wrap}
 header.top h1{font:400 var(--text-2xl)/1.1 var(--font-display)}
 header.top .machine{font:400 var(--text-xs)/1.4 var(--font-mono);color:var(--text-secondary);text-align:right}
-p.lede{color:var(--text-secondary);font:400 var(--text-md)/1.6 var(--font-sans);max-width:54ch;margin-bottom:24px}
+p.lede{color:var(--text-secondary);font:400 var(--text-md)/1.6 var(--font-sans);max-width:52ch;margin-bottom:24px}
 .card{padding:20px;margin-bottom:16px}
-.card h2{font:600 var(--text-md)/1.3 var(--font-sans);margin-bottom:4px}
-.card .sub{font:400 var(--text-xs)/1.55 var(--font-sans);color:var(--text-secondary);margin-bottom:14px}
-/* The command — the whole point of the page, so it reads first and copies in one action */
-.cmd{display:flex;align-items:stretch;gap:0;border:1px solid var(--border-line);border-radius:var(--radius-md);overflow:hidden;background:var(--surface-inverse)}
-.cmd code{flex:1;min-width:0;padding:14px 16px;font:400 var(--text-sm)/1.5 var(--font-mono);color:var(--paper-050);overflow-x:auto;white-space:pre}
-.cmd button{flex:none;border:0;border-left:1px solid var(--paper-a16);background:transparent;color:var(--paper-a72);font:500 var(--text-xs)/1 var(--font-sans);padding:0 16px;cursor:pointer}
+/* Both commands, always. The page is read on one machine and the command is run on a
+   different one, so a switch defaulted to the reader's OS is wrong by construction. */
+.block{margin-bottom:18px}
+.block:last-child{margin-bottom:0}
+.block h3{font:600 var(--text-sm)/1.3 var(--font-sans);margin-bottom:2px}
+.block .for{font:400 var(--text-xs)/1.5 var(--font-sans);color:var(--text-secondary);margin-bottom:9px}
+.cmd{display:flex;align-items:stretch;border:1px solid var(--border-line);border-radius:var(--radius-md);overflow:hidden;background:var(--surface-inverse)}
+.cmd code{flex:1;min-width:0;padding:13px 15px;font:400 var(--text-xs)/1.6 var(--font-mono);color:var(--paper-050);overflow-x:auto;white-space:pre}
+.cmd button{flex:none;border:0;border-left:1px solid var(--paper-a16);background:transparent;color:var(--paper-a72);font:500 var(--text-xs)/1 var(--font-sans);padding:0 15px;cursor:pointer}
 .cmd button:hover{background:var(--paper-a08);color:var(--paper-000)}
-.os{display:flex;gap:2px;margin-bottom:12px}
-.os button{font:500 var(--text-sm)/1.2 var(--font-sans);padding:7px 14px;border:1px solid var(--border-line);background:var(--surface-card);color:var(--text-secondary);cursor:pointer}
-.os button:first-child{border-radius:var(--radius-md) 0 0 var(--radius-md)}
-.os button:last-child{border-radius:0 var(--radius-md) var(--radius-md) 0;border-left:0}
-.os button[aria-pressed=true]{background:var(--surface-inverse);border-color:var(--surface-inverse);color:var(--text-inverse)}
-.chain{margin-top:16px;display:flex;flex-direction:column;gap:0}
-.link{display:flex;gap:12px;padding:11px 0;border-top:1px dashed var(--border-line)}
+.chain{margin-top:18px}
+.link{display:flex;gap:11px;padding:10px 0;border-top:1px dashed var(--border-line)}
 .link:first-child{border-top:0}
-.link .n{width:22px;height:22px;flex:none;border-radius:50%;background:var(--surface-sunken);color:var(--text-secondary);display:flex;align-items:center;justify-content:center;font:600 10px/1 var(--font-mono)}
+.link .n{width:21px;height:21px;flex:none;border-radius:50%;background:var(--surface-sunken);color:var(--text-secondary);display:flex;align-items:center;justify-content:center;font:600 10px/1 var(--font-mono)}
 .link .t{font:500 var(--text-sm)/1.4 var(--font-sans)}
 .link .d{font:400 var(--text-xs)/1.55 var(--font-sans);color:var(--text-secondary)}
-.link .d b{color:var(--text-primary);font-weight:600}
-.rule{margin-top:14px;padding:12px 14px;border-radius:var(--radius-md);background:var(--surface-accent-soft);border:1px solid var(--indigo-100);color:var(--indigo-800);font:400 var(--text-xs)/1.6 var(--font-sans)}
-.rule b{font-weight:600}
-.warn{margin-top:12px;padding:12px 14px;border-radius:var(--radius-md);background:var(--feedback-warning-bg);border:1px solid var(--feedback-warning-line);color:var(--feedback-warning-fg);font:400 var(--text-xs)/1.6 var(--font-sans)}
-.after{display:flex;align-items:center;gap:12px;padding:13px 15px;border-radius:var(--radius-md);background:var(--surface-sunken);font:400 var(--text-sm)/1.5 var(--font-sans);color:var(--text-secondary)}
+.after{display:flex;align-items:center;gap:11px;padding:13px 15px;border-radius:var(--radius-md);background:var(--surface-sunken);font:400 var(--text-sm)/1.55 var(--font-sans);color:var(--text-secondary)}
 .after .dot{width:8px;height:8px;border-radius:50%;background:var(--sage-500);flex:none}
+.warn{margin-top:12px;padding:12px 14px;border-radius:var(--radius-md);background:var(--feedback-warning-bg);border:1px solid var(--feedback-warning-line);color:var(--feedback-warning-fg);font:400 var(--text-xs)/1.6 var(--font-sans)}
+.nonet{padding:12px 14px;border-radius:var(--radius-md);background:var(--feedback-danger-bg);border:1px solid var(--feedback-danger-line);color:var(--feedback-danger-fg);font:400 var(--text-sm)/1.55 var(--font-sans);margin-bottom:14px}
 @media (max-width:560px){.shell{padding:18px 14px 48px}.cmd{flex-direction:column}.cmd button{border-left:0;border-top:1px solid var(--paper-a16);padding:11px 0}}
 </style></head><body>
 <div class="shell">
   <header class="top"><h1>Add a machine</h1><div class="machine"></div></header>
-  <p class="lede">Run one line on the other machine. It fetches the matching version, checks it, and joins this fleet — no downloads to find, no versions to match by hand.</p>
+  <p class="lede">Run one line <b>on the machine you are adding</b> — not on this one. It fetches the matching version, checks it, and joins.</p>
+
+  <p class="nonet" data-join-nonet>This machine has no network address other machines could reach, so there is no command to give yet. Connect it to the network and this page will fill in.</p>
 
   <section class="card">
-    <div class="os">
-      <button type="button" data-os="unix" aria-pressed="true">macOS &amp; Linux</button>
-      <button type="button" data-os="windows" aria-pressed="false">Windows</button>
+    <div class="block">
+      <h3>Windows</h3>
+      <div class="for">Paste into PowerShell on the machine you are adding.</div>
+      <div class="cmd"><code data-join-win>…</code><button type="button" data-copy="win">Copy</button></div>
     </div>
-    <div class="cmd">
-      <code data-join-cmd>SEAM_SERVER=192.168.2.69:24810 sh -c "$(curl -fsSL http://192.168.2.69:24810/join.sh)"</code>
-      <button type="button" data-copy>Copy</button>
+    <div class="block">
+      <h3>macOS &amp; Linux</h3>
+      <div class="for">Paste into Terminal on the machine you are adding.</div>
+      <div class="cmd"><code data-join-unix>…</code><button type="button" data-copy="unix">Copy</button></div>
     </div>
 
     <div class="chain">
-      <div class="link"><span class="n">1</span><div><div class="t">Asks this machine which version to run</div><div class="d">The only thing the other machine trusts this one for — a single version number.</div></div></div>
-      <div class="link"><span class="n">2</span><div><div class="t">Downloads that release from GitHub over TLS</div><div class="d">Not from here. A binary served off a machine on your network is unauthenticated and unverifiable.</div></div></div>
-      <div class="link"><span class="n">3</span><div><div class="t">Checks it against the release's published checksum</div><div class="d">A mismatch refuses to run rather than warning and continuing.</div></div></div>
-      <div class="link"><span class="n">4</span><div><div class="t">Keeps it, and starts</div><div class="d">Running the line again on an up-to-date machine <b>starts it</b> rather than downloading anything.</div></div></div>
+      <div class="link"><span class="n">1</span><div><div class="t">Asks this machine which version to run</div><div class="d">The only thing the new machine trusts this one for — a version number.</div></div></div>
+      <div class="link"><span class="n">2</span><div><div class="t">Downloads that release from GitHub over TLS</div><div class="d">Not from here. A binary served off your network would be the one thing nobody could verify.</div></div></div>
+      <div class="link"><span class="n">3</span><div><div class="t">Checks it against the published checksum</div><div class="d">A mismatch refuses to run rather than warning and carrying on.</div></div></div>
+      <div class="link"><span class="n">4</span><div><div class="t">Keeps it, and starts</div><div class="d">Running it again on an up-to-date machine starts it instead of downloading anything.</div></div></div>
     </div>
-
-    <p class="rule"><b>Why not just serve the binary from here?</b> Because then the machine handing out the software would be the one machine nobody verified. The version number is cheap to trust; the bytes are not, so they come from the release page with their checksums.</p>
   </section>
 
   <section class="card">
-    <h2>After it starts</h2>
-    <p class="sub">The two machines still have to be introduced — downloading seam is not the same as trusting it.</p>
-    <div class="after"><span class="dot"></span><div>Both screens will show the same six digits. Confirm they match, and the machines are paired for good.</div></div>
-    <p class="warn"><b>Every machine must run the same version.</b> Clipboard images and files need matching protocol on both ends, and a machine that is behind closes the link rather than guessing. This command always fetches the version this machine is running, which is what keeps them in step.</p>
+    <div class="after"><span class="dot"></span><div>The new machine opens its own activation page first, then both screens show the same six digits — confirm they match and the machines are paired for good.</div></div>
+    <p class="warn"><b>Every machine needs its own licence, and they must all run the same version.</b> Clipboard images and files need matching protocol on both ends, and a machine that is behind closes the link rather than guessing.</p>
   </section>
 </div>
 <script src="_ds/nav.js"></script>
 <script src="_ds/shared.js"></script>
 <script src="_ds/page-join.js"></script>
+<script src="_ds/quit.js"></script>
 </body></html>

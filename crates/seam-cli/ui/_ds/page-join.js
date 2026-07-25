@@ -1,31 +1,40 @@
-// Add a machine — the command, built from what the daemon actually knows.
+// Add a machine — both commands, built from what the daemon actually knows.
 //
-// Two things this gets right that the first version did not: the address is this
-// machine's LAN address as reported by the daemon (the browser only ever sees
-// 127.0.0.1, which is meaningless on the machine being added), and the script is fetched
-// from the public releases page rather than from here — seam's page listens on loopback
-// only, so the other machine could never have reached it.
+// No OS switch: this page is read on one machine and the command is run on a different
+// one, so defaulting to the reader's browser is wrong by construction — it handed a shell
+// command to someone standing at a PowerShell prompt. Showing both, labelled, removes the
+// state and the mistake together.
+//
+// The address is the daemon's LAN address, not the browser's view of itself: a page served
+// on loopback only ever sees 127.0.0.1, which is meaningless on the machine being added.
+// The script comes from the public releases page because seam's own page listens on
+// loopback and could never be reached from there.
 (function () {
   "use strict";
   var RELEASES = "https://github.com/amor-openmind/seam-releases/releases/latest/download";
-  var os = navigator.userAgent.indexOf("Windows") !== -1 ? "windows" : "unix";
   var server = null;
 
+  function commands() {
+    return {
+      win: '$env:SEAM_SERVER="' + server + '"; iwr -useb ' + RELEASES + '/join.ps1 | iex',
+      unix: 'SEAM_SERVER=' + server + ' sh -c "$(curl -fsSL ' + RELEASES + '/join.sh)"'
+    };
+  }
+
   function render() {
-    var el = document.querySelector("[data-join-cmd]");
-    if (!el) return;
+    var win = document.querySelector("[data-join-win]");
+    var unix = document.querySelector("[data-join-unix]");
     if (!server) {
-      el.textContent = "Waiting for this machine's network address…";
+      if (win) win.textContent = "—";
+      if (unix) unix.textContent = "—";
       return;
     }
-    el.textContent = os === "windows"
-      ? '$env:SEAM_SERVER="' + server + '"; iwr -useb ' + RELEASES + '/join.ps1 | iex'
-      : 'SEAM_SERVER=' + server + ' sh -c "$(curl -fsSL ' + RELEASES + '/join.sh)"';
+    var c = commands();
+    if (win) win.textContent = c.win;
+    if (unix) unix.textContent = c.unix;
   }
 
   window.seam.onState(function (s) {
-    // No LAN address means this machine is not on a network another can reach, and the
-    // command would be a lie. Say that instead of printing something that cannot work.
     server = s.lan ? s.lan + ":" + (s.seamPort || 24810) : null;
     var warn = document.querySelector("[data-join-nonet]");
     if (warn) warn.style.display = s.lan ? "none" : "";
@@ -34,29 +43,13 @@
 
   document.addEventListener("click", function (event) {
     var closest = event.target.closest ? event.target.closest.bind(event.target) : function () { return null; };
-    var pick = closest("[data-os]");
-    if (pick) {
-      os = pick.getAttribute("data-os");
-      var all = document.querySelectorAll("[data-os]");
-      for (var i = 0; i < all.length; i++) all[i].setAttribute("aria-pressed", all[i] === pick ? "true" : "false");
-      render();
-      return;
-    }
-    if (closest("[data-copy]")) {
-      var cmd = document.querySelector("[data-join-cmd]");
-      var btn = closest("[data-copy]");
-      if (!cmd || !server) return;
-      var done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1400); };
-      if (navigator.clipboard) navigator.clipboard.writeText(cmd.textContent).then(done, done);
-      else done();
-    }
+    var btn = closest("[data-copy]");
+    if (!btn || !server) return;
+    var text = commands()[btn.getAttribute("data-copy")];
+    var done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1400); };
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, done);
+    else done();
   });
 
-  // Match the switch to the machine most likely being added — the one you are reading on.
-  var initial = document.querySelector('[data-os="' + os + '"]');
-  if (initial) {
-    var all = document.querySelectorAll("[data-os]");
-    for (var i = 0; i < all.length; i++) all[i].setAttribute("aria-pressed", all[i] === initial ? "true" : "false");
-  }
   render();
 })();
