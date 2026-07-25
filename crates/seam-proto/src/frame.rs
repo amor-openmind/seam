@@ -32,7 +32,16 @@ use crate::{
 ///
 /// A bound is required before any allocation is sized from peer-supplied data;
 /// otherwise a single bad length prefix is a remote out-of-memory.
-pub const MAX_FRAME_LEN: usize = 64 * 1024;
+///
+/// Sized by the largest legitimate payload — a clipboard image — plus envelope. It was
+/// once 64 KB, set when every frame was an input event; the clipboard caps grew to
+/// megabytes above it and every real screenshot then died in the sender's own encoder,
+/// while the tiny codec test images sailed through. The compile-time checks below exist
+/// so the caps can never fall out of order again.
+pub const MAX_FRAME_LEN: usize = 160 * 1024 * 1024;
+
+const _: () = assert!(MAX_FRAME_LEN > MAX_IMAGE_BYTES, "images must fit the framing");
+const _: () = assert!(MAX_FRAME_LEN > MAX_FILES_BYTES, "file payloads must fit the framing");
 
 /// A stable, random identifier for a peer, so a machine keeps its identity across
 /// hostname changes and DHCP leases.
@@ -595,6 +604,45 @@ fn decode_key_state(r: &mut Reader<'_>) -> Result<KeyState, Error> {
         *word = r.u64()?;
     }
     Ok(KeyState::from_parts(words, Modifiers(r.u16()?)))
+}
+
+#[cfg(test)]
+mod realistic_sizes {
+    use super::*;
+
+    /// A real screenshot must survive the full framed round trip.
+    ///
+    /// The 4x4 codec samples proved nothing about size: the framing cap was 64 KB and
+    /// every actual screenshot died in the sender's own encoder, misreported as a
+    /// protocol-version mismatch. This is that field failure, pinned.
+    #[test]
+    fn a_full_screenshot_survives_framing() {
+        let (w, h) = (2560u32, 1440u32);
+        let rgba = vec![0x7Fu8; (w * h * 4) as usize]; // 14.7 MB
+        let frame = Frame::ClipboardImage { seq: 1, generation: 1, width: w, height: h, rgba };
+        let mut buf = Vec::new();
+        frame.encode_framed(&mut buf).expect("a screenshot-sized image must encode");
+        let (decoded, used) =
+            Frame::decode_framed(&buf).expect("and decode").expect("complete");
+        assert_eq!(used, buf.len());
+        assert_eq!(decoded, frame);
+    }
+
+    /// A files payload at the sender-side cap must survive framing too.
+    #[test]
+    fn a_max_size_file_copy_survives_framing() {
+        let frame = Frame::ClipboardFiles {
+            seq: 2,
+            generation: 2,
+            entries: vec![("big.bin".into(), vec![0xA5u8; 64 * 1024 * 1024])],
+        };
+        let mut buf = Vec::new();
+        frame.encode_framed(&mut buf).expect("a cap-sized file copy must encode");
+        let (decoded, used) =
+            Frame::decode_framed(&buf).expect("and decode").expect("complete");
+        assert_eq!(used, buf.len());
+        assert!(matches!(decoded, Frame::ClipboardFiles { .. }));
+    }
 }
 
 #[cfg(test)]

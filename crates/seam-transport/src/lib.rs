@@ -72,7 +72,10 @@ pub enum Error {
     )]
     IdentityConflict,
 
-    #[error("the peer speaks a different version of the seam protocol: {0}")]
+    // Named for what it usually is. Every codec error used to claim a protocol-version
+    // mismatch, which sent a real bug hunting in the wrong place: an over-limit frame is
+    // OUR side refusing to encode, not the peer speaking anything.
+    #[error("could not encode or decode a frame (oversized, truncated or malformed): {0}")]
     Protocol(#[from] seam_proto::Error),
 
     #[error("could not set up the encrypted connection: {0}")]

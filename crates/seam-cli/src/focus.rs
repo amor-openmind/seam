@@ -232,6 +232,19 @@ impl Graph {
         self.y = y.clamp(0, node.height - 1);
     }
 
+    /// Send the pointer home unconditionally — the panic path, and the UI's release
+    /// button. Same settling/lockout treatment as a crossing, so the return is clean.
+    pub(crate) fn force_home(&mut self) -> Update {
+        let before = self.current;
+        self.current = 0;
+        let node = &self.nodes[0];
+        self.x = self.x.clamp(0, node.width - 1);
+        self.y = self.y.clamp(0, node.height - 1);
+        self.settling = SETTLING_EVENTS;
+        self.lockout = CROSSING_LOCKOUT;
+        Update { focus: self.focus(), changed: self.current != before, x: self.x, y: self.y }
+    }
+
     /// Apply movement, crossing edges as needed.
     pub(crate) fn apply_motion(&mut self, dx: i32, dy: i32) -> Update {
         let before = self.current;

@@ -933,6 +933,13 @@ async fn apply_clipboard_files(
 
 // ---------------------------------------------------------------- ui
 
+/// Peer placements (which edge each sits on), for the UI's desk mapping.
+static UI_PLACES: std::sync::Mutex<Vec<(seam_proto::PeerId, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Set when the UI asks for input to come home; consumed by the forwarding loop.
+static UI_RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Which machine holds the pointer, for the UI. `None` means this one.
 static UI_FOCUS: std::sync::Mutex<Option<seam_proto::PeerId>> = std::sync::Mutex::new(None);
 
@@ -1000,7 +1007,11 @@ fn start_ui_server(
                 let request = String::from_utf8_lossy(&buf[..n]);
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
 
-                let (status, ctype, body) = if path == "/state" {
+                let method = request.split_whitespace().next().unwrap_or("GET");
+                let (status, ctype, body) = if method == "POST" && path == "/action/release" {
+                    UI_RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+                } else if path == "/state" {
                     ("200 OK", "application/json", ui_state_json(&name, id, &links).await)
                 } else if let Some((_, page, ctype)) =
                     UI_PAGES.iter().find(|(route, _, _)| *route == path)
@@ -1040,7 +1051,18 @@ async fn ui_state_json(
             peers.push(',');
         }
         let peer = link.peer_id();
-        let _ = write!(peers, r#"{{"id":"{peer}","name":"{peer}","addr":"{}"}}"#, link.remote_address());
+        let edge = UI_PLACES
+            .lock()
+            .ok()
+            .and_then(|places| {
+                places.iter().find(|(p, _)| *p == peer).map(|(_, edge)| *edge)
+            })
+            .unwrap_or("");
+        let _ = write!(
+            peers,
+            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}"}}"#,
+            link.remote_address()
+        );
     }
 
     let mut health = String::new();
@@ -1576,6 +1598,18 @@ async fn sync_peers(
             continue;
         }
         graph.place(*id, edge, anchor, w, h);
+        if let Ok(mut places) = UI_PLACES.lock() {
+            places.retain(|(p, _)| p != id);
+            places.push((
+                *id,
+                match edge {
+                    focus::Edge::Left => "left",
+                    focus::Edge::Right => "right",
+                    focus::Edge::Top => "top",
+                    focus::Edge::Bottom => "bottom",
+                },
+            ));
+        }
         known.push(*id);
         tracing::info!(peer = %id, ?edge, w, h, "placed — push the pointer off that edge to reach it");
     }
@@ -1901,6 +1935,27 @@ fn start_pointer_forwarding(
                     }
                     seam_input::macos::set_suppress_local(false);
                     detached = None;
+                }
+
+                // The UI's release button: send the pointer home before anything else.
+                if UI_RELEASE.swap(false, std::sync::atomic::Ordering::Relaxed)
+                    && graph.focus() != Focus::Local
+                {
+                    let u = graph.force_home();
+                    tracing::info!("input released to this machine from the fleet page");
+                    if let Some(lost) = holder {
+                        let links = Arc::clone(&links);
+                        tokio::spawn(async move {
+                            let peers = links.lock().await;
+                            if let Some(link) = peers.iter().find(|l| l.peer_id() == lost) {
+                                let _ = link
+                                    .send_reliable(&seam_proto::Frame::Leave { seq: 0 })
+                                    .await;
+                            }
+                        });
+                    }
+                    holder = None;
+                    detached = handover(u, detached);
                 }
 
                 // Movement decides ownership; everything else follows whoever owns it.
