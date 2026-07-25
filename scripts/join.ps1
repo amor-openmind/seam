@@ -18,23 +18,20 @@ $repo   = "amor-openmind/seam-releases"
 $server = $env:SEAM_SERVER
 $home_  = if ($env:SEAM_HOME) { $env:SEAM_HOME } else { Join-Path $env:USERPROFILE ".seam" }
 
-# The version is baked into the command by the page that generated it. Asking the server
-# was the original design and could never work: seam's HTTP page listens on loopback, and
-# the port peers use is QUIC over UDP - there is nothing on the network to ask.
-$version = $env:SEAM_VERSION
-if (-not $version) {
-  Write-Error "No version given. Copy the command from the Add a machine page."
-  return
-}
+# Always the latest release. GitHub resolves `latest` itself, so the command carries no
+# version and never goes stale - an earlier design put the version in the command and in an
+# environment variable, which turned a one-line join into something to keep in step by hand.
+$base = "https://github.com/$repo/releases/latest/download"
 
 New-Item -ItemType Directory -Force -Path $home_ | Out-Null
-$bin = Join-Path $home_ "seam-$version.exe"
+$bin = Join-Path $home_ "seam.exe"
 
-if (-not (Test-Path $bin)) {
-  Write-Host "seam: fetching v$version from GitHub..."
-  $base = "https://github.com/$repo/releases/download/v$version"
-  $tmp  = "$bin.part"
-  Invoke-WebRequest -UseBasicParsing "$base/seam.exe" -OutFile $tmp
+# Fetch every time: a few megabytes over a LAN is cheaper than reasoning about whether the
+# copy on disk is still newest, and re-running the command is how a person updates.
+Write-Host "seam: fetching the latest release..."
+$tmp = "$bin.part"
+Invoke-WebRequest -UseBasicParsing "$base/seam.exe" -OutFile $tmp
+if ($true) {
 
   # Verify before trusting the bytes.
   try {
@@ -49,8 +46,6 @@ if (-not (Test-Path $bin)) {
   } catch { }
 
   Move-Item -Force $tmp $bin
-} else {
-  Write-Host "seam: v$version already here"
 }
 
 Write-Host "seam: starting..."

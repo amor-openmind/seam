@@ -21,20 +21,23 @@ case "$(uname -s)" in
   *) echo "seam: this script covers macOS; on Windows use join.ps1" >&2; exit 1 ;;
 esac
 
-# The version is baked into the command by the page that generated it. Asking the server
-# was the original design and could never work: seam's HTTP page listens on loopback, and
-# the port peers use is QUIC over UDP — there is nothing on the network to ask.
-VERSION="${SEAM_VERSION:-}"
-[ -n "$VERSION" ] || { echo "seam: no version given. Copy the command from the Add a machine page." >&2; exit 1; }
+# Always the latest release. GitHub resolves `latest` itself, so the command carries no
+# version and never goes stale — an earlier design put the version in the command and in an
+# environment variable, which made a one-line join into something to keep in step by hand.
+#
+# Every machine on latest is also the state seam needs: versions must match across a fleet,
+# and "everyone takes the newest" is a rule a person can actually follow.
+BASE="https://github.com/$REPO/releases/latest/download"
 
 HOME_DIR="${SEAM_HOME:-$HOME/.seam}"
-BIN="$HOME_DIR/seam-$VERSION"
+BIN="$HOME_DIR/seam"
 mkdir -p "$HOME_DIR"
 
-if [ ! -x "$BIN" ]; then
-  echo "seam: fetching v$VERSION from GitHub…"
-  BASE="https://github.com/$REPO/releases/download/v$VERSION"
-  curl -fsSL "$BASE/$ASSET" -o "$BIN.part"
+# Fetch every time: a few megabytes over a LAN is cheaper than reasoning about whether the
+# copy on disk is still the newest, and re-running the command is how a person updates.
+echo "seam: fetching the latest release…"
+curl -fsSL "$BASE/$ASSET" -o "$BIN.part"
+if true; then
   # Verify against the release's own checksum file before trusting the bytes.
   if curl -fsSL "$BASE/SHA256SUMS.txt" -o "$HOME_DIR/sums.txt" 2>/dev/null; then
     WANT="$(sed -n "s|^\([0-9a-f]*\)  *.*$ASSET\$|\1|p" "$HOME_DIR/sums.txt" | head -1)"
@@ -47,9 +50,8 @@ if [ ! -x "$BIN" ]; then
   fi
   chmod +x "$BIN.part"
   mv "$BIN.part" "$BIN"
-else
-  echo "seam: v$VERSION already here"
 fi
+echo "seam: got $("$BIN" doctor 2>/dev/null | sed -n 's/.*seam  *\(v[0-9.]*\).*/\1/p' | head -1)"
 
 echo "seam: starting…"
 exec "$BIN" run --connect "$SERVER"
