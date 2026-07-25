@@ -172,6 +172,19 @@ pub fn inject_text(text: &str, down: bool) -> Result<(), Error> {
     }
 }
 
+/// Press or release a key by its physical identity, for keys that produce no text.
+pub fn inject_key(usage: u16, down: bool) -> Result<(), Error> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::inject_key(usage, down)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (usage, down);
+        Err(Error::Unsupported("key injection"))
+    }
+}
+
 /// What this machine will let seam do, as a human-readable report.
 ///
 /// Used by `seam doctor`. Returns `None` where permissions are not a concept.

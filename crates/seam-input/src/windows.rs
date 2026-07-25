@@ -308,3 +308,53 @@ pub fn inject_text(text: &str, down: bool) -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// USB HID usage to Windows virtual-key code.
+///
+/// Only for keys that produce no text. Anything that types a character is injected as
+/// that character with `KEYEVENTF_UNICODE`, which is layout-independent; these keys have
+/// no character, so they must be named by which key they are.
+const fn virtual_key_for(usage: u16) -> u16 {
+    match usage {
+        0x2A => 0x08, // Backspace
+        0x28 => 0x0D, // Return
+        0x2B => 0x09, // Tab
+        0x29 => 0x1B, // Escape
+        0x4C => 0x2E, // Delete
+        0x50 => 0x25, // Left
+        0x4F => 0x27, // Right
+        0x51 => 0x28, // Down
+        0x52 => 0x26, // Up
+        0x4A => 0x24, // Home
+        0x4D => 0x23, // End
+        0x4B => 0x21, // Page Up
+        0x4E => 0x22, // Page Down
+        // F1..F12 are contiguous in both encodings, so the offset maps them all.
+        0x3A..=0x45 => 0x70 + (usage - 0x3A),
+        _ => 0,
+    }
+}
+
+/// Press or release a key by its physical identity.
+///
+/// Returns `Unsupported` for a key this build does not know, so the caller can fall back
+/// to typing the character instead of silently doing nothing.
+pub fn inject_key(usage: u16, down: bool) -> Result<(), Error> {
+    let vk = virtual_key_for(usage);
+    if vk == 0 {
+        return Err(Error::Unsupported("that key"));
+    }
+    let mut input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        // SAFETY: INPUT is a union of POD; zeroing is a valid initial state.
+        Anonymous: unsafe { core::mem::zeroed() },
+    };
+    input.Anonymous.ki = KEYBDINPUT {
+        wVk: vk,
+        wScan: 0,
+        dwFlags: if down { 0 } else { KEYEVENTF_KEYUP },
+        time: 0,
+        dwExtraInfo: 0,
+    };
+    send_one(input)
+}

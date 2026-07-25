@@ -709,9 +709,9 @@ fn to_frame(event: seam_input::macos::Observed, seq: u32) -> Option<seam_proto::
             unit: seam_proto::ScrollUnit::Detent,
             end_of_gesture: false,
         }),
-        Observed::Key { text, down } => seam_proto::Frame::Key(seam_proto::KeyEvent {
+        Observed::Key { text, physical, down } => seam_proto::Frame::Key(seam_proto::KeyEvent {
             seq,
-            physical: seam_proto::PhysicalKey::UNKNOWN,
+            physical,
             logical: text,
             press: press(down),
             modifiers: seam_proto::Modifiers::NONE,
@@ -753,11 +753,16 @@ async fn receive_reliable(link: Arc<Link>, geometry: Geometry) {
     loop {
         match link.recv_reliable().await {
             Ok(seam_proto::Frame::Key(k)) => {
-                if k.logical.is_empty() {
-                    continue;
-                }
-                if let Err(e) = seam_input::inject_text(k.logical.as_str(), k.press.is_down()) {
-                    tracing::warn!(%peer, "could not type: {e}");
+                // A key with no text - Backspace, Escape, an arrow, a function key - can
+                // only be reproduced by its physical identity. A key that produced text
+                // is reproduced as that text, which is what survives a layout mismatch.
+                let outcome = if k.logical.is_empty() {
+                    seam_input::inject_key(k.physical.0, k.press.is_down())
+                } else {
+                    seam_input::inject_text(k.logical.as_str(), k.press.is_down())
+                };
+                if let Err(e) = outcome {
+                    tracing::warn!(%peer, physical = k.physical.0, "could not send key: {e}");
                 }
             }
             Ok(seam_proto::Frame::Button(b)) => {

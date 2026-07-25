@@ -411,6 +411,9 @@ const K_CG_MOUSE_DELTA_Y: u32 = 5;
 const K_CG_UNACCELERATED_X: u32 = 170;
 const K_CG_UNACCELERATED_Y: u32 = 171;
 
+/// `kCGKeyboardEventKeycode` — the physical key, independent of what it types.
+const K_CG_KEYBOARD_KEYCODE: u32 = 9;
+
 /// `kCGScrollWheelEventDeltaAxis1` — vertical, in wheel notches.
 const K_CG_SCROLL_DELTA_AXIS1: u32 = 11;
 /// `kCGScrollWheelEventDeltaAxis2` — horizontal.
@@ -506,12 +509,17 @@ pub enum Observed {
     Button { button: u8, down: bool },
     /// Scrolled. Positive `dy` is away from the user, matching the protocol's convention.
     Scroll { dx: i32, dy: i32 },
-    /// A key changed state, carrying the text the *local* layout produced.
+    /// A key changed state.
+    ///
+    /// `text` is what the *local* layout produced, and `physical` identifies the key
+    /// itself. Both are carried because keys divide into two kinds and each needs a
+    /// different one: `@` must arrive as the glyph, while Backspace and F5 produce no
+    /// text at all and can only be described by which key they are.
     ///
     /// The text is what makes mismatched layouts work: a German Apple keyboard types `@`
     /// as `Option+L`, and sending the resulting glyph is the only way the receiver can
     /// reproduce it without knowing anything about the sender's layout.
-    Key { text: LogicalText, down: bool },
+    Key { text: LogicalText, physical: seam_proto::PhysicalKey, down: bool },
 }
 
 /// State shared with the tap callback. Boxed and leaked deliberately: the callback may
@@ -524,6 +532,44 @@ struct TapState {
 // SAFETY: the only field touched from the callback thread is `sender`, which is Send, and
 // `tap`, which is only compared and passed back to CoreGraphics.
 unsafe impl Send for TapState {}
+
+/// macOS virtual keycode to USB HID usage.
+///
+/// Only the keys that produce **no text** need to be here. Everything that types a
+/// character travels as that character instead, which is what makes mismatched layouts
+/// work — but Backspace, Enter, Tab, Escape, the arrows and the function keys have no
+/// character at all, and without this they were being dropped entirely.
+const fn hid_usage_for(keycode: u16) -> seam_proto::PhysicalKey {
+    let usage: u16 = match keycode {
+        0x33 => 0x2A, // Delete (Backspace)
+        0x24 => 0x28, // Return
+        0x30 => 0x2B, // Tab
+        0x35 => 0x29, // Escape
+        0x75 => 0x4C, // Forward Delete
+        0x7B => 0x50, // Left
+        0x7C => 0x4F, // Right
+        0x7D => 0x51, // Down
+        0x7E => 0x52, // Up
+        0x73 => 0x4A, // Home
+        0x77 => 0x4D, // End
+        0x74 => 0x4B, // Page Up
+        0x79 => 0x4E, // Page Down
+        0x7A => 0x3A, // F1
+        0x78 => 0x3B,
+        0x63 => 0x3C,
+        0x76 => 0x3D,
+        0x60 => 0x3E,
+        0x61 => 0x3F,
+        0x62 => 0x40,
+        0x64 => 0x41,
+        0x65 => 0x42,
+        0x6D => 0x43,
+        0x67 => 0x44,
+        0x6F => 0x45, // F12
+        _ => 0,
+    };
+    seam_proto::PhysicalKey(usage)
+}
 
 /// Turn a CoreGraphics event into something the protocol can carry.
 ///
@@ -545,8 +591,14 @@ unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observe
                     CGEventGetIntegerValueField(event, K_CG_MOUSE_DELTA_Y),
                 )
             };
-            // Prefer raw movement; fall back to cursor delta if the field is absent.
-            let (dx, dy) = if raw_x != 0 || raw_y != 0 { (raw_x, raw_y) } else { (dx, dy) };
+            // Prefer the *accelerated* cursor delta, so the pointer moves at the same
+            // speed on every machine as it does here — raw device counts are unscaled and
+            // make a remote screen feel much faster than the local one.
+            //
+            // Fall back to raw movement when the accelerated delta is zero, which happens
+            // when the cursor is pinned against a screen edge. That case is why raw is
+            // read at all: without it the pointer can never reach the boundary to cross.
+            let (dx, dy) = if dx != 0 || dy != 0 { (dx, dy) } else { (raw_x, raw_y) };
             #[expect(clippy::cast_possible_truncation, reason = "screen coordinates fit i32")]
             Some(Observed::Motion {
                 x: p.x.round() as i32,
@@ -583,6 +635,10 @@ unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observe
         }
 
         K_CG_EVENT_KEY_DOWN | K_CG_EVENT_KEY_UP => {
+            // SAFETY: valid event; by-value getter.
+            let keycode = unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_KEYCODE) };
+            let physical = hid_usage_for(u16::try_from(keycode).unwrap_or(0));
+
             let mut buffer = [0u16; 8];
             let mut length: usize = 0;
             // SAFETY: `buffer` has 8 elements and that bound is passed, so CoreGraphics
@@ -601,10 +657,12 @@ unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observe
             // text, so they must not be replayed as a glyph.
             let text: String = text.chars().filter(|c| !c.is_control()).collect();
             let logical = LogicalText::new(&text).unwrap_or(LogicalText::NONE);
-            if logical.is_empty() {
+            // A key with neither text nor a known identity cannot be reproduced, so
+            // sending it would only produce a phantom keystroke.
+            if logical.is_empty() && physical.is_unknown() {
                 return None;
             }
-            Some(Observed::Key { text: logical, down: event_type == K_CG_EVENT_KEY_DOWN })
+            Some(Observed::Key { text: logical, physical, down: event_type == K_CG_EVENT_KEY_DOWN })
         }
 
         _ => None,
