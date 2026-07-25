@@ -463,6 +463,44 @@ than another cursor warp.
 
 ---
 
+## 12a. Design governance — permanent rule for every feature and config
+
+**Claude Design is the source of truth for everything visible, for the life of this
+project.** Not a phase — a standing rule:
+
+1. **Every** feature, config surface, dialog, notification, status, empty state, error
+   state and OS chrome is authored in Claude Design first — "Seam Pages"
+   (e3000f2f-209b-434d-b7a8-4ca8813e66d0), consuming the "Seams Design System"
+   (22ae8beb-c703-4b1c-aa6d-ae63e84ef135). New reusable pieces go into the DS itself.
+2. **Ask Claude Design for ideas, new designs and redesigns** — author explorations and
+   alternatives in the design project and pick there, not in code. When a surface feels
+   wrong, it is redesigned in Claude Design and re-pulled; it is never patched in code.
+3. The frontend **renders the produced structure 1:1**. Implementation work is binding:
+   real daemon state, real events, real actions wrapped around the design's elements.
+   Hand-editing the visible part of the frontend — any element, style, spacing or copy —
+   is a violation, including "small fixes" and "temporary" states.
+4. A design/business conflict is resolved by fixing the DESIGN first (a template must
+   never override a real constraint like the zero-config principle or the pairing trust
+   model), then re-injecting.
+
+**Surface inventory** (each needs design coverage before its frontend exists —
+authored ✓ / to ask Claude Design for ✗):
+
+| Surface | State |
+|---|---|
+| Fleet dashboard (desk, peers, health, activity) | ✓ index.html |
+| Transfers (streaming, resume, history, refusals) | ✓ transfers.html |
+| Pairing flow incl. SAS verify + refusal | ✓ pairing.html |
+| Settings (sharing, behaviour, notifications, diagnostics, danger) | ✓ settings.html |
+| Onboarding + macOS permission walkthrough (the per-binary re-grant pain) | ✗ |
+| Menu-bar dropdown (macOS) / tray popover (Windows) — the everyday chrome | ✗ |
+| Toasts/notifications (peer joined/dropped, transfer done/failed, update) | ✗ |
+| Doctor report as a full page (what's wrong and the exact fix) | ✗ |
+| Degraded states: tap disabled, UIPI elevated-window warning, mirrors-not-switching | ✗ |
+| Empty states: no peers yet, nothing transferred yet | ✗ |
+| Update flow (new version available → restart → re-grant reminder) | ✗ |
+| Compact/mobile-width variants of all of the above | ✗ |
+
 ## 12. /goal — design-driven frontend + streaming clipboard (in progress)
 
 **Objective**: a real user-facing frontend on every OS — status, pairing, layout,
