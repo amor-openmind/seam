@@ -1183,6 +1183,7 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/_ds/bind.js", include_str!("../ui/_ds/bind.js"), "text/javascript; charset=utf-8"),
     ("/_ds/shared.js", include_str!("../ui/_ds/shared.js"), "text/javascript; charset=utf-8"),
     ("/_ds/nav.js", include_str!("../ui/_ds/nav.js"), "text/javascript; charset=utf-8"),
+    ("/_ds/quit.js", include_str!("../ui/_ds/quit.js"), "text/javascript; charset=utf-8"),
     (
         "/_ds/page-settings.js",
         include_str!("../ui/_ds/page-settings.js"),

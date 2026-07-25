@@ -131,7 +131,6 @@
   function tick() {
     fetch("/state").then(function (r) { return r.json(); }).then(apply).catch(function () {});
   }
-  function closeTab() { try { window.close(); } catch (ignored) {} }
 
   document.addEventListener("click", function (event) {
     var closest = event.target.closest ? event.target.closest.bind(event.target) : function () { return null; };
@@ -157,11 +156,6 @@
     }
     if (closest("[data-action=release]")) {
       fetch("/action/release", { method: "POST" }).then(tick).catch(function () {});
-    } else if (closest("[data-action=quit]")) {
-      fetch("/action/quit", { method: "POST" }).then(closeTab, closeTab);
-      var m = document.querySelector("header.top .machine");
-      if (m) m.innerHTML = "seam stopped<br>launch the app to start again";
-      setTimeout(closeTab, 400);
     }
   });
 

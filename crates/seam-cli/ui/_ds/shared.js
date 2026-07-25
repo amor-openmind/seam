@@ -55,14 +55,6 @@
     }
   });
 
-  document.addEventListener("click", function (event) {
-    var closest = event.target.closest ? event.target.closest.bind(event.target) : function () { return null; };
-    if (closest("[data-action=quit]")) {
-      fetch("/action/quit", { method: "POST" }).catch(function () {});
-      setTimeout(function () { try { window.close(); } catch (e) {} }, 300);
-    }
-  });
-
   tick();
   setInterval(tick, POLL_MS);
 })();
