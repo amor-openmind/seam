@@ -460,3 +460,52 @@ With the tap at the HID location the cursor should stop moving. It still sits wh
 left. Hiding it needs foreground status, which a daemon does not have — two attempts to
 work around that failed and one locked the machine, so the real fix is a UI agent rather
 than another cursor warp.
+
+---
+
+## 12. /goal — design-driven frontend + streaming clipboard (in progress)
+
+**Objective**: a real user-facing frontend on every OS — status, pairing, layout,
+notifications, settings — with every visible element authored in Claude Design and never
+hand-touched; and chunked, resumable streaming for clipboard payloads over the 64 MB cap.
+
+**Design source of truth**
+- Design System: "Seams Design System" (claude.ai/design/p/22ae8beb-c703-4b1c-aa6d-ae63e84ef135)
+  — already populated: warm paper/ink/indigo tokens, Archivo + IBM Plex Mono + Instrument
+  Serif, core components (Button, Dialog, Toast, Badge, Table, Tabs, forms), brand
+  guidelines. Its status vocabulary maps onto KVM state: approved→connected,
+  in-production→holding pointer, at-risk→degraded, late→offline.
+- Pages: "Seam Pages" (claude.ai/design/p/e3000f2f-209b-434d-b7a8-4ca8813e66d0).
+  Authored so far, render-verified:
+  - `index.html` — fleet dashboard: identity, the real desk topology (iMac left,
+    laptop below iMac, live pointer focus), peers with status pills, permission
+    health (the doctor as UI, including the mirrors-instead-of-switching warning),
+    activity feed from the real log lines.
+  - `transfers.html` — clipboard transfers: chunked progress, pause/resume,
+    resumed-after-reconnect state, refused-over-cap state, history table.
+  - `_ds/tokens.css` — verbatim mirror of the DS tokens (DS remains the source; edit
+    there, re-mirror here).
+  Still to author: pairing flow (SAS confirmation), settings, notifications/toasts,
+  per-OS chrome variants, mobile layouts.
+
+**Streaming clipboard design (frame kinds 0x60–0x6F, reserved since v0.1.0)**
+1. `TransferOffer {id, generation, kind: files|image, manifest: [(path, size, sha256)]}` —
+   sent instead of ClipboardFiles/Image when total > 64 MB.
+2. Receiver pastes a *promise* immediately (Windows: IDataObject with
+   CFSTR_FILEDESCRIPTORW/CFSTR_FILECONTENTS; macOS: spool-on-demand), pulls with
+   `TransferPull {id, index}` — lazy: chunks fetched only when the paste target reads.
+3. `TransferChunk {id, index, bytes}` — 1 MB chunks over one reliable QUIC stream per
+   transfer; per-chunk sha-256; receiver acks high-water mark.
+4. Resume: on reconnect the receiver re-sends its high-water mark; sender continues from
+   there. Chunks already landed are never resent.
+5. Cancel/timeout: either side sends `TransferAbort {id, reason}`; spool partials swept.
+
+**Honest phase status (per the completion contract)**
+1. Design authored + render-verified: PARTIAL (2 pages of ~6; desktop only).
+2. Sync/mapping into the app: NOT STARTED.
+3. Frontend shells (menu-bar app on macOS, tray app on Windows) rendering the design 1:1:
+   NOT STARTED — the daemon currently has no GUI at all.
+4. Real data binding: NOT STARTED (page data is illustrative, from real log values).
+5. Tests/E2E for the frontend: NOT STARTED.
+6. Streaming protocol: DESIGNED above, NOT IMPLEMENTED — v0.2.1 ships the 64 MB
+   single-frame cap.
