@@ -2,7 +2,7 @@
 //!
 //! # Identity is derived from the key, not assigned
 //!
-//! A peer's [`PeerId`] is the first 16 bytes of the SHA-256 of its public key (SPKI).
+//! A peer's [`PeerId`] is the first 16 bytes of the SHA-256 of its own certificate.
 //! Nothing generates or stores an identifier separately, which has three consequences
 //! that matter:
 //!
@@ -17,29 +17,36 @@
 
 use std::collections::BTreeMap;
 
-use rcgen::PublicKeyData;
 use seam_proto::PeerId;
 use sha2::{Digest, Sha256};
 
 use crate::Error;
 
-/// SHA-256 of a peer's DER-encoded `SubjectPublicKeyInfo`.
+/// SHA-256 of a peer's DER-encoded X.509 certificate.
 ///
-/// This is the value pinned after pairing, and the value both sides feed into the
-/// pairing code. Comparing full fingerprints is a machine's job; humans compare the
-/// 6-digit code in [`crate::pairing`] instead.
+/// This is the value pinned after pairing. Comparing full fingerprints is a machine's
+/// job; humans compare the 6-digit code in [`crate::pairing`] instead.
+///
+/// # Why the certificate and not the `SubjectPublicKeyInfo`
+///
+/// Pinning the SPKI is the textbook choice, because it survives certificate rotation.
+/// seam pins the whole certificate instead, for one reason: TLS hands the verifier a
+/// `CertificateDer` and nothing else, so extracting the SPKI would mean taking on an
+/// X.509 parser purely to reach a field we then hash. seam generates both certificates
+/// itself, never rotates them, and never checks their names or expiry — so the two are
+/// equivalent in practice, and this way there is no parser to be wrong.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Fingerprint([u8; 32]);
 
 impl Fingerprint {
-    /// Hash a DER-encoded `SubjectPublicKeyInfo`.
+    /// Hash a DER-encoded X.509 certificate.
     #[must_use]
-    pub fn of_spki(spki_der: &[u8]) -> Self {
+    pub fn of_certificate(cert_der: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         // Domain separation: this hash is used as an identity, so it must never collide
         // with a hash of the same bytes computed for some other purpose.
-        hasher.update(b"seam-peer-spki-v1");
-        hasher.update(spki_der);
+        hasher.update(b"seam-peer-cert-v1");
+        hasher.update(cert_der);
         Self(hasher.finalize().into())
     }
 
@@ -50,7 +57,7 @@ impl Fingerprint {
 
     /// The [`PeerId`] this fingerprint yields.
     ///
-    /// 128 bits of a SHA-256 preimage-resistant hash: finding a key pair that collides
+    /// 128 bits of a SHA-256 preimage-resistant hash: finding a certificate that collides
     /// with a given peer's id is a ~2^64 birthday search, and doing so buys nothing on
     /// its own because the TLS handshake still requires the matching private key.
     #[must_use]
@@ -97,7 +104,6 @@ impl core::fmt::Debug for Fingerprint {
 pub struct Identity {
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
-    spki_der: Vec<u8>,
     fingerprint: Fingerprint,
 }
 
@@ -111,24 +117,20 @@ impl Identity {
         let certified = rcgen::generate_simple_self_signed(vec!["seam.invalid".to_owned()])
             .map_err(|e| Error::Identity(e.to_string()))?;
 
-        let spki_der = certified.signing_key.subject_public_key_info();
-        let fingerprint = Fingerprint::of_spki(&spki_der);
+        let cert_der = certified.cert.der().to_vec();
+        let fingerprint = Fingerprint::of_certificate(&cert_der);
 
-        Ok(Self {
-            cert_der: certified.cert.der().to_vec(),
-            key_der: certified.signing_key.serialize_der(),
-            spki_der,
-            fingerprint,
-        })
+        Ok(Self { cert_der, key_der: certified.signing_key.serialize_der(), fingerprint })
     }
 
     /// Reconstruct from persisted DER bytes.
     pub fn from_der(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<Self, Error> {
-        let key = rcgen::KeyPair::try_from(key_der.as_slice())
+        // Parsed and discarded purely to reject a corrupt key file at load time rather
+        // than at the first handshake, where the error would be far from its cause.
+        rcgen::KeyPair::try_from(key_der.as_slice())
             .map_err(|e| Error::Identity(format!("stored private key is unusable: {e}")))?;
-        let spki_der = key.subject_public_key_info();
-        let fingerprint = Fingerprint::of_spki(&spki_der);
-        Ok(Self { cert_der, key_der, spki_der, fingerprint })
+        let fingerprint = Fingerprint::of_certificate(&cert_der);
+        Ok(Self { cert_der, key_der, fingerprint })
     }
 
     #[must_use]
@@ -139,11 +141,6 @@ impl Identity {
     #[must_use]
     pub fn private_key_der(&self) -> &[u8] {
         &self.key_der
-    }
-
-    #[must_use]
-    pub fn spki_der(&self) -> &[u8] {
-        &self.spki_der
     }
 
     #[must_use]
@@ -279,15 +276,15 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_bound_to_the_public_key() {
+    fn fingerprint_is_bound_to_the_certificate() {
         let a = Identity::generate().unwrap();
-        assert_eq!(Fingerprint::of_spki(a.spki_der()), a.fingerprint());
-        assert_ne!(Fingerprint::of_spki(b"not the key"), a.fingerprint());
+        assert_eq!(Fingerprint::of_certificate(a.certificate_der()), a.fingerprint());
+        assert_ne!(Fingerprint::of_certificate(b"not the certificate"), a.fingerprint());
     }
 
     #[test]
     fn peer_id_is_the_fingerprint_prefix() {
-        let fp = Fingerprint::of_spki(b"example");
+        let fp = Fingerprint::of_certificate(b"example");
         assert_eq!(fp.peer_id().0, fp.as_bytes()[..16]);
     }
 
@@ -358,7 +355,7 @@ mod tests {
 
     #[test]
     fn grouped_hex_is_readable_and_complete() {
-        let fp = Fingerprint::of_spki(b"example");
+        let fp = Fingerprint::of_certificate(b"example");
         let text = fp.to_grouped_hex();
         assert_eq!(text.replace(' ', "").len(), 64);
         assert_eq!(text.split(' ').count(), 16);

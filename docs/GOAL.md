@@ -223,14 +223,34 @@ corresponding fix:
 
 | Host | Address | Platform | Physical position | Status |
 |---|---|---|---|---|
-| `Mac-mini` | 192.168.2.69 | macOS 26.5.2, arm64 (M4) | right | ✅ available |
-| `AMorIMac-2` ("iMac") | 192.168.2.111 | **Windows** (ports 135/445 confirm it) | left, upper | ✅ reachable, 78 ms RTT |
-| `om-amorabbi23-2` ("amor") | 192.168.2.193 | **Windows** | left, below the iMac | 💤 asleep at scan time |
-| `linux.local` | 192.168.2.109 | Linux | — | 💤 asleep at scan time |
+| `Mac-mini` | 192.168.2.69 | macOS 26.5.2, arm64 (M4), LG 2560x1080 | right | ✅ up |
+| `AMorIMac-2` ("iMac") | 192.168.2.111 | **Windows** (135/139/445/5040/7680 open) | left, **same level as Mac-mini** | ✅ up |
+| `om-amorabbi23-2` ("amor") | 192.168.2.193 | **Windows**, Dell laptop (7680 open) | below the iMac | ✅ up |
+| `linux.local` | 192.168.2.109 | Linux | — | ✅ present (live ARP) |
 
-Note the layout is **not** a horizontal row: the iMac sits *above* amor, and Mac-mini is to
-the right of both. Barrier's config models this as a per-edge graph and gets it wrong at
-corners. seam must handle a genuine 2-D edge graph, not a left/right chain.
+```
+ [ iMac / Windows ]  [ Mac-mini / macOS ]
+ [ amor  / Windows ]
+```
+
+The layout is a genuine **2-D edge graph, not a row**. Note the corner: amor's right edge
+and Mac-mini's bottom-left corner touch only diagonally, so part of Mac-mini's left edge
+borders the iMac and part borders nothing at all. Barrier models this as per-edge links
+and gets corners wrong; seam must handle partial edge adjacency and dead zones (F13/F14).
+
+### Correction — ICMP is not a liveness test
+
+An earlier pass reported `.193` and `.109` as "asleep" because they did not answer ping.
+Both were in fact powered on and in use: **Windows Firewall drops ICMP echo by default.**
+The reliable signals were a live ARP entry, an open TCP port, and mDNS resolution — all
+three confirmed every machine.
+
+This is a bug seam must not ship: **discovery and liveness must never depend on ICMP.**
+It also validates mDNS-first discovery (D8), which resolved all three names correctly.
+
+Note the two Windows machines have *different* firewall profiles — `.111` exposes SMB/RPC,
+`.193` exposes only 7680. seam must therefore work without any inbound port being opened
+by hand (Z7), and must not assume a peer is unreachable because a probe was refused.
 
 **E2E must work with no SSH and no credentials** — confirmed as a constraint by the user.
 That rules out driving the Windows peers from a remote shell, and it is the right

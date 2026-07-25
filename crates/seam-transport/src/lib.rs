@@ -32,9 +32,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod endpoint;
 pub mod identity;
 pub mod pairing;
+mod tls;
 
+pub use endpoint::{Endpoint, Link};
 pub use identity::{Fingerprint, Identity, Trust, TrustStore, TrustedPeer};
 pub use pairing::{CODE_DIGITS, EXPORTER_LABEL, PairingCode};
 
@@ -69,4 +72,28 @@ pub enum Error {
 
     #[error("the peer speaks a different version of the seam protocol: {0}")]
     Protocol(#[from] seam_proto::Error),
+
+    #[error("could not set up the encrypted connection: {0}")]
+    Tls(String),
+
+    #[error("could not bind to {addr}: {reason}")]
+    Bind { addr: std::net::SocketAddr, reason: String },
+
+    #[error("could not reach the peer at {addr}: {reason}")]
+    Connect { addr: std::net::SocketAddr, reason: String },
+
+    #[error("the peer presented no certificate, so its identity could not be established")]
+    NoPeerCertificate,
+
+    #[error(
+        "refused to send this frame as an unreliable datagram: only pointer motion can \
+         recover from being dropped"
+    )]
+    NotDatagramSafe,
+
+    #[error("could not send to the peer: {0}")]
+    Send(String),
+
+    #[error("could not receive from the peer: {0}")]
+    Recv(String),
 }
