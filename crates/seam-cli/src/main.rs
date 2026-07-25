@@ -666,7 +666,10 @@ async fn daemon(
 
     let store = Arc::new(store::load_peers(dir));
     let endpoint =
-        Arc::new(Endpoint::bind(Arc::clone(&identity), format!("0.0.0.0:{port}").parse()?)?);
+        match bind_or_show_running(dir, &identity, port)? {
+            std::ops::ControlFlow::Continue(endpoint) => endpoint,
+            std::ops::ControlFlow::Break(()) => return Ok(()),
+        };
     let bound = endpoint.local_addr()?;
     let name = Discovery::default_display_name(identity.peer_id());
 
@@ -809,6 +812,12 @@ async fn receive_from(
                 // The pointer went somewhere else: hide this machine's cursor, exactly
                 // as the server hides its own. Reveal happens on the next arriving
                 // motion, on link loss, and at startup — fail open, always.
+                // The pointer went to some other machine. A client cannot know which, so
+                // it records the peer that told it — the machine holding the session —
+                // rather than claiming the pointer is still here.
+                if let Ok(mut focus) = UI_FOCUS.lock() {
+                    *focus = Some(peer);
+                }
                 #[cfg(target_os = "windows")]
                 {
                     seam_input::windows::conceal_cursor();
@@ -816,8 +825,22 @@ async fn receive_from(
                 }
             }
             Ok(seam_proto::Frame::Motion(motion)) => {
+                // A peer that sends motion is a machine that captures input. Learned by
+                // observation rather than announced: the protocol carries no capability
+                // field, and inventing one from a guess is how a UI starts lying.
+                if let Ok(mut roles) = UI_ROLES.lock()
+                    && !roles.iter().any(|(p, _)| *p == peer)
+                {
+                    roles.push((peer, "shares input"));
+                }
                 #[cfg(target_os = "windows")]
                 seam_input::windows::reveal_if_concealed();
+                // Input arriving means the pointer is HERE. A client has no focus graph,
+                // so without this its page always claimed the pointer was local and its
+                // own screen stayed highlighted no matter where the pointer really was.
+                if let Ok(mut focus) = UI_FOCUS.lock() {
+                    *focus = None;
+                }
                 let (px, py) = motion.cursor.to_px();
                 // The sender's coordinates are its own; clamp onto a real display here so
                 // a mismatched resolution can never strand the pointer somewhere invisible.
@@ -884,6 +907,7 @@ async fn apply_clipboard_image(
     match seam_input::clipboard::write_image(width, height, &rgba) {
         Ok(()) => {
             tracing::info!(%peer, width, height, bytes = rgba.len(), "clipboard image received");
+            note_transfer("image received", format!("{width} x {height}"));
             state.applied_generation = generation;
             state.image_sig = Some(image_signature(width, height, &rgba));
             state.last_seen = None;
@@ -947,6 +971,7 @@ async fn apply_clipboard_files(
         Ok(()) => {
             let bytes: usize = entries.iter().map(|(_, b)| b.len()).sum();
             tracing::info!(%peer, files = entries.len(), bytes, "clipboard files received");
+            note_transfer("files received", format!("{} files, {} KB", entries.len(), bytes / 1024));
             state.applied_generation = generation;
             state.files_sig = Some(files_signature(&spooled));
             state.last_seen = None;
@@ -978,6 +1003,23 @@ async fn apply_clipboard_files(
 /// once can never find this machine again, and discovery becomes the only way in — so any
 /// hiccup there looks like seam being broken. Fixed by default, overridable.
 const DEFAULT_PORT: u16 = 24810;
+
+/// The most recent clipboard movement, for the fleet page. Text is cheap and instant;
+/// an image or a folder is not, and a page that shows nothing while megabytes move is
+/// indistinguishable from one that is broken.
+static UI_TRANSFER: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Note what the clipboard is doing, for the UI.
+fn note_transfer(what: &str, detail: String) {
+    if let Ok(mut slot) = UI_TRANSFER.lock() {
+        *slot = Some((what.to_owned(), detail));
+    }
+}
+
+/// What each peer can do — capture and share input, or only replay it. Learned from
+/// the peer's own announcement, never assumed.
+static UI_ROLES: std::sync::Mutex<Vec<(seam_proto::PeerId, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Peers this machine dialled — it is their client; the ones that dialled us are ours.
 static UI_DIALLED: std::sync::Mutex<Vec<seam_proto::PeerId>> = std::sync::Mutex::new(Vec::new());
@@ -1218,7 +1260,6 @@ async fn ui_state_json(
         .map_or_else(|| "local".to_owned(), |peer| peer.to_string());
 
     let mut peers = String::new();
-    let mut accepted_any = false;
     for link in links.lock().await.iter() {
         if !peers.is_empty() {
             peers.push(',');
@@ -1235,12 +1276,17 @@ async fn ui_state_json(
         // accepted the connection is the server for that pair.
         let we_dialled =
             UI_DIALLED.lock().is_ok_and(|dialled| dialled.contains(&peer));
-        // From our side: if we dialled them, they accepted, so THEY are the server and
-        // we are their client — and vice versa.
-        let role = if we_dialled { "server" } else { "client" };
-        if !we_dialled {
-            accepted_any = true;
-        }
+        // Not server/client. Both machines dial each other now that discovery
+        // auto-connects, so who-accepted is a race and every machine could call itself
+        // the server — which is exactly what three screens showed. The distinction that
+        // is real and stable is CAPABILITY: this build captures input on macOS and only
+        // replays it on Windows, and that is what a person actually wants to know.
+        let role = UI_ROLES
+            .lock()
+            .ok()
+            .and_then(|roles| roles.iter().find(|(p, _)| *p == peer).map(|(_, r)| *r))
+            .unwrap_or("receives input");
+        let _ = we_dialled;
         let enabled = UI_DISABLED.lock().is_ok_and(|off| !off.contains(&peer));
         let _ = write!(
             peers,
@@ -1249,15 +1295,9 @@ async fn ui_state_json(
         );
     }
 
-    // No peers at all is neither role. Saying "server" with nothing connected is a
-    // claim about a relationship that does not exist.
-    let self_role = if peers.is_empty() {
-        "standalone"
-    } else if accepted_any {
-        "server"
-    } else {
-        "client"
-    };
+    // This machine's own capability, decided by what the build can actually do rather
+    // than by any negotiation. Capture exists on macOS today; Windows replays only.
+    let self_role = if cfg!(target_os = "macos") { "shares input" } else { "receives input" };
 
     let mut health = String::new();
     let mut push_health = |ok: bool, text: &str| {
@@ -1286,7 +1326,7 @@ async fn ui_state_json(
     }
 
     format!(
-        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"focus":"{focus}","peers":[{peers}],"health":[{health}]}}"#,
+        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"focus":"{focus}","transfer":{},"peers":[{peers}],"health":[{health}]}}"#,
         env!("CARGO_PKG_VERSION"),
         name.replace('"', "'"),
         std::env::consts::OS,
@@ -1299,7 +1339,50 @@ async fn ui_state_json(
         // which is why two idle machines both said "server".
         self_role,
         ui_port,
+        UI_TRANSFER.lock().ok().and_then(|slot| slot.clone()).map_or_else(
+            || "null".to_owned(),
+            |(what, detail)| format!(r#"{{"what":"{what}","detail":"{detail}"}}"#),
+        ),
     )
+}
+
+/// Bind the endpoint, or — if seam is already running here — show that one instead.
+///
+/// Launching twice is what a person does by double-clicking the icon again. Failing with
+/// a port message would be technically correct and useless; showing them the seam they
+/// already have is the answer. Returns `Err` only for genuine failures.
+fn bind_or_show_running(
+    dir: &std::path::Path,
+    identity: &Arc<Identity>,
+    port: u16,
+) -> Result<std::ops::ControlFlow<(), Arc<seam_transport::Endpoint>>> {
+    match Endpoint::bind(Arc::clone(identity), format!("0.0.0.0:{port}").parse()?) {
+        Ok(endpoint) => Ok(std::ops::ControlFlow::Continue(Arc::new(endpoint))),
+        Err(e) if is_address_in_use(&e) => {
+            tracing::info!("seam is already running on this machine; opening its page");
+            // If the note is missing the daemon is still running — say that, rather than
+            // open_ui's "seam is not running", which would be flatly untrue.
+            open_ui(dir).map_err(|_| {
+                anyhow::anyhow!(
+                    "seam is already running on this machine, but its page address could \
+                     not be found. Quit it from its own window, or stop it and start again."
+                )
+            })?;
+            Ok(std::ops::ControlFlow::Break(()))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Is this bind failure "something is already listening"?
+///
+/// Matched on the message because the transport's error type deliberately does not leak
+/// `std::io::ErrorKind`. Narrow on purpose: any other bind failure is still a real error
+/// and must not be silently turned into "already running".
+fn is_address_in_use(error: &seam_transport::Error) -> bool {
+    let text = error.to_string();
+    text.contains("Address already in use") || text.contains("os error 48")
+        || text.contains("os error 98") || text.contains("10048")
 }
 
 /// Open the fleet page of the daemon running on this machine.
@@ -1597,7 +1680,9 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
                                 entries,
                             }
                         };
+                        note_transfer("sending files", format!("{} files", paths.len()));
                         share_with_all(&links, &frame, "files").await;
+                        note_transfer("files sent", format!("{} files", paths.len()));
                     }
                     Ok(_) => clipboard.lock().await.files_sig = Some(sig),
                     Err(reason) => {
