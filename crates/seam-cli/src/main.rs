@@ -797,6 +797,38 @@ async fn receive_from(
     clipboard: Clipboard,
     links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
 ) {
+    let peer_id = link.peer_id();
+    receive_from_inner(link, geometry, clipboard, Arc::clone(&links)).await;
+
+    // Forget the peer on every exit path.
+    //
+    // Nothing used to remove a closed link from the shared list, so a machine that had
+    // quit stayed listed as connected forever — the fleet page showed corpses, and the
+    // clipboard fan-out kept sending to them. Doing it here rather than at each `return`
+    // means a future early exit cannot reintroduce the leak.
+    links.lock().await.retain(|l| l.peer_id() != peer_id);
+    if let Ok(mut places) = UI_PLACES.lock() {
+        places.retain(|(p, _)| *p != peer_id);
+    }
+    if let Ok(mut roles) = UI_ROLES.lock() {
+        roles.retain(|(p, _)| *p != peer_id);
+    }
+    if let Ok(mut focus) = UI_FOCUS.lock()
+        && *focus == Some(peer_id)
+    {
+        // Never leave the pointer pointed at a machine that is gone.
+        *focus = None;
+    }
+    tracing::info!(peer = %peer_id, "peer disconnected; removed from the fleet");
+}
+
+/// The receive loop itself. Split so `receive_from` owns the cleanup for every exit.
+async fn receive_from_inner(
+    link: Arc<Link>,
+    geometry: Geometry,
+    clipboard: Clipboard,
+    links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+) {
     tokio::spawn(receive_reliable(Arc::clone(&link), geometry, clipboard, links));
     let peer = link.peer_id();
     let Ok(desktop) = seam_input::desktop() else {
