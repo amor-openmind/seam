@@ -608,7 +608,7 @@ async fn daemon(
                 }
                 tracing::info!(peer = %link.peer_id(), %target, "connected to peer");
                 let link = Arc::new(link);
-                links.lock().await.push(Arc::clone(&link));
+                register_link(&links, &link).await;
                 announce_geometry(&link).await;
                 tokio::spawn(receive_from(
                     link,
@@ -641,7 +641,7 @@ async fn daemon(
                             Ok(()) => {
                                 tracing::info!(%peer, remote = %link.remote_address(), "peer connected");
                                 let link = Arc::new(link);
-                                links.lock().await.push(Arc::clone(&link));
+                                register_link(&links, &link).await;
                                 announce_geometry(&link).await;
                                 tokio::spawn(receive_from(
                                     link,
@@ -876,6 +876,27 @@ async fn announce_geometry(link: &Link) {
     });
     if let Err(e) = link.send_reliable(&hello).await {
         tracing::warn!(peer = %link.peer_id(), "could not report this machine's screen: {e}");
+    }
+}
+
+/// Add a peer's link, replacing any earlier link to the same peer.
+///
+/// A machine that reconnects - because its daemon was restarted, or the network blipped -
+/// arrives as a second link with the same `PeerId`. Pushing it left the dead one in the
+/// list ahead of it, and everything that iterates peers then talked to the corpse: the
+/// Mac mini's log showed `clipboard changed; sharing peers=3` with only two machines on
+/// the desk, and the reconnected laptop received nothing while no send ever errored.
+///
+/// Replacing by identity is correct rather than merely tidy: `PeerId` is derived from the
+/// peer's certificate, so two links with the same id are the same machine by construction.
+async fn register_link(links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, link: &Arc<Link>) {
+    let mut peers = links.lock().await;
+    let id = link.peer_id();
+    let replaced = peers.iter().any(|l| l.peer_id() == id);
+    peers.retain(|l| l.peer_id() != id);
+    peers.push(Arc::clone(link));
+    if replaced {
+        tracing::info!(peer = %id, "peer reconnected; dropped the stale link");
     }
 }
 
