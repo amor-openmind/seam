@@ -485,8 +485,15 @@ hand-touched; and chunked, resumable streaming for clipboard payloads over the 6
     resumed-after-reconnect state, refused-over-cap state, history table.
   - `_ds/tokens.css` — verbatim mirror of the DS tokens (DS remains the source; edit
     there, re-mirror here).
-  Still to author: pairing flow (SAS confirmation), settings, notifications/toasts,
-  per-OS chrome variants, mobile layouts.
+  - `pairing.html` — the pairing flow as states: discovering (mDNS, zero-config),
+    machines found, the SAS six-digit verify dialog (the moment that matters, with the
+    mismatch-means-interception explanation), paired, and numbers-differ refusal.
+  - `settings.html` — the few settings a person could genuinely want: identity +
+    fingerprint, sharing toggles and the 64 MB direct-transfer limit, start-at-login,
+    menu-bar status, panic release shortcut, notification choices, log level/doctor,
+    and the danger zone (forget all, reset identity) — prefaced by the zero-config
+    statement that layout/speed/geometry are detected, not configured.
+  Still to author: notifications/toast surfaces, per-OS chrome variants, mobile layouts.
 
 **Streaming clipboard design (frame kinds 0x60–0x6F, reserved since v0.1.0)**
 1. `TransferOffer {id, generation, kind: files|image, manifest: [(path, size, sha256)]}` —
@@ -500,8 +507,16 @@ hand-touched; and chunked, resumable streaming for clipboard payloads over the 6
    there. Chunks already landed are never resent.
 5. Cancel/timeout: either side sends `TransferAbort {id, reason}`; spool partials swept.
 
+**Clipboard feature status, precisely**
+- Images: SHIPPED v0.2.0. Verified by a live round-trip through the real macOS
+  pasteboard and codec fuzz tests. Cross-machine paste awaits the user's test.
+- Files/folders ≤ 64 MB: SHIPPED v0.2.1. Same verification level; Windows side
+  compiles and speaks CF_HDROP but has not been exercised end-to-end.
+- Over 64 MB: NOT DONE. Streaming/resumable is fully specified below and is the next
+  implementation item. Until then, over-cap copies are refused with a log line.
+
 **Honest phase status (per the completion contract)**
-1. Design authored + render-verified: PARTIAL (2 pages of ~6; desktop only).
+1. Design authored + render-verified: PARTIAL (4 pages of ~6; desktop only).
 2. Sync/mapping into the app: NOT STARTED.
 3. Frontend shells (menu-bar app on macOS, tray app on Windows) rendering the design 1:1:
    NOT STARTED — the daemon currently has no GUI at all.
