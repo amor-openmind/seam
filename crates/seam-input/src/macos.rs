@@ -397,6 +397,16 @@ const K_CG_EVENT_OTHER_MOUSE_UP: CGEventType = 26;
 const K_CG_MOUSE_DELTA_X: u32 = 4;
 const K_CG_MOUSE_DELTA_Y: u32 = 5;
 
+/// `kCGEventUnacceleratedPointerMovementX` / `Y` — raw device movement.
+///
+/// These matter more than they look. `kCGMouseEventDelta*` is how far the *cursor* moved,
+/// so once the cursor is pinned against a screen edge it reports **zero** no matter how
+/// hard the user pushes — and a design that crosses screens on cursor delta can therefore
+/// never leave the screen at all. The unaccelerated fields report what the hand did,
+/// independent of where the cursor is allowed to be.
+const K_CG_UNACCELERATED_X: u32 = 170;
+const K_CG_UNACCELERATED_Y: u32 = 171;
+
 /// `kCGScrollWheelEventDeltaAxis1` — vertical, in wheel notches.
 const K_CG_SCROLL_DELTA_AXIS1: u32 = 11;
 /// `kCGScrollWheelEventDeltaAxis2` — horizontal.
@@ -493,13 +503,17 @@ unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observe
         | K_CG_EVENT_RIGHT_MOUSE_DRAGGED
         | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
             // SAFETY: valid event; all three are by-value getters on it.
-            let (p, dx, dy) = unsafe {
+            let (p, raw_x, raw_y, dx, dy) = unsafe {
                 (
                     CGEventGetLocation(event),
+                    CGEventGetIntegerValueField(event, K_CG_UNACCELERATED_X),
+                    CGEventGetIntegerValueField(event, K_CG_UNACCELERATED_Y),
                     CGEventGetIntegerValueField(event, K_CG_MOUSE_DELTA_X),
                     CGEventGetIntegerValueField(event, K_CG_MOUSE_DELTA_Y),
                 )
             };
+            // Prefer raw movement; fall back to cursor delta if the field is absent.
+            let (dx, dy) = if raw_x != 0 || raw_y != 0 { (raw_x, raw_y) } else { (dx, dy) };
             #[expect(clippy::cast_possible_truncation, reason = "screen coordinates fit i32")]
             Some(Observed::Motion {
                 x: p.x.round() as i32,

@@ -617,24 +617,34 @@ async fn receive_from(link: Arc<Link>) {
 #[cfg(target_os = "macos")]
 async fn sync_peers(
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
-    strip: &mut focus::Layout,
+    graph: &mut focus::Graph,
     known: &mut Vec<seam_proto::PeerId>,
 ) {
     let live: Vec<seam_proto::PeerId> = links.lock().await.iter().map(|l| l.peer_id()).collect();
 
     for id in &live {
-        if !known.contains(id) {
-            known.push(*id);
-            strip.add_peer_right(*id, 1920, 1080);
-            tracing::info!(peer = %id, "placed to the right — push the pointer off the right edge to reach it");
+        if graph.is_placed(*id) {
+            continue;
         }
+        // Default arrangement, matching this project's own fleet and the commonest desk
+        // layout: the first machine sits to the LEFT, the next one BELOW that. A layout
+        // editor belongs in the UI; this makes handover work without asking anyone to
+        // draw anything (goal Z3).
+        let (edge, anchor) = match known.first() {
+            None => (focus::Edge::Left, None),
+            Some(first) => (focus::Edge::Bottom, Some(*first)),
+        };
+        graph.place(*id, edge, anchor, 1920, 1080);
+        known.push(*id);
+        tracing::info!(peer = %id, ?edge, "placed — push the pointer off that edge to reach it");
     }
+
     known.retain(|id| {
         if live.contains(id) {
             return true;
         }
         tracing::info!(peer = %id, "peer gone; input returns to this machine");
-        strip.forget_peer(*id);
+        graph.forget(*id);
         false
     });
 }
@@ -763,7 +773,7 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>) {
             use focus::Focus;
             use seam_input::macos::Observed;
 
-            let mut strip = focus::Layout::new(local_w, local_h);
+            let mut graph = focus::Graph::new(local_w, local_h);
             let mut known: Vec<seam_proto::PeerId> = Vec::new();
             let mut buf = Vec::with_capacity(64);
             let mut seq: u32 = 0;
@@ -773,11 +783,11 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>) {
             while let Some(event) = rx.recv().await {
                 seq = seq.wrapping_add(1);
 
-                sync_peers(&links, &mut strip, &mut known).await;
+                sync_peers(&links, &mut graph, &mut known).await;
 
                 // Movement decides ownership; everything else follows whoever owns it.
                 let update = match event {
-                    Observed::Motion { dx, dy, .. } => Some(strip.apply_motion(dx, dy)),
+                    Observed::Motion { dx, dy, .. } => Some(graph.apply_motion(dx, dy)),
                     _ => None,
                 };
 
@@ -798,7 +808,7 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>) {
                     }
                 }
 
-                let Some(target) = (match strip.focus() {
+                let Some(target) = (match graph.focus() {
                     Focus::Local => None,
                     Focus::Remote(p) => Some(p),
                 }) else {
@@ -809,12 +819,12 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>) {
 
                 let frame = match event {
                     Observed::Motion { .. } => {
-                        let u = update.unwrap_or_else(|| strip.apply_motion(0, 0));
+                        let u = update.unwrap_or_else(|| graph.apply_motion(0, 0));
                         seam_proto::Frame::Motion(seam_proto::Motion {
                             seq,
-                            cursor: seam_proto::Point::from_px(u.local_x, u.local_y),
-                            travel_x: u.local_x,
-                            travel_y: u.local_y,
+                            cursor: seam_proto::Point::from_px(u.x, u.y),
+                            travel_x: u.x,
+                            travel_y: u.y,
                         })
                     }
                     other => match to_frame(other, seq) {
