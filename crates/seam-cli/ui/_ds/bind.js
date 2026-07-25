@@ -7,10 +7,6 @@
 
   function short(id) { return String(id || "").slice(0, 8); }
 
-  // The authored desk has three slots: the left-edge machine, this machine, and the
-  // machine below. Peers are matched to slots by their PLACEMENT (the edge the daemon
-  // reports), never by list order — connection order reshuffles on reconnect, and an
-  // order-based mapping highlighted the wrong screen.
   function slotFor(edge) {
     if (edge === "left" || edge === "right") return document.querySelector(".screen.imac");
     if (edge === "bottom" || edge === "top") return document.querySelector(".screen.laptop");
@@ -19,7 +15,7 @@
 
   function apply(s) {
     var mach = document.querySelector("header.top .machine");
-    if (mach) mach.innerHTML = s.name + " · " + short(s.id) + "<br>v" + s.version + " · " + s.platform;
+    if (mach) mach.innerHTML = s.name + " · " + short(s.id) + " · <b>" + (s.role || "server") + "</b> · port " + (s.port || "?") + "<br>v" + s.version + " · " + s.platform;
 
     var self = document.querySelector(".screen.mac");
     if (self) self.classList.toggle("holding", s.focus === "local");
@@ -30,7 +26,8 @@
     (s.peers || []).forEach(function (p) {
       var slot = slotFor(p.edge);
       if (!slot) return;
-      if (s.focus === short(p.id)) slot.classList.add("holding");
+      slot.style.opacity = p.enabled ? "" : ".38";
+      if (p.enabled && s.focus === short(p.id)) slot.classList.add("holding");
     });
 
     var rows = document.querySelectorAll(".peers .peer");
@@ -38,12 +35,22 @@
       var row = rows[i], p = (s.peers || [])[i];
       if (!p) { row.style.display = "none"; continue; }
       row.style.display = "";
-      var n = row.querySelector(".who .n"), d = row.querySelector(".who .id"), lat = row.querySelector(".lat");
+      var n = row.querySelector(".who .n"), d = row.querySelector(".who .id");
       if (n) n.textContent = p.name || short(p.id);
-      if (d) d.textContent = short(p.id) + " · " + (p.edge ? p.edge + " edge · " : "") + p.addr;
-      if (lat) lat.textContent = "";
+      if (d) d.textContent = short(p.id) + " · " + (p.role || "client") + " · " + (p.edge ? p.edge + " edge · " : "") + p.addr;
       var pill = row.querySelector(".pill");
-      if (pill) { pill.className = "pill " + (s.focus === short(p.id) ? "holding" : "connected"); pill.innerHTML = '<span class=\"dot\"></span>' + (s.focus === short(p.id) ? "holds pointer" : "connected"); }
+      if (pill) {
+        var cls = !p.enabled ? "offline" : (s.focus === short(p.id) ? "holding" : "connected");
+        var txt = !p.enabled ? "disabled" : (s.focus === short(p.id) ? "holds pointer" : "connected");
+        pill.className = "pill " + cls;
+        pill.innerHTML = '<span class=\"dot\"></span>' + txt;
+      }
+      var sw = row.querySelector(".sw");
+      if (sw) {
+        sw.classList.toggle("on", !!p.enabled);
+        sw.setAttribute("aria-checked", p.enabled ? "true" : "false");
+        sw.setAttribute("data-peer", short(p.id));
+      }
     }
 
     var vals = document.querySelectorAll(".health .item .v");
@@ -59,13 +66,22 @@
   }
 
   function closeTab() {
-    // Best effort: browsers allow close() for fresh tabs (history length 1), which is
-    // exactly what the daemon opens. When blocked, the stopped message below remains.
     try { window.close(); } catch (ignored) {}
   }
 
   document.addEventListener("click", function (event) {
     var closest = event.target.closest ? event.target.closest.bind(event.target) : function () { return null; };
+    var sw = closest(".peers .sw");
+    if (sw) {
+      var peer = sw.getAttribute("data-peer");
+      var enable = sw.getAttribute("aria-checked") !== "true";
+      if (peer) {
+        fetch("/action/peer/" + peer + "/" + (enable ? "enable" : "disable"), { method: "POST" })
+          .then(tick)
+          .catch(function () {});
+      }
+      return;
+    }
     if (closest("[data-action=release]")) {
       fetch("/action/release", { method: "POST" }).then(tick).catch(function () {});
     } else if (closest("[data-action=quit]")) {

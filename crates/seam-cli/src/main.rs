@@ -214,8 +214,24 @@ async fn run_daemon(
                     "requesting administrator rights so input keeps working when an \
                      elevated window has focus (--no-elevate to skip)"
                 );
-                let mut args: Vec<String> = std::env::args().skip(1).collect();
-                args.push("--no-elevate".into()); // the elevated copy must not loop
+                // Build the argument list explicitly. Passing raw argv was wrong and
+                // silently fatal: a bare `seam.exe` has no subcommand, so the relaunch
+                // became `seam.exe --no-elevate`, which is not valid (the flag belongs to
+                // `run`). The elevated copy then died on an argument error in a console
+                // window that closes instantly, and the parent had already exited — from
+                // the user's chair, the program printed one line and quit.
+                let mut args: Vec<String> = vec!["run".into(), "--no-elevate".into()];
+                if port != 0 {
+                    args.push("--port".into());
+                    args.push(port.to_string());
+                }
+                for address in &connect {
+                    args.push("--connect".into());
+                    args.push(address.clone());
+                }
+                if !open_ui_when_ready {
+                    args.push("--no-ui".into());
+                }
                 match seam_input::windows::relaunch_elevated(&args) {
                     Ok(true) => return Ok(()),
                     Ok(false) => tracing::warn!(
@@ -888,6 +904,22 @@ async fn apply_clipboard_image(
     }
 }
 
+/// Switch a peer on or off from the UI, matched by its short id (what the page shows).
+fn set_peer_enabled(short_id: &str, enable: bool) {
+    let Ok(mut off) = UI_DISABLED.lock() else { return };
+    let matches_short = |peer: &seam_proto::PeerId| peer.to_string().starts_with(short_id);
+    if enable {
+        off.retain(|peer| !matches_short(peer));
+        tracing::info!(peer = short_id, "peer enabled from the fleet page");
+    } else if let Ok(places) = UI_PLACES.lock()
+        && let Some((peer, _)) = places.iter().find(|(peer, _)| matches_short(peer))
+        && !off.contains(peer)
+    {
+        off.push(*peer);
+        tracing::info!(peer = short_id, "peer disabled from the fleet page");
+    }
+}
+
 /// Apply clipboard files from a peer: spool them locally, point this machine's
 /// clipboard at the spooled copies, then relay around the star like text and images.
 async fn apply_clipboard_files(
@@ -936,6 +968,13 @@ async fn apply_clipboard_files(
 }
 
 // ---------------------------------------------------------------- ui
+
+/// Peers this machine dialled — it is their client; the ones that dialled us are ours.
+static UI_DIALLED: std::sync::Mutex<Vec<seam_proto::PeerId>> = std::sync::Mutex::new(Vec::new());
+
+/// Peers the user has switched off in the UI. Input is not forwarded to a disabled
+/// machine and it is not placed in the layout, but the link and its clipboard stay.
+static UI_DISABLED: std::sync::Mutex<Vec<seam_proto::PeerId>> = std::sync::Mutex::new(Vec::new());
 
 /// Peer placements (which edge each sits on), for the UI's desk mapping.
 static UI_PLACES: std::sync::Mutex<Vec<(seam_proto::PeerId, &'static str)>> =
@@ -1025,11 +1064,17 @@ fn start_ui_server(
                         std::process::exit(0);
                     });
                     ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+                } else if method == "POST" && path.starts_with("/action/peer/") {
+                    let mut parts = path.trim_start_matches("/action/peer/").split('/');
+                    let target = parts.next().unwrap_or("").to_owned();
+                    let enable = parts.next() == Some("enable");
+                    set_peer_enabled(&target, enable);
+                    ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
                 } else if method == "POST" && path == "/action/release" {
                     UI_RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
                     ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
                 } else if path == "/state" {
-                    ("200 OK", "application/json", ui_state_json(&name, id, &links).await)
+                    ("200 OK", "application/json", ui_state_json(&name, id, port, &links).await)
                 } else if let Some((_, page, ctype)) =
                     UI_PAGES.iter().find(|(route, _, _)| *route == path)
                 {
@@ -1052,6 +1097,7 @@ fn start_ui_server(
 async fn ui_state_json(
     name: &str,
     id: seam_proto::PeerId,
+    ui_port: u16,
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
 ) -> String {
     use std::fmt::Write as _;
@@ -1075,9 +1121,15 @@ async fn ui_state_json(
                 places.iter().find(|(p, _)| *p == peer).map(|(_, edge)| *edge)
             })
             .unwrap_or("");
+        // Role is a fact about who dialled whom, not a setting: the machine that
+        // accepted the connection is the server for that pair.
+        let we_dialled =
+            UI_DIALLED.lock().is_ok_and(|dialled| dialled.contains(&peer));
+        let role = if we_dialled { "server" } else { "client" };
+        let enabled = UI_DISABLED.lock().is_ok_and(|off| !off.contains(&peer));
         let _ = write!(
             peers,
-            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}"}}"#,
+            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}","role":"{role}","enabled":{enabled}}}"#,
             link.remote_address()
         );
     }
@@ -1109,11 +1161,15 @@ async fn ui_state_json(
     }
 
     format!(
-        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","focus":"{focus}","peers":[{peers}],"health":[{health}]}}"#,
+        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"focus":"{focus}","peers":[{peers}],"health":[{health}]}}"#,
         env!("CARGO_PKG_VERSION"),
         name.replace('"', "'"),
         std::env::consts::OS,
         std::env::consts::ARCH,
+        // This machine is a server to everyone that dialled it, and a client of anyone
+        // it dialled. Both at once is normal in a star, so name the dominant role.
+        if UI_DIALLED.lock().is_ok_and(|dialled| dialled.is_empty()) { "server" } else { "client" },
+        ui_port,
     )
 }
 
@@ -1543,6 +1599,12 @@ fn spawn_reconnector(
                             return;
                         }
                         tracing::info!(peer = %link.peer_id(), %target, "connected to peer");
+                        if let Ok(mut dialled) = UI_DIALLED.lock() {
+                            let id = link.peer_id();
+                            if !dialled.contains(&id) {
+                                dialled.push(id);
+                            }
+                        }
                         delay = Duration::from_millis(500);
                         let link = Arc::new(link);
                         register_link(&links, &link).await;
