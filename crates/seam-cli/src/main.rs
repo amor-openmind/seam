@@ -484,6 +484,12 @@ async fn daemon(
         tracing::warn!("no paired machines yet — run `seam pair` on this and another machine");
     }
 
+    // Real screen size of each peer, learned from its `Hello`. Until a peer reports its
+    // geometry it is not placed in the layout at all: guessing a size puts the screen
+    // boundary at a coordinate that exists on neither machine, which looks exactly like
+    // "the pointer will not leave the screen".
+    let geometry: Geometry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     // Every authorised link, so captured pointer motion can be sent to all of them.
     let links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -504,18 +510,20 @@ async fn daemon(
                 tracing::info!(peer = %link.peer_id(), %target, "connected to peer");
                 let link = Arc::new(link);
                 links.lock().await.push(Arc::clone(&link));
-                tokio::spawn(receive_from(link));
+                announce_geometry(&link).await;
+                tokio::spawn(receive_from(link, Arc::clone(&geometry)));
             }
             Err(e) => tracing::warn!(%target, "could not connect: {e}"),
         }
     }
 
-    start_pointer_forwarding(Arc::clone(&links));
+    start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry));
 
     let accepting = {
         let endpoint = Arc::clone(&endpoint);
         let store = Arc::clone(&store);
         let links = Arc::clone(&links);
+        let geometry = Arc::clone(&geometry);
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 match incoming {
@@ -526,7 +534,8 @@ async fn daemon(
                                 tracing::info!(%peer, remote = %link.remote_address(), "peer connected");
                                 let link = Arc::new(link);
                                 links.lock().await.push(Arc::clone(&link));
-                                tokio::spawn(receive_from(link));
+                                announce_geometry(&link).await;
+                                tokio::spawn(receive_from(link, Arc::clone(&geometry)));
                             }
                             Err(e) => {
                                 // Never silent: a refused peer says why (goal O5).
@@ -550,8 +559,8 @@ async fn daemon(
 }
 
 /// Receive motion from a peer and reproduce it on this machine.
-async fn receive_from(link: Arc<Link>) {
-    tokio::spawn(receive_reliable(Arc::clone(&link)));
+async fn receive_from(link: Arc<Link>, geometry: Geometry) {
+    tokio::spawn(receive_reliable(Arc::clone(&link), geometry));
     let peer = link.peer_id();
     let Ok(desktop) = seam_input::desktop() else {
         tracing::warn!(%peer, "cannot read this machine's displays, so incoming motion is ignored");
@@ -608,6 +617,32 @@ async fn receive_from(link: Arc<Link>) {
     }
 }
 
+/// Peer id to real screen size, as reported by that peer.
+type Geometry = Arc<tokio::sync::Mutex<std::collections::HashMap<seam_proto::PeerId, (i32, i32)>>>;
+
+/// Tell a peer how big this machine's screen is.
+///
+/// Screen size is detected, never configured (goal Z2) — but it must also be *exchanged*.
+/// Without it the machine that owns the pointer places the screen boundary at an invented
+/// coordinate, and a boundary in the wrong place is indistinguishable from a pointer that
+/// refuses to leave.
+async fn announce_geometry(link: &Link) {
+    let Ok(desktop) = seam_input::desktop() else { return };
+    let bb = desktop.bounding_box();
+    let hello = seam_proto::Frame::Hello(seam_proto::Hello {
+        version: seam_proto::PROTOCOL_VERSION,
+        peer: seam_proto::PeerId::NIL,
+        name: String::new(),
+        width: u32::try_from(bb.width).unwrap_or(0),
+        height: u32::try_from(bb.height).unwrap_or(0),
+        scale: desktop.primary().map_or(256, |d| d.scale),
+        layout_policy: seam_proto::LayoutPolicy::Auto,
+    });
+    if let Err(e) = link.send_reliable(&hello).await {
+        tracing::warn!(peer = %link.peer_id(), "could not report this machine's screen: {e}");
+    }
+}
+
 /// Keep the layout in step with which peers are actually connected.
 ///
 /// Peers are placed to the right in the order they connect. A layout editor belongs in
@@ -619,13 +654,17 @@ async fn sync_peers(
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
     graph: &mut focus::Graph,
     known: &mut Vec<seam_proto::PeerId>,
+    geometry: &Geometry,
 ) {
     let live: Vec<seam_proto::PeerId> = links.lock().await.iter().map(|l| l.peer_id()).collect();
+    let sizes = geometry.lock().await.clone();
 
     for id in &live {
         if graph.is_placed(*id) {
             continue;
         }
+        // Wait for the peer's real screen size rather than guessing one.
+        let Some(&(w, h)) = sizes.get(id) else { continue };
         // Default arrangement, matching this project's own fleet and the commonest desk
         // layout: the first machine sits to the LEFT, the next one BELOW that. A layout
         // editor belongs in the UI; this makes handover work without asking anyone to
@@ -634,9 +673,9 @@ async fn sync_peers(
             None => (focus::Edge::Left, None),
             Some(first) => (focus::Edge::Bottom, Some(*first)),
         };
-        graph.place(*id, edge, anchor, 1920, 1080);
+        graph.place(*id, edge, anchor, w, h);
         known.push(*id);
-        tracing::info!(peer = %id, ?edge, "placed — push the pointer off that edge to reach it");
+        tracing::info!(peer = %id, ?edge, w, h, "placed — push the pointer off that edge to reach it");
     }
 
     known.retain(|id| {
@@ -707,7 +746,7 @@ fn log_event(frame: &seam_proto::Frame) {
 }
 
 /// Receive buttons, scroll and keystrokes, which travel reliably.
-async fn receive_reliable(link: Arc<Link>) {
+async fn receive_reliable(link: Arc<Link>, geometry: Geometry) {
     let peer = link.peer_id();
     loop {
         match link.recv_reliable().await {
@@ -729,6 +768,16 @@ async fn receive_reliable(link: Arc<Link>) {
                     tracing::warn!(%peer, "could not scroll: {e}");
                 }
             }
+            Ok(seam_proto::Frame::Hello(hello)) => {
+                let (w, h) = (
+                    i32::try_from(hello.width).unwrap_or(0),
+                    i32::try_from(hello.height).unwrap_or(0),
+                );
+                if w > 0 && h > 0 {
+                    tracing::info!(%peer, w, h, "peer reported its screen size");
+                    geometry.lock().await.insert(peer, (w, h));
+                }
+            }
             Ok(_) => {}
             Err(e) => {
                 tracing::debug!(%peer, "reliable stream ended: {e}");
@@ -743,7 +792,7 @@ async fn receive_reliable(link: Arc<Link>) {
 /// **Mirror mode.** The capture is listen-only, so the local pointer keeps moving too:
 /// this proves the whole path end to end without any code being able to suppress input,
 /// which is the failure that can freeze a Mac until it is rebooted.
-fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>) {
+fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geometry: Geometry) {
     #[cfg(target_os = "macos")]
     {
         let observed = match seam_input::macos::observe_pointer() {
@@ -783,7 +832,7 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>) {
             while let Some(event) = rx.recv().await {
                 seq = seq.wrapping_add(1);
 
-                sync_peers(&links, &mut graph, &mut known).await;
+                sync_peers(&links, &mut graph, &mut known, &geometry).await;
 
                 // Movement decides ownership; everything else follows whoever owns it.
                 let update = match event {
@@ -852,7 +901,7 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>) {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = links;
+        let _ = (links, geometry);
         tracing::info!("this machine receives input only; capture is not built for it yet");
     }
 }
