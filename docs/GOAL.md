@@ -368,3 +368,49 @@ exercised against the real German Apple keyboard on this fleet.
   the rule; until then `doctor` should *detect* and report it rather than leaving the user
   to guess.
 - `seam peers` shows a peer's id where its name should be.
+
+---
+
+## 11. Known gaps, precisely stated
+
+Recorded so the next session starts from evidence rather than rediscovery.
+
+### Media and volume keys are not forwarded
+
+Volume, brightness, play/pause and the rest are **not keyboard events** on macOS. They
+arrive as `NX_SYSDEFINED` (`CGEventType` 14), and which key it was lives in the event's
+`data1` field rather than in a keycode. seam's tap masks only key-down, key-up and
+flags-changed, so these never reach the wire — and the Mac keeps acting on them, which is
+why they work locally while the pointer is on another machine.
+
+**What it needs**
+1. Add `NX_SYSDEFINED` to the event mask, and suppress it like any other key while a peer
+   holds focus.
+2. Decode it. `CGEvent` exposes no accessor for `data1`; the practical route is
+   `NSEvent.eventWithCGEvent:` and then `subtype` (8 = `NX_SUBTYPE_AUX_CONTROL_BUTTONS`),
+   `data1 >> 16` for the key, and `(data1 & 0xFF00) >> 8` for the direction. That means an
+   AppKit dependency — `objc2-app-kit` — in the macOS backend.
+3. Carry it. USB HID puts these on the **Consumer** page (`0x0C`), not the Keyboard page
+   (`0x07`), so `PhysicalKey` needs a page as well as a usage, or a separate frame.
+4. Inject on Windows: `VK_VOLUME_UP` `0xAF`, `VK_VOLUME_DOWN` `0xAE`, `VK_VOLUME_MUTE`
+   `0xAD`, `VK_MEDIA_PLAY_PAUSE` `0xB3`, `VK_MEDIA_NEXT_TRACK` `0xB0`,
+   `VK_MEDIA_PREV_TRACK` `0xB1`.
+
+**Honest caveat from the research**: these keys can be *observed*, but the local machine
+often cannot be stopped from acting on them as well — brightness in particular has
+lower-level handling. Expect volume to forward cleanly and brightness to remain local.
+
+### Clipboard: images and files
+
+Text works in all directions. Images are a contained addition (`arboard` handles them; one
+more frame type). Files are not: no Rust crate implements the Windows file promise
+(`CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS` over a custom `IDataObject`), and macOS has
+no working clipboard file promise at all, so it needs a virtual filesystem — NFS loopback
+rather than macFUSE, to avoid a kext. See `docs/research/clipboard.md`.
+
+### Cosmetic: the local cursor at the edge
+
+With the tap at the HID location the cursor should stop moving. It still sits where it was
+left. Hiding it needs foreground status, which a daemon does not have — two attempts to
+work around that failed and one locked the machine, so the real fix is a UI agent rather
+than another cursor warp.
