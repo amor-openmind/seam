@@ -552,6 +552,8 @@ async fn daemon(
 
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("shutting down");
+    // Never exit while this machine is still withholding its own input.
+    seam_input::release_input();
     discovery.shutdown();
     endpoint.close();
     accepting.abort();
@@ -834,6 +836,17 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geom
 
                 sync_peers(&links, &mut graph, &mut known, &geometry).await;
 
+                // Safety net. `sync_peers` can hand focus back on its own — a peer that
+                // disappears while holding the pointer is sent home immediately — and that
+                // path produces no focus *transition* for the handover code below to see.
+                // Without this check the Mac would keep withholding its own input from
+                // itself, with no way back. Fail open, always.
+                if graph.focus() == Focus::Local && seam_input::macos::is_suppressing_local() {
+                    tracing::info!("input returned to this machine");
+                    seam_input::macos::set_suppress_local(false);
+                    detached = None;
+                }
+
                 // Movement decides ownership; everything else follows whoever owns it.
                 let update = match event {
                     Observed::Motion { dx, dy, .. } => Some(graph.apply_motion(dx, dy)),
@@ -846,12 +859,15 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geom
                     match u.focus {
                         Focus::Remote(peer) => {
                             tracing::info!(%peer, "pointer and keyboard moved to this peer");
-                            // Freeze the local cursor so this machine stops tracking the
-                            // mouse. The guard reattaches on every exit path.
+                            // Freeze the local cursor, then stop this machine acting on
+                            // the input at all. Order matters: detach first so that if
+                            // suppression is somehow left on, the guard's Drop clears it.
                             detached = seam_input::macos::CursorGuard::detach(false).ok();
+                            seam_input::macos::set_suppress_local(true);
                         }
                         Focus::Local => {
                             tracing::info!("pointer and keyboard back on this machine");
+                            seam_input::macos::set_suppress_local(false);
                             detached = None;
                         }
                     }
@@ -896,6 +912,8 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geom
                     tracing::warn!(peer = %target, "could not forward input: {e}");
                 }
             }
+            // Whatever ends this loop, this machine gets its own input back.
+            seam_input::macos::set_suppress_local(false);
             drop(detached);
         });
     }

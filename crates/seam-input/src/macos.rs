@@ -228,6 +228,10 @@ impl CursorGuard {
 
 impl Drop for CursorGuard {
     fn drop(&mut self) {
+        // Releasing the cursor and withholding input must end together: leaving
+        // suppression on with the cursor reattached would be a Mac that ignores its own
+        // keyboard.
+        set_suppress_local(false);
         // SAFETY: reattaching is always valid, and showing the cursor more times than it
         // was hidden is harmless — the counter saturates at visible. Deliberately
         // over-showing: CGDisplayShowCursor is refcounted, and an unbalanced hide leaves
@@ -377,8 +381,8 @@ type CGEventMask = u64;
 const K_CG_SESSION_EVENT_TAP: u32 = 1;
 /// `kCGHeadInsertEventTap`.
 const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
-/// `kCGEventTapOptionListenOnly` — observe without the ability to modify or discard.
-const K_CG_EVENT_TAP_OPTION_LISTEN_ONLY: u32 = 1;
+/// `kCGEventTapOptionDefault` — may modify or discard events.
+const K_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 
 const K_CG_EVENT_LEFT_MOUSE_DOWN: CGEventType = 1;
 const K_CG_EVENT_LEFT_MOUSE_UP: CGEventType = 2;
@@ -461,6 +465,35 @@ unsafe extern "C" {
 
 const fn mask_for(event_type: CGEventType) -> CGEventMask {
     1u64 << event_type
+}
+
+/// Whether local input is currently being withheld from this machine.
+///
+/// # Why this is a global
+///
+/// The tap callback runs on its own run loop thread and receives only a raw pointer to
+/// its state. A single atomic is the smallest thing that can be read from it without a
+/// lock — and taking a lock on the input path is what makes macOS disable the tap.
+///
+/// # Why it defaults to false
+///
+/// **Fail open.** Every path that cannot reach a definite answer leaves this false, so
+/// input reaches this machine. An active tap that discards events is the mechanism behind
+/// the freeze-until-reboot failure (`deskflow#9562`); if anything goes wrong the correct
+/// outcome is a KVM that stops forwarding, never a Mac that stops responding.
+static SUPPRESS_LOCAL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Withhold local input while another machine owns the pointer.
+///
+/// Only ever set true while a peer holds focus, and cleared on every path that returns
+/// focus here — including [`CursorGuard::drop`].
+pub fn set_suppress_local(suppress: bool) {
+    SUPPRESS_LOCAL.store(suppress, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn is_suppressing_local() -> bool {
+    SUPPRESS_LOCAL.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Something the user did on this machine.
@@ -611,17 +644,23 @@ unsafe extern "C" fn on_event(
     // harmless because motion is self-correcting.
     let _ = state.sender.send(observed);
 
-    // Listen-only: this return value is ignored by the OS. Returning the event unchanged
-    // is still the correct thing to do, so that switching to an active tap later does not
-    // silently start discarding input.
+    // Discard the event only while a peer owns the pointer. Any other time — including
+    // every error path above, which returns early — the event passes through untouched,
+    // so this machine keeps working normally.
+    if is_suppressing_local() {
+        return core::ptr::null_mut();
+    }
     event
 }
 
-/// Start observing local input.
+/// Start observing local input, with the ability to withhold it.
 ///
-/// **Listen-only.** The tap cannot modify or discard events, so it cannot suppress local
-/// input and therefore cannot cause the freeze-until-reboot failure that an active tap
-/// can. The local pointer keeps moving; this is the safe first half of the input path.
+/// The tap can discard events, but only ever does so while [`set_suppress_local`] is true
+/// — i.e. while a peer owns the pointer. Everything else, including every error path,
+/// passes input through untouched.
+///
+/// Suppression is what makes this a KVM rather than a mirror: without it the local
+/// machine keeps acting on clicks and keystrokes that were meant for another screen.
 pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
     let permissions = Permissions::check();
     if !permissions.can_listen {
@@ -662,7 +701,7 @@ pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
                 CGEventTapCreate(
                     K_CG_SESSION_EVENT_TAP,
                     K_CG_HEAD_INSERT_EVENT_TAP,
-                    K_CG_EVENT_TAP_OPTION_LISTEN_ONLY,
+                    K_CG_EVENT_TAP_OPTION_DEFAULT,
                     mask,
                     on_event,
                     state.cast::<c_void>(),

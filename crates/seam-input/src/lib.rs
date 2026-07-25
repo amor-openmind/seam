@@ -106,6 +106,7 @@ pub fn warp_cursor(x: i32, y: i32) -> Result<(), Error> {
 pub fn release_input() {
     #[cfg(target_os = "macos")]
     {
+        macos::set_suppress_local(false);
         macos::force_restore_cursor();
     }
 }
