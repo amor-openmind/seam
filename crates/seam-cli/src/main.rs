@@ -6,6 +6,9 @@
 //! confirm a 6-digit pairing code, because that confirmation *is* the security boundary
 //! and cannot be automated away.
 
+/// Focus lives on the sending side, which today means macOS. A receiving machine has no
+/// layout to reason about: it acts on whatever the owner sends it.
+#[cfg(target_os = "macos")]
 mod focus;
 mod layout;
 mod store;
