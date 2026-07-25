@@ -499,11 +499,12 @@ keyboard/mouse hook plus its own suppression story, comparable in size to the wh
 capture path. Until that exists, a machine's role is reported as observed capability
 (`shares input` / `receives input`), never as a choice.
 
-**Outstanding Claude Design surfaces** (not done, and the reason is that every round so
-far went to field bugs — the loopback vulnerability, the dead Windows exe, roles,
-highlighting — which was the right order, but leaves these unauthored):
-onboarding/permission walkthrough, doctor-as-a-page, the update flow, compact/mobile
-variants, and the settings page rebound to the real persisted values.
+**Claude Design surfaces: all authored** as of v0.3.8. Nine pages, every one served by
+the binary. What remains is not design but *binding*: onboarding, doctor, update,
+settings, pairing, chrome and notifications still show their authored states rather than
+live daemon data. The fleet page is the only one bound so far. Binding each is
+mechanical — a `_ds/bind.js` handler per page against endpoints that mostly exist —
+and must be done without touching the visible structure.
 
 ## 12b. Review discipline — added after a self-inflicted vulnerability
 
@@ -556,14 +557,14 @@ authored ✓ / to ask Claude Design for ✗):
 | Transfers (streaming, resume, history, refusals) | ✓ transfers.html |
 | Pairing flow incl. SAS verify + refusal | ✓ pairing.html |
 | Settings (sharing, behaviour, notifications, diagnostics, danger) | ✓ settings.html |
-| Onboarding + macOS permission walkthrough (the per-binary re-grant pain) | ✗ |
+| Onboarding + macOS permission walkthrough (the per-binary re-grant pain) | ✓ onboarding.html |
 | Menu-bar dropdown (macOS) / tray popover (Windows) — the everyday chrome | ✓ chrome.html |
 | Toasts/notifications (peer joined/dropped, transfer done/failed, update) | ✓ notifications.html |
-| Doctor report as a full page (what's wrong and the exact fix) | ✗ |
+| Doctor report as a full page (what's wrong and the exact fix) | ✓ doctor.html |
 | Degraded states: tap disabled, UIPI elevated-window warning, mirrors-not-switching | ✓ in chrome.html + notifications.html |
-| Empty states: no peers yet, nothing transferred yet | ✗ |
-| Update flow (new version available → restart → re-grant reminder) | ✗ |
-| Compact/mobile-width variants of all of the above | ✗ |
+| Empty states: no peers yet, nothing transferred yet | ✓ in index.html + transfers.html |
+| Update flow (new version available → restart → re-grant reminder) | ✓ update.html |
+| Compact/mobile-width variants of all of the above | ✓ responsive in each page (media queries), not separate files |
 
 ## 12. /goal — design-driven frontend + streaming clipboard (in progress)
 

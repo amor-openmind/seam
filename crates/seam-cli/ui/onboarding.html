@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en"><head>
+
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>seam — first run</title>
+<link rel="stylesheet" href="_ds/tokens.css">
+<style>
+.shell{max-width:720px;margin:0 auto;padding:32px 24px 64px}
+h1{font:400 var(--text-3xl)/1.1 var(--font-display);margin-bottom:6px}
+h1 .stitch{color:var(--text-accent)}
+p.lede{color:var(--text-secondary);font:400 var(--text-md)/1.6 var(--font-sans);max-width:52ch;margin-bottom:28px}
+.step{display:flex;gap:16px;padding:18px 0;border-top:1px solid var(--border-subtle)}
+.step:first-of-type{border-top:0}
+.step .n{width:26px;height:26px;flex:none;border-radius:50%;background:var(--surface-inverse);color:var(--text-inverse);display:flex;align-items:center;justify-content:center;font:600 var(--text-xs)/1 var(--font-mono)}
+.step.done .n{background:var(--sage-600)}
+.step.now .n{background:var(--action-primary)}
+.step .body{flex:1;min-width:0}
+.step .t{font:600 var(--text-md)/1.35 var(--font-sans);margin-bottom:3px}
+.step .d{font:400 var(--text-sm)/1.6 var(--font-sans);color:var(--text-secondary)}
+.step .d b{color:var(--text-primary);font-weight:600}
+.step .act{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap}
+.step .state{margin-top:10px;font:500 var(--text-xs)/1.3 var(--font-sans)}
+.step .state.ok{color:var(--feedback-success-fg)}
+.step .state.wait{color:var(--feedback-warning-fg)}
+.why{margin-top:10px;padding:10px 12px;border-radius:var(--radius-md);background:var(--surface-sunken);font:400 var(--text-xs)/1.55 var(--font-sans);color:var(--text-secondary)}
+.why b{color:var(--text-primary)}
+.pinned{margin-top:26px;padding:14px 16px;border-radius:var(--radius-md);background:var(--feedback-warning-bg);border:1px solid var(--feedback-warning-line);color:var(--feedback-warning-fg);font:400 var(--text-sm)/1.6 var(--font-sans)}
+@media (max-width:560px){.shell{padding:20px 16px 48px}h1{font-size:var(--text-2xl)}.step{gap:12px}}
+</style></head><body>
+<div class="shell">
+  <h1>seam<span class="stitch">.</span></h1>
+  <p class="lede">Two things to grant, once. Then push your pointer off the edge of this screen and it appears on the next machine.</p>
+
+  <div class="step done">
+    <div class="n">✓</div>
+    <div class="body">
+      <div class="t">Watch the mouse and keyboard</div>
+      <div class="d">Granted in <b>Privacy &amp; Security › Input Monitoring</b>. Without it seam sees nothing at all.</div>
+      <div class="state ok">● granted to this build</div>
+    </div>
+  </div>
+
+  <div class="step now">
+    <div class="n">2</div>
+    <div class="body">
+      <div class="t">Hold input back from this machine</div>
+      <div class="d">Granted in <b>Privacy &amp; Security › Accessibility</b>. This is the one that makes seam a switch rather than a mirror.</div>
+      <div class="act">
+        <button class="btn primary">Open Accessibility settings</button>
+        <button class="btn ghost">Check again</button>
+      </div>
+      <div class="state wait">○ not granted — typing would land on both machines at once</div>
+      <div class="why"><b>Why this one is easy to miss:</b> without it macOS still lets seam <i>see</i> input, and forwarding looks perfect — while this machine keeps acting on the same keystrokes. Nothing reports an error.</div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="n">3</div>
+    <div class="body">
+      <div class="t">Restart seam</div>
+      <div class="d">macOS does not apply either permission to a program that is already running.</div>
+      <div class="act"><button class="btn">Restart seam now</button></div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="n">4</div>
+    <div class="body">
+      <div class="t">Start seam on another machine</div>
+      <div class="d">Paired machines find each other and connect on their own — no addresses, no ports.</div>
+      <div class="act"><button class="btn">Pair a machine…</button></div>
+    </div>
+  </div>
+
+  <p class="pinned"><b>Every update asks again.</b> macOS ties these permissions to the exact binary, so a new download starts with none. That is the rule, not a bug — seam will say so plainly when it happens.</p>
+</div>
+</body></html>

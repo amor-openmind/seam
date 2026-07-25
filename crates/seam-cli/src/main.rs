@@ -1171,6 +1171,9 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/pairing.html", include_str!("../ui/pairing.html"), "text/html; charset=utf-8"),
     ("/settings.html", include_str!("../ui/settings.html"), "text/html; charset=utf-8"),
     ("/chrome.html", include_str!("../ui/chrome.html"), "text/html; charset=utf-8"),
+    ("/onboarding.html", include_str!("../ui/onboarding.html"), "text/html; charset=utf-8"),
+    ("/doctor.html", include_str!("../ui/doctor.html"), "text/html; charset=utf-8"),
+    ("/update.html", include_str!("../ui/update.html"), "text/html; charset=utf-8"),
     (
         "/notifications.html",
         include_str!("../ui/notifications.html"),
