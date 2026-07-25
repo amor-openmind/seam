@@ -1,0 +1,19 @@
+[package]
+name = "seam-proto"
+description = "Wire protocol for seam: types, codec and versioning. Zero dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Deliberately zero dependencies. This crate defines the bytes on the wire; it must
+# never break because a serialization library changed its encoding between versions.
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
