@@ -1171,7 +1171,7 @@ fn start_pointer_forwarding(
                 return;
             }
         };
-        tracing::info!("forwarding this machine's pointer to connected peers (mirror mode)");
+        tracing::info!("watching this machine's input; peers take it when the pointer crosses an edge");
 
         // The blocking receiver lives on its own thread so nothing on the async runtime
         // can stall the input path.
