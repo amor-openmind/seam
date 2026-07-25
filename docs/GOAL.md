@@ -408,7 +408,30 @@ more frame type). Files are not: no Rust crate implements the Windows file promi
 no working clipboard file promise at all, so it needs a virtual filesystem — NFS loopback
 rather than macFUSE, to avoid a kext. See `docs/research/clipboard.md`.
 
-### Cosmetic: the local cursor at the edge
+### The local cursor still tracks the mouse — needs a foreground agent
+
+**Status: understood, not fixed. This is architectural, not a bug in the logic.**
+
+Suppression is enabled correctly: `set_suppress_local(true)` runs on every remote
+handover and is cleared only when focus returns local. `CursorGuard::detach` is called,
+and `CGAssociateMouseAndMouseCursorPosition(0)` returns success. Six separate attempts
+to fix this by changing the suppression logic failed because the logic was never wrong.
+
+The mistake was reading that success return as proof of effect. It is not. On macOS,
+cursor visibility and cursor-to-mouse coupling belong to the **foreground application**.
+A background daemon may call `CGAssociateMouseAndMouseCursorPosition` and
+`CGDisplayHideCursor`, receive success from both, and have neither take effect.
+
+This is why Barrier and deskflow ship a GUI application on macOS rather than a headless
+daemon. It is not a stylistic choice: owning the cursor requires foreground status.
+
+**The fix**: a minimal Cocoa agent — `NSApplicationActivationPolicyAccessory`, no dock
+icon, no window — that holds the cursor state while a peer has the pointer. The daemon
+keeps the transport, the graph and the tap; the agent owns only the cursor. Do **not**
+attempt another workaround from the daemon: two have already failed and one locked the
+machine (see the removed `park_cursor` note in `crates/seam-cli/src/main.rs`).
+
+### Cosmetic: the cursor position at the edge
 
 With the tap at the HID location the cursor should stop moving. It still sits where it was
 left. Hiding it needs foreground status, which a daemon does not have — two attempts to
