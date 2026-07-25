@@ -762,6 +762,14 @@ async fn daemon(
         );
     }
 
+    // A machine that was told to dial somewhere joined a fleet: it is a client, and stays
+    // one across restarts. Recorded here rather than inferred later, so the answer cannot
+    // change when connections race.
+    if !connect.is_empty() && !dir.join("joined").exists() {
+        let _ = std::fs::write(dir.join("joined"), "");
+        let _ = std::fs::remove_file(dir.join("first-machine"));
+    }
+
     load_settings_into_ui(dir);
 
     start_update_watch();
@@ -1704,17 +1712,20 @@ async fn ui_state_json(
 
     // This machine's own capability, decided by what the build can actually do rather
     // than by any negotiation. Capture exists on macOS today; Windows replays only.
-    // The first machine installed is the one whose keyboard and mouse get shared: it is
-    // where a person starts, and every machine added afterwards joins it. Recorded on
-    // first run rather than negotiated, so it cannot flip when connections race.
+    // Server or client is decided by how this machine entered the fleet, and is known
+    // from the first run rather than negotiated: the machine seam was installed on is the
+    // server, and a machine that ran the join command is a client. Deriving it from
+    // connections would let it change under a race; deriving it from capability made two
+    // idle machines both claim to be servers.
     //
-    // Capability still constrains it: a machine that cannot capture says so regardless of
-    // what it was designated, because a role promising something this build cannot do
-    // would be a label that lies.
-    let self_role = if cfg!(target_os = "macos") {
-        if first_machine(dir) { "shares input" } else { "shares input, joined later" }
-    } else {
+    // Capability still qualifies it. A build that cannot capture input says so, because a
+    // role promising something it cannot do would be a label that lies.
+    let self_role = if !cfg!(target_os = "macos") {
         "receives input"
+    } else if first_machine(dir) {
+        "shares input"
+    } else {
+        "receives input, joined this fleet"
     };
 
     let shares = UI_SHARES.lock().map_or((true, true, true), |s| *s);
