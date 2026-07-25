@@ -613,3 +613,91 @@ pub fn relaunch_elevated(args: &[String]) -> Result<bool, Error> {
     // only expected one here is the user pressing No on the UAC prompt.
     Ok(handle > 32)
 }
+
+// ---------------------------------------------------------------- cursor concealment
+
+// SAFETY CONTRACT: system-cursor replacement, the standard KVM technique on Windows
+// (Synergy and Barrier both ship it). There is no supported way for a background
+// process to hide the cursor globally; replacing the system cursors with a blank one
+// is global, reversible, and survives focus changes. The risk is a crash while
+// concealed - the machine keeps an invisible cursor - so reveal is wired to every
+// input arrival, link loss, daemon startup and `seam release`.
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn CreateCursor(
+        inst: *mut core::ffi::c_void,
+        x_hot: i32,
+        y_hot: i32,
+        width: i32,
+        height: i32,
+        and_mask: *const u8,
+        xor_mask: *const u8,
+    ) -> *mut core::ffi::c_void;
+    fn SetSystemCursor(cursor: *mut core::ffi::c_void, id: u32) -> i32;
+    fn SystemParametersInfoW(action: u32, param: u32, value: *mut core::ffi::c_void, ini: u32)
+    -> i32;
+}
+
+/// Every replaceable system cursor: arrow, ibeam, wait, cross, up, the four resize
+/// pairs, size-all, no, hand, app-starting.
+const SYSTEM_CURSORS: [u32; 13] = [
+    32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644, 32645, 32646, 32648, 32649, 32650,
+];
+const SPI_SETCURSORS: u32 = 0x0057;
+
+static CONCEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Hide the cursor globally by replacing every system cursor with a blank one.
+///
+/// Called when the pointer leaves this machine for another. Idempotent.
+pub fn conceal_cursor() {
+    use std::sync::atomic::Ordering;
+    if CONCEALED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // A 32x32 cursor whose AND mask is all ones and XOR mask all zeroes: fully
+    // transparent. SetSystemCursor consumes the handle, so one is made per id.
+    let and_mask = [0xFFu8; 128];
+    let xor_mask = [0x00u8; 128];
+    for id in SYSTEM_CURSORS {
+        // SAFETY: documented calls; the created cursor is owned by the system after
+        // SetSystemCursor succeeds, and leaks harmlessly if it fails.
+        unsafe {
+            let blank = CreateCursor(
+                core::ptr::null_mut(),
+                0,
+                0,
+                32,
+                32,
+                and_mask.as_ptr(),
+                xor_mask.as_ptr(),
+            );
+            if !blank.is_null() {
+                SetSystemCursor(blank, id);
+            }
+        }
+    }
+}
+
+/// Restore the real system cursors. Safe to call at any time, from anywhere —
+/// this is the recovery path as well as the normal one.
+pub fn reveal_cursor() {
+    use std::sync::atomic::Ordering;
+    CONCEALED.store(false, Ordering::Relaxed);
+    // SAFETY: documented reload of the user's configured cursors from the registry.
+    unsafe {
+        SystemParametersInfoW(SPI_SETCURSORS, 0, core::ptr::null_mut(), 0);
+    }
+}
+
+/// Restore the cursors only if seam hid them, cheaply. Called on every arriving
+/// motion frame, so regaining the pointer reveals instantly.
+pub fn reveal_if_concealed() {
+    use std::sync::atomic::Ordering;
+    if CONCEALED.swap(false, Ordering::Relaxed) {
+        // SAFETY: as above.
+        unsafe {
+            SystemParametersInfoW(SPI_SETCURSORS, 0, core::ptr::null_mut(), 0);
+        }
+    }
+}

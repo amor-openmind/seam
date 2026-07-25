@@ -109,6 +109,10 @@ pub fn release_input() {
         macos::set_suppress_local(false);
         macos::force_restore_cursor();
     }
+    #[cfg(target_os = "windows")]
+    {
+        windows::reveal_cursor();
+    }
 }
 
 /// Move the pointer by injecting a real input event, so applications see genuine movement

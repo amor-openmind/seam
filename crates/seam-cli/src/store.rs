@@ -17,9 +17,40 @@ const PEERS: &str = "peers";
 
 /// Where seam keeps its state, following each platform's own convention.
 pub(crate) fn state_dir() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("dev", "seam", "seam")
-        .context("could not determine this platform's application data directory")?;
-    Ok(dirs.data_dir().to_path_buf())
+    // Explicit override wins, always.
+    if let Ok(home) = std::env::var("SEAM_HOME")
+        && !home.is_empty()
+    {
+        return Ok(PathBuf::from(home));
+    }
+
+    let platform = directories::ProjectDirs::from("dev", "seam", "seam")
+        .context("could not determine this platform's application data directory")?
+        .data_dir()
+        .to_path_buf();
+
+    // Portable mode: a `seam-data` folder next to the executable. Someone who only
+    // downloads the binary and double-clicks it gets their identity, pairings and
+    // settings in a folder they can see, move with the binary, and not lose.
+    //
+    // The rule is deliberately conservative so existing installs never change homes:
+    //   1. an existing seam-data next to the binary is used;
+    //   2. otherwise, an existing platform-dir identity keeps the platform dir —
+    //      moving it would present a new identity and silently unpair the fleet;
+    //   3. only a genuinely fresh install (neither exists) prefers portable, falling
+    //      back to the platform dir where the binary's folder is not writable.
+    let portable = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("seam-data")));
+    if let Some(portable) = portable {
+        if portable.is_dir() {
+            return Ok(portable);
+        }
+        if !platform.join(IDENTITY_CERT).exists() && fs::create_dir_all(&portable).is_ok() {
+            return Ok(portable);
+        }
+    }
+    Ok(platform)
 }
 
 /// Load this machine's identity, generating and persisting one on first run.

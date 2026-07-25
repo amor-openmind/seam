@@ -36,7 +36,7 @@ use seam_transport::{
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -159,7 +159,11 @@ async fn run(cli: Cli) -> Result<()> {
     let dir = store::state_dir()?;
     let identity = Arc::new(store::load_or_create_identity(&dir)?);
 
-    match cli.command {
+    // No arguments is the double-click case: run, and show the fleet page.
+    let Some(command) = cli.command else {
+        return run_daemon(&dir, identity, 0, Vec::new(), false, true).await;
+    };
+    match command {
         Command::Doctor => doctor(&dir, &identity),
         Command::Discover { r#for } => {
             discover(Duration::from_secs(r#for), identity.peer_id()).await
@@ -179,6 +183,22 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Forget { peer } => forget(&dir, &peer),
         Command::Ui => open_ui(&dir),
         Command::Run { port, connect, no_elevate } => {
+            run_daemon(&dir, identity, port, connect, no_elevate, false).await
+        }
+    }
+}
+
+/// Run the daemon — the body of `seam run`, and of `seam` with no arguments at all
+/// (a double-click on the downloaded binary), which also opens the fleet page once up.
+async fn run_daemon(
+    dir: &std::path::Path,
+    identity: Arc<Identity>,
+    port: u16,
+    connect: Vec<String>,
+    no_elevate: bool,
+    open_ui_when_ready: bool,
+) -> Result<()> {
+    {
             #[cfg(target_os = "windows")]
             if !no_elevate && !seam_input::windows::is_elevated() {
                 // UIPI is the reason: Windows silently discards injected input while an
@@ -203,8 +223,16 @@ async fn run(cli: Cli) -> Result<()> {
             }
             #[cfg(not(target_os = "windows"))]
             let _ = no_elevate;
-            daemon(&dir, identity, port, connect).await
-        }
+            if open_ui_when_ready {
+                let dir = dir.to_path_buf();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    if let Err(e) = open_ui(&dir) {
+                        tracing::warn!("could not open the fleet page: {e}");
+                    }
+                });
+            }
+            daemon(dir, identity, port, connect).await
     }
 }
 
@@ -674,6 +702,11 @@ async fn daemon(
         );
     }
 
+    // Crash recovery: a previous seam that died while the cursor was concealed leaves
+    // this machine with an invisible cursor. Restoring is free when nothing was hidden.
+    #[cfg(target_os = "windows")]
+    seam_input::windows::reveal_cursor();
+
     start_ui_server(dir.to_path_buf(), name.clone(), identity.peer_id(), Arc::clone(&links));
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry), dir.to_path_buf());
 
@@ -719,6 +752,7 @@ async fn daemon(
 
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("shutting down");
+    let _ = std::fs::remove_file(dir.join("ui-port"));
     // Never exit while this machine is still withholding its own input.
     seam_input::release_input();
     tracing::info!("this machine's input restored");
@@ -748,7 +782,19 @@ async fn receive_from(
 
     loop {
         match link.recv_datagram().await {
+            Ok(seam_proto::Frame::Leave { .. }) => {
+                // The pointer went somewhere else: hide this machine's cursor, exactly
+                // as the server hides its own. Reveal happens on the next arriving
+                // motion, on link loss, and at startup — fail open, always.
+                #[cfg(target_os = "windows")]
+                {
+                    seam_input::windows::conceal_cursor();
+                    tracing::info!("pointer left this machine; cursor hidden");
+                }
+            }
             Ok(seam_proto::Frame::Motion(motion)) => {
+                #[cfg(target_os = "windows")]
+                seam_input::windows::reveal_if_concealed();
                 let (px, py) = motion.cursor.to_px();
                 // The sender's coordinates are its own; clamp onto a real display here so
                 // a mismatched resolution can never strand the pointer somewhere invisible.
@@ -786,6 +832,8 @@ async fn receive_from(
             Ok(_) => {}
             Err(e) => {
                 tracing::info!(%peer, "link closed: {e}");
+                #[cfg(target_os = "windows")]
+                seam_input::windows::reveal_cursor();
                 return;
             }
         }
@@ -1032,10 +1080,25 @@ async fn ui_state_json(
 
 /// Open the fleet page of the daemon running on this machine.
 fn open_ui(dir: &std::path::Path) -> Result<()> {
-    let port: u16 = std::fs::read_to_string(dir.join("ui-port"))
+    let port_file = dir.join("ui-port");
+    let port: u16 = std::fs::read_to_string(&port_file)
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .context("seam is not running on this machine — start it, then run 'seam ui'")?;
+    // The file outlives the daemon that wrote it, so probe before opening a browser at
+    // a dead port — 'connection refused' in a browser tab explains nothing.
+    if std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(600),
+    )
+    .is_err()
+    {
+        let _ = std::fs::remove_file(&port_file);
+        anyhow::bail!(
+            "seam is not running on this machine (a previous run left its note behind) — \
+             start 'seam run', then 'seam ui'"
+        );
+    }
     let url = format!("http://127.0.0.1:{port}/");
     #[cfg(target_os = "macos")]
     std::process::Command::new("open").arg(&url).spawn()?;
@@ -1810,6 +1873,8 @@ fn start_pointer_forwarding(
             let mut seq: u32 = 0;
             // Holds the cursor still on this machine while a peer owns the pointer.
             let mut detached: Option<seam_input::macos::CursorGuard> = None;
+            // Which peer currently holds the pointer, for leave announcements.
+            let mut holder: Option<seam_proto::PeerId> = None;
             // Where the local cursor is held while a peer owns the pointer.
             let mut parked: Option<(i32, i32)> = None;
             // Rate limit for the drift warning below, so a moving cursor does not turn
@@ -1852,6 +1917,30 @@ fn start_pointer_forwarding(
                 if let Some(u) = update
                     && u.changed
                 {
+                    // Tell the peer that LOST the pointer, so it can hide its cursor.
+                    // The gaining peer needs no announcement — input starts arriving,
+                    // which is unambiguous — but a losing peer sees only silence, and
+                    // silence is indistinguishable from a user who stopped moving.
+                    let now_holding = match u.focus {
+                        Focus::Remote(p) => Some(p),
+                        Focus::Local => None,
+                    };
+                    if let Some(lost) = holder
+                        && now_holding != Some(lost)
+                    {
+                        let links = Arc::clone(&links);
+                        tokio::spawn(async move {
+                            let peers = links.lock().await;
+                            if let Some(link) = peers.iter().find(|l| l.peer_id() == lost)
+                                && let Err(e) = link
+                                    .send_reliable(&seam_proto::Frame::Leave { seq: 0 })
+                                    .await
+                            {
+                                tracing::debug!("could not send leave: {e}");
+                            }
+                        });
+                    }
+                    holder = now_holding;
                     detached = handover(u, detached);
                     match u.focus {
                         // Remember where the cursor was left, and hold it there. Logged,
@@ -2035,7 +2124,8 @@ mod tests {
 
     #[test]
     fn the_port_is_optional_and_defaults_to_os_chosen() {
-        let Command::Run { port, connect, .. } = Cli::try_parse_from(["seam", "run"]).unwrap().command
+        let Some(Command::Run { port, connect, .. }) =
+            Cli::try_parse_from(["seam", "run"]).unwrap().command
         else {
             panic!("expected run");
         };
