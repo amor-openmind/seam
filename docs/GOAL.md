@@ -425,7 +425,30 @@ A background daemon may call `CGAssociateMouseAndMouseCursorPosition` and
 This is why Barrier and deskflow ship a GUI application on macOS rather than a headless
 daemon. It is not a stylistic choice: owning the cursor requires foreground status.
 
-**The fix**: a minimal Cocoa agent — `NSApplicationActivationPolicyAccessory`, no dock
+**Read Barrier before touching this again.** `OSXScreen.mm` uses two APIs seam does not:
+
+```cpp
+CGSetLocalEventsSuppressionInterval(0.0);              // setZeroSuppressionInterval()
+CGSetLocalEventsFilterDuringSupressionState(           // avoidSupression()
+    kCGEventFilterMaskPermitAllEvents, kCGEventSupressionStateSupressionInterval);
+CGSetLocalEventsFilterDuringSupressionState(
+    kCGEventFilterMaskPermitLocalKeyboardEvents | kCGEventFilterMaskPermitSystemDefinedEvents,
+    kCGEventSupressionStateRemoteMouseDrag);
+```
+
+After any `CGWarpMouseCursorPosition`, macOS suppresses local hardware events for about
+0.25 s by default. Barrier zeroes that interval on entering the primary screen and permits
+all events during the suppression state. seam warps on every return-home and sets neither,
+so for a quarter second after each crossing macOS is filtering local input in a way seam
+does not account for. Barrier calls `setZeroSuppressionInterval()` from `enter()` on the
+primary screen and `avoidSupression()` from `enter()` on a secondary one.
+
+Barrier's `hideCursor()` is otherwise the same pair seam already uses
+(`CGDisplayHideCursor` + `CGAssociateMouseAndMouseCursorPosition(false)`), so the
+difference is the suppression state, not the cursor call. Try this **before** building an
+agent — it is three lines against a new crate.
+
+**If that is not enough**: a minimal Cocoa agent — `NSApplicationActivationPolicyAccessory`, no dock
 icon, no window — that holds the cursor state while a peer has the pointer. The daemon
 keeps the transport, the graph and the tap; the agent owns only the cursor. Do **not**
 attempt another workaround from the daemon: two have already failed and one locked the
