@@ -391,6 +391,12 @@ const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
 const K_CG_EVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
 const K_CG_EVENT_OTHER_MOUSE_UP: CGEventType = 26;
 
+/// `kCGMouseEventDeltaX` / `Y` — movement since the last event. While the cursor is
+/// detached from the mouse the reported *location* stops changing, so these deltas are
+/// the only remaining truth about what the user's hand did.
+const K_CG_MOUSE_DELTA_X: u32 = 4;
+const K_CG_MOUSE_DELTA_Y: u32 = 5;
+
 /// `kCGScrollWheelEventDeltaAxis1` — vertical, in wheel notches.
 const K_CG_SCROLL_DELTA_AXIS1: u32 = 11;
 /// `kCGScrollWheelEventDeltaAxis2` — horizontal.
@@ -450,8 +456,9 @@ const fn mask_for(event_type: CGEventType) -> CGEventMask {
 /// Something the user did on this machine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Observed {
-    /// Pointer moved to an absolute position.
-    Motion { x: i32, y: i32 },
+    /// Pointer moved. `x`/`y` are the absolute position, which freezes while the cursor
+    /// is detached; `dx`/`dy` are the movement, which keeps working either way.
+    Motion { x: i32, y: i32, dx: i32, dy: i32 },
     /// A mouse button changed state. `button` follows the evdev numbering the protocol uses.
     Button { button: u8, down: bool },
     /// Scrolled. Positive `dy` is away from the user, matching the protocol's convention.
@@ -485,10 +492,21 @@ unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observe
         | K_CG_EVENT_LEFT_MOUSE_DRAGGED
         | K_CG_EVENT_RIGHT_MOUSE_DRAGGED
         | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
-            // SAFETY: valid event, by-value getter.
-            let p = unsafe { CGEventGetLocation(event) };
+            // SAFETY: valid event; all three are by-value getters on it.
+            let (p, dx, dy) = unsafe {
+                (
+                    CGEventGetLocation(event),
+                    CGEventGetIntegerValueField(event, K_CG_MOUSE_DELTA_X),
+                    CGEventGetIntegerValueField(event, K_CG_MOUSE_DELTA_Y),
+                )
+            };
             #[expect(clippy::cast_possible_truncation, reason = "screen coordinates fit i32")]
-            Some(Observed::Motion { x: p.x.round() as i32, y: p.y.round() as i32 })
+            Some(Observed::Motion {
+                x: p.x.round() as i32,
+                y: p.y.round() as i32,
+                dx: i32::try_from(dx).unwrap_or(0),
+                dy: i32::try_from(dy).unwrap_or(0),
+            })
         }
 
         K_CG_EVENT_LEFT_MOUSE_DOWN => Some(Observed::Button { button: 1, down: true }),

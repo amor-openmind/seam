@@ -6,6 +6,7 @@
 //! confirm a 6-digit pairing code, because that confirmation *is* the security boundary
 //! and cannot be automated away.
 
+mod focus;
 mod layout;
 mod store;
 
@@ -604,29 +605,43 @@ async fn receive_from(link: Arc<Link>) {
     }
 }
 
-/// Turn a captured event into a protocol frame.
+/// Keep the layout in step with which peers are actually connected.
+///
+/// Peers are placed to the right in the order they connect. A layout editor belongs in
+/// the UI; this makes handover work today without asking the user to draw anything
+/// (goal Z3). A peer that goes away is removed, which returns the pointer home if it
+/// held it — never leave input aimed at a machine that is gone (goal R2).
 #[cfg(target_os = "macos")]
-fn to_frame(
-    event: seam_input::macos::Observed,
-    seq: u32,
-    travel: &mut (i32, i32),
-    last: &mut Option<(i32, i32)>,
-) -> Option<seam_proto::Frame> {
+async fn sync_peers(
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    strip: &mut focus::Layout,
+    known: &mut Vec<seam_proto::PeerId>,
+) {
+    let live: Vec<seam_proto::PeerId> = links.lock().await.iter().map(|l| l.peer_id()).collect();
+
+    for id in &live {
+        if !known.contains(id) {
+            known.push(*id);
+            strip.add_peer_right(*id, 1920, 1080);
+            tracing::info!(peer = %id, "placed to the right — push the pointer off the right edge to reach it");
+        }
+    }
+    known.retain(|id| {
+        if live.contains(id) {
+            return true;
+        }
+        tracing::info!(peer = %id, "peer gone; input returns to this machine");
+        strip.forget_peer(*id);
+        false
+    });
+}
+
+/// Turn a captured non-motion event into a protocol frame.
+#[cfg(target_os = "macos")]
+fn to_frame(event: seam_input::macos::Observed, seq: u32) -> Option<seam_proto::Frame> {
     use seam_input::macos::Observed;
     Some(match event {
-        Observed::Motion { x, y } => {
-            if let Some((lx, ly)) = *last {
-                travel.0 = travel.0.wrapping_add(x - lx);
-                travel.1 = travel.1.wrapping_add(y - ly);
-            }
-            *last = Some((x, y));
-            seam_proto::Frame::Motion(seam_proto::Motion {
-                seq,
-                cursor: seam_proto::Point::from_px(x, y),
-                travel_x: travel.0,
-                travel_y: travel.1,
-            })
-        }
+        Observed::Motion { .. } => return None,
         Observed::Button { button, down } => seam_proto::Frame::Button(seam_proto::ButtonEvent {
             seq,
             button: seam_proto::Button::try_from_u8(button).ok()?,
@@ -732,54 +747,94 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<seam_input::macos::Observed>(512);
         std::thread::spawn(move || {
             while let Ok(event) = observed.recv() {
-                // Drop rather than block: a stalled input thread is what makes macOS
-                // disable the tap, and motion is self-correcting.
                 let _ = tx.try_send(event);
             }
         });
 
+        let desktop = seam_input::desktop().ok();
+        let (local_w, local_h) = desktop
+            .as_ref()
+            .map_or((1920, 1080), |d| (d.bounding_box().width, d.bounding_box().height));
+
         tokio::spawn(async move {
+            use focus::Focus;
+            use seam_input::macos::Observed;
+
+            let mut strip = focus::Layout::new(local_w, local_h);
+            let mut known: Vec<seam_proto::PeerId> = Vec::new();
             let mut buf = Vec::with_capacity(64);
             let mut seq: u32 = 0;
-            let mut travel = (0i32, 0i32);
-            let mut last: Option<(i32, i32)> = None;
-            let mut sent: u64 = 0;
-            let mut failed: u64 = 0;
+            // Holds the cursor still on this machine while a peer owns the pointer.
+            let mut detached: Option<seam_input::macos::CursorGuard> = None;
 
             while let Some(event) = rx.recv().await {
                 seq = seq.wrapping_add(1);
 
-                let Some(frame) = to_frame(event, seq, &mut travel, &mut last) else {
+                sync_peers(&links, &mut strip, &mut known).await;
+
+                // Movement decides ownership; everything else follows whoever owns it.
+                let update = match event {
+                    Observed::Motion { dx, dy, .. } => Some(strip.apply_motion(dx, dy)),
+                    _ => None,
+                };
+
+                if let Some(u) = update
+                    && u.changed
+                {
+                    match u.focus {
+                        Focus::Remote(peer) => {
+                            tracing::info!(%peer, "pointer and keyboard moved to this peer");
+                            // Freeze the local cursor so this machine stops tracking the
+                            // mouse. The guard reattaches on every exit path.
+                            detached = seam_input::macos::CursorGuard::detach(false).ok();
+                        }
+                        Focus::Local => {
+                            tracing::info!("pointer and keyboard back on this machine");
+                            detached = None;
+                        }
+                    }
+                }
+
+                let Some(target) = (match strip.focus() {
+                    Focus::Local => None,
+                    Focus::Remote(p) => Some(p),
+                }) else {
+                    // Local machine owns input: forward nothing at all. This is what makes
+                    // it a KVM rather than a mirror.
                     continue;
+                };
+
+                let frame = match event {
+                    Observed::Motion { .. } => {
+                        let u = update.unwrap_or_else(|| strip.apply_motion(0, 0));
+                        seam_proto::Frame::Motion(seam_proto::Motion {
+                            seq,
+                            cursor: seam_proto::Point::from_px(u.local_x, u.local_y),
+                            travel_x: u.local_x,
+                            travel_y: u.local_y,
+                        })
+                    }
+                    other => match to_frame(other, seq) {
+                        Some(f) => f,
+                        None => continue,
+                    },
                 };
                 log_event(&frame);
 
                 let peers = links.lock().await;
-                for link in peers.iter() {
-                    // Motion rides an unreliable datagram; everything else must be
-                    // reliable, because a lost button-up is a stuck drag and a lost
-                    // key-up is a stuck modifier.
-                    let result = if frame.is_datagram_safe() {
-                        link.send_datagram(&frame, &mut buf)
-                    } else {
-                        link.send_reliable(&frame).await
-                    };
-                    match result {
-                        Ok(()) => {
-                            sent = sent.wrapping_add(1);
-                            if sent == 1 || sent.is_multiple_of(2000) {
-                                tracing::info!(peer = %link.peer_id(), sent, "forwarding input");
-                            }
-                        }
-                        Err(e) => {
-                            failed = failed.wrapping_add(1);
-                            if failed == 1 || failed.is_multiple_of(500) {
-                                tracing::warn!(peer = %link.peer_id(), failed, "cannot forward input: {e}");
-                            }
-                        }
-                    }
+                let Some(link) = peers.iter().find(|l| l.peer_id() == target) else {
+                    continue;
+                };
+                let result = if frame.is_datagram_safe() {
+                    link.send_datagram(&frame, &mut buf)
+                } else {
+                    link.send_reliable(&frame).await
+                };
+                if let Err(e) = result {
+                    tracing::warn!(peer = %target, "could not forward input: {e}");
                 }
             }
+            drop(detached);
         });
     }
     #[cfg(not(target_os = "macos"))]
