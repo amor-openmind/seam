@@ -314,3 +314,57 @@ Stated because they change the work if wrong:
 2. macOS peers require Accessibility + Input Monitoring permission. This is an OS
    requirement no implementation can avoid; it will be detected and reported clearly.
 3. The project name `seam` is provisional and cheap to change.
+
+---
+
+## 10. Next: the input path (decided, not yet built)
+
+Everything up to the link is done and proven on three machines. What remains is the part
+that actually moves the pointer. The design below is settled so implementation can start
+immediately.
+
+### Step 1 — mirror mode, and why it comes first
+
+**macOS capture uses `kCGEventTapOptionListenOnly` initially.** A listen-only tap's return
+value is ignored by the OS, so it *physically cannot* suppress input — which means it
+cannot produce the failure that makes this work dangerous (deskflow#9562: an active
+suppressing tap whose permission is revoked mid-session freezes all local input until a
+hard reboot).
+
+The trade-off is that the local pointer keeps moving too. That is not the final UX, but it
+is honest, visible, end-to-end input forwarding, and it de-risks everything underneath:
+event tap plumbing, tap-disable recovery, the motion encoding, the wire path, and Windows
+injection all get proven before any code is allowed to suppress anything.
+
+| Piece | Detail |
+|---|---|
+| macOS capture | `CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, …)` on a dedicated thread with its own `CFRunLoop` in `kCFRunLoopCommonModes` |
+| Tap health | Handle `kCGEventTapDisabledByTimeout` **first and unconditionally**, re-arm with `CGEventTapEnable`, and poll `CGEventTapIsEnabled` every ~5 s. This is the bug behind "it works again when I open the app window" |
+| Hot path | Callback does no allocation, no I/O, no locks: it writes a fixed-size event into an SPSC ring and returns |
+| Wire | `Frame::Motion` on a QUIC datagram, already implemented and tested |
+| Windows injection | `SendInput` with `MOUSEEVENTF_ABSOLUTE \| MOUSEEVENTF_VIRTUALDESK`, coordinates normalised 0–65535 across the **virtual desktop**, never the primary monitor |
+
+### Step 2 — real crossing
+
+Only once step 1 works end to end: switch to an active tap, suppress locally, and add
+`CGAssociateMouseAndMouseCursorPosition(false)` via the existing `CursorGuard`. Edge
+detection uses the geometry already implemented in `seam-input::screen`.
+
+**Preconditions before any suppressing tap ships:** a supervisor process that restores OS
+cursor state if the daemon dies (R2.1, because `SIGKILL` cannot be handled in-process), a
+receiver-side dead-man watchdog (D6), and a local release chord evaluated in the capture
+layer before any network involvement.
+
+### Step 3 — keyboard
+
+`CGEventKeyboardSetUnicodeString` plus a `UCKeyTranslate` reverse map on the receiver, so
+the `LayoutPolicy::Auto` logic already implemented in `seam-proto::keys` is finally
+exercised against the real German Apple keyboard on this fleet.
+
+### Known limits to fix, not hide
+
+- **Z7 is currently violated on Windows**: inbound mDNS needs a firewall rule, so discovery
+  fails silently and only `seam pair --at` works. The fix is an installer that registers
+  the rule; until then `doctor` should *detect* and report it rather than leaving the user
+  to guess.
+- `seam peers` shows a peer's id where its name should be.
