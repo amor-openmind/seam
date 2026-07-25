@@ -1750,6 +1750,19 @@ fn start_pointer_forwarding(
                     // user sees flicker. One extra call per event makes that impossible
                     // rather than arguable.
                     seam_input::macos::reassert_detach();
+                    // Visibility is global OS state: any foreground app or system banner
+                    // can show the cursor again mid-session, and did — the field report
+                    // was the arrow reappearing until the pointer came home. Watch and
+                    // re-hide, and say so in the log instead of leaving it to be noticed.
+                    if seam_input::macos::rehide_if_visible()
+                        && last_drift_warn.is_none_or(|t| t.elapsed() > Duration::from_secs(1))
+                    {
+                        tracing::info!(
+                            "the cursor had become visible while a peer holds the \
+                             pointer — hidden again"
+                        );
+                        last_drift_warn = Some(std::time::Instant::now());
+                    }
                 }
 
                 // Log the captured event and the resulting focus *before* deciding

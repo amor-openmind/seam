@@ -142,6 +142,7 @@ unsafe extern "C" {
     fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> CGError;
     fn CGAssociateMouseAndMouseCursorPosition(connected: Boolean) -> CGError;
     fn CGDisplayHideCursor(display: CGDirectDisplayID) -> CGError;
+    fn CGCursorIsVisible() -> Boolean;
     fn CGDisplayShowCursor(display: CGDirectDisplayID) -> CGError;
 
     fn CGEventCreate(source: *const c_void) -> *mut c_void;
@@ -296,6 +297,7 @@ impl CursorGuard {
             let _ = allow_background_cursor_control();
             // SAFETY: the display argument is documented as ignored.
             unsafe { CGDisplayHideCursor(CGMainDisplayID()) };
+            HIDES.store(1, std::sync::atomic::Ordering::Relaxed);
         }
         tracing::info!(hide, "cursor detached from the mouse");
         Ok(Self { hidden: hide })
@@ -327,7 +329,13 @@ impl Drop for CursorGuard {
         // SAFETY: reattaching is always valid, and the over-show is refcount-saturating.
         unsafe {
             if self.hidden {
-                for _ in 0..4 {
+                // Balance the hide count exactly: mid-session re-hides (see
+                // `rehide_if_visible`) each incremented it, and a fixed count here
+                // would leave the cursor invisible after a session in which the system
+                // re-showed it more than that many times. One extra is harmless — the
+                // counter saturates at visible.
+                let hides = HIDES.swap(0, std::sync::atomic::Ordering::Relaxed);
+                for _ in 0..=hides.max(3) {
                     CGDisplayShowCursor(CGMainDisplayID());
                 }
             }
@@ -1046,6 +1054,34 @@ pub fn capture_is_alive() -> Option<bool> {
     Some(unsafe { CGEventTapIsEnabled(tap.cast()) } != 0)
 }
 
+/// How many times the cursor has been hidden and not yet shown.
+///
+/// Hiding is refcounted by the window server, and visibility is GLOBAL state: any
+/// foreground app or system surface (a notification banner, Spotlight, an app switch)
+/// can show the cursor again while a peer holds the pointer. seam therefore re-hides
+/// whenever it finds the arrow visible mid-session — and the release path must then
+/// show exactly as many times as were hidden, or coming home leaves no cursor at all.
+static HIDES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// If the arrow has become visible while it should be hidden, hide it again.
+///
+/// Returns whether a re-hide happened, so the caller can log it (throttled) — a
+/// reappearing cursor was a field report, and the log should name the moments it
+/// happens rather than leaving them to be noticed from a chair.
+pub fn rehide_if_visible() -> bool {
+    // SAFETY: documented visibility query and hide call; the count keeps show/hide
+    // balanced on release.
+    unsafe {
+        if CGCursorIsVisible() == 0 {
+            return false;
+        }
+        let _ = allow_background_cursor_control();
+        CGDisplayHideCursor(CGMainDisplayID());
+        HIDES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+}
+
 /// Re-assert the cursor/mouse disassociation, without constructing a new guard.
 ///
 /// The association is global window-server state, and nothing guarantees it stays
@@ -1460,6 +1496,39 @@ mod tap_behaviour {
             "a tap that was just created and is delivering events must report alive, or \
              the watchdog will release input from a machine that is working perfectly"
         );
+    }
+
+    /// The reappearing-cursor machinery, asserted as far as one process can.
+    ///
+    /// The real trigger — another application's connection making the arrow visible —
+    /// cannot be simulated from in here: visibility is per-connection refcounted and
+    /// applied asynchronously by the window server. What is provable in-process: the
+    /// watchdog is a no-op while hidden, a forced show (if it takes effect here) is
+    /// noticed and reversed, and release always ends with a visible cursor.
+    #[test]
+    fn hiding_survives_the_system_showing_the_cursor() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = CursorGuard::detach(true).expect("detach");
+        std::thread::sleep(Duration::from_millis(50));
+        // SAFETY: documented calls, serialized by the mutex above.
+        unsafe {
+            assert!(!rehide_if_visible(), "no-op while already hidden");
+            CGDisplayShowCursor(CGMainDisplayID());
+            std::thread::sleep(Duration::from_millis(50));
+            if CGCursorIsVisible() == 0 {
+                eprintln!("window server kept it hidden; external show not simulable here");
+            } else {
+                assert!(rehide_if_visible(), "the watchdog must notice and re-hide");
+                std::thread::sleep(Duration::from_millis(50));
+                assert_eq!(CGCursorIsVisible(), 0, "hidden again");
+            }
+        }
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(80));
+        // SAFETY: read-only visibility query.
+        unsafe {
+            assert_ne!(CGCursorIsVisible(), 0, "coming home must leave a visible cursor");
+        }
     }
 
     /// Does THIS macOS still honour Barrier's background-cursor trick?
