@@ -377,7 +377,24 @@ type CGEventRef = *mut c_void;
 type CGEventType = u32;
 type CGEventMask = u64;
 
-/// `kCGSessionEventTap` — the login session, which an ordinary user process may tap.
+/// `kCGHIDEventTap` — where HID events enter the window server, **before** the cursor is
+/// moved.
+///
+/// This placement is the difference between suppression that works and suppression that
+/// only looks like it does. At `kCGSessionEventTap` the `WindowServer` has already moved the
+/// cursor by the time the tap sees the event, so discarding it stops applications
+/// receiving input while the pointer carries on visibly tracking the mouse. At the HID tap
+/// the event is discarded before that happens.
+///
+/// Apple's reference page still says only root may tap here. That text predates TCC and is
+/// stale: deskflow and input-leap both create this tap from an ordinary user process, and
+/// the real gate is the Input Monitoring permission. A NULL return means the permission is
+/// missing, not that root is required.
+const K_CG_HID_EVENT_TAP: u32 = 0;
+
+/// `kCGSessionEventTap` — the login session. Kept for reference; see above for why the HID
+/// tap is used instead.
+#[expect(dead_code, reason = "documents the alternative that does not suppress the cursor")]
 const K_CG_SESSION_EVENT_TAP: u32 = 1;
 /// `kCGHeadInsertEventTap`.
 const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
@@ -869,7 +886,7 @@ pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
             // `on_event` matches the required callback signature.
             let tap = unsafe {
                 CGEventTapCreate(
-                    K_CG_SESSION_EVENT_TAP,
+                    K_CG_HID_EVENT_TAP,
                     K_CG_HEAD_INSERT_EVENT_TAP,
                     K_CG_EVENT_TAP_OPTION_DEFAULT,
                     mask,
@@ -962,7 +979,7 @@ mod tap_behaviour {
             }
             CGEventSetIntegerValueField(event, K_CG_MOUSE_DELTA_X, dx);
             CGEventSetIntegerValueField(event, K_CG_MOUSE_DELTA_Y, dy);
-            CGEventPost(K_CG_SESSION_EVENT_TAP, event);
+            CGEventPost(K_CG_HID_EVENT_TAP, event);
             CFRelease(event.cast_const());
         }
     }
