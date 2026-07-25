@@ -358,3 +358,212 @@ mod tests {
         assert!(desktop().unwrap().contains(x, y), "cursor lost after restore");
     }
 }
+
+// ---------------------------------------------------------------- capture
+
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+type CFMachPortRef = *mut c_void;
+type CFRunLoopSourceRef = *mut c_void;
+type CFRunLoopRef = *mut c_void;
+type CFRunLoopMode = *const c_void;
+type CGEventTapProxy = *mut c_void;
+type CGEventRef = *mut c_void;
+type CGEventType = u32;
+type CGEventMask = u64;
+
+/// `kCGSessionEventTap` — the login session, which an ordinary user process may tap.
+const K_CG_SESSION_EVENT_TAP: u32 = 1;
+/// `kCGHeadInsertEventTap`.
+const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+/// `kCGEventTapOptionListenOnly` — observe without the ability to modify or discard.
+const K_CG_EVENT_TAP_OPTION_LISTEN_ONLY: u32 = 1;
+
+const K_CG_EVENT_MOUSE_MOVED: CGEventType = 5;
+const K_CG_EVENT_LEFT_MOUSE_DRAGGED: CGEventType = 6;
+const K_CG_EVENT_RIGHT_MOUSE_DRAGGED: CGEventType = 7;
+const K_CG_EVENT_OTHER_MOUSE_DRAGGED: CGEventType = 27;
+const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: CGEventType = 0xFFFF_FFFE;
+const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: CGEventType = 0xFFFF_FFFF;
+
+type CGEventTapCallBack = unsafe extern "C" fn(
+    proxy: CGEventTapProxy,
+    event_type: CGEventType,
+    event: CGEventRef,
+    user_info: *mut c_void,
+) -> CGEventRef;
+
+// SAFETY CONTRACT: documented CoreGraphics / CoreFoundation signatures, verified against
+// the macOS 26.5 SDK headers.
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: CGEventMask,
+        callback: CGEventTapCallBack,
+        user_info: *mut c_void,
+    ) -> CFMachPortRef;
+    fn CGEventTapEnable(tap: CFMachPortRef, enable: Boolean);
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const c_void,
+        port: CFMachPortRef,
+        order: isize,
+    ) -> CFRunLoopSourceRef;
+    fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFRunLoopMode);
+    fn CFRunLoopRun();
+    static kCFRunLoopCommonModes: CFRunLoopMode;
+}
+
+const fn mask_for(event_type: CGEventType) -> CGEventMask {
+    1u64 << event_type
+}
+
+/// A pointer position observed on this machine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Observed {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// State shared with the tap callback. Boxed and leaked deliberately: the callback may
+/// outlive this function's stack frame, and the run loop owns it for the process lifetime.
+struct TapState {
+    sender: Sender<Observed>,
+    tap: CFMachPortRef,
+}
+
+// SAFETY: the only field touched from the callback thread is `sender`, which is Send, and
+// `tap`, which is only compared and passed back to CoreGraphics.
+unsafe impl Send for TapState {}
+
+unsafe extern "C" fn on_event(
+    _proxy: CGEventTapProxy,
+    event_type: CGEventType,
+    event: CGEventRef,
+    user_info: *mut c_void,
+) -> CGEventRef {
+    // SAFETY: `user_info` is the leaked `TapState` passed to CGEventTapCreate, valid for
+    // the lifetime of the run loop.
+    let state = unsafe { &*(user_info.cast::<TapState>()) };
+
+    // Handle the disable notices FIRST and unconditionally. This is the bug behind every
+    // "it starts working again when I click the app window" report: macOS silently
+    // disables a tap whose callback was too slow, and a callback that filters by event
+    // type before checking swallows the notice and never re-arms.
+    if event_type == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
+        || event_type == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+    {
+        // SAFETY: `state.tap` is the live tap this callback belongs to.
+        unsafe { CGEventTapEnable(state.tap, 1) };
+        tracing::warn!("macOS disabled the input tap; re-armed it");
+        return event;
+    }
+
+    // SAFETY: `event` is a valid event for the duration of the callback.
+    let location = unsafe { CGEventGetLocation(event) };
+    #[expect(clippy::cast_possible_truncation, reason = "screen coordinates fit in i32")]
+    let observed = Observed { x: location.x.round() as i32, y: location.y.round() as i32 };
+
+    // Never block: the callback runs on the input path, and a slow callback is exactly
+    // what makes macOS disable the tap. A full channel drops the sample, which is
+    // harmless because motion is self-correcting.
+    let _ = state.sender.send(observed);
+
+    // Listen-only: this return value is ignored by the OS. Returning the event unchanged
+    // is still the correct thing to do, so that switching to an active tap later does not
+    // silently start discarding input.
+    event
+}
+
+/// Start observing pointer motion.
+///
+/// **Listen-only.** The tap cannot modify or discard events, so it cannot suppress local
+/// input and therefore cannot cause the freeze-until-reboot failure that an active tap
+/// can. The local pointer keeps moving; this is the safe first half of the input path.
+pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
+    let permissions = Permissions::check();
+    if !permissions.can_listen {
+        return Err(Error::PermissionDenied {
+            what: "watch the mouse and keyboard".into(),
+            where_to: "System Settings > Privacy & Security > Input Monitoring".into(),
+        });
+    }
+
+    let (sender, receiver) = channel();
+    let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+
+    // The tap runs on its own thread with its own run loop, so it fires regardless of what
+    // the rest of the program is doing. Sharing a run loop with async work is how a
+    // callback ends up slow enough for macOS to disable the tap.
+    std::thread::Builder::new()
+        .name("seam-macos-tap".into())
+        .spawn(move || {
+            let mask = mask_for(K_CG_EVENT_MOUSE_MOVED)
+                | mask_for(K_CG_EVENT_LEFT_MOUSE_DRAGGED)
+                | mask_for(K_CG_EVENT_RIGHT_MOUSE_DRAGGED)
+                | mask_for(K_CG_EVENT_OTHER_MOUSE_DRAGGED);
+
+            let state = Box::into_raw(Box::new(TapState { sender, tap: core::ptr::null_mut() }));
+
+            // SAFETY: `state` is a valid, leaked pointer that outlives the run loop, and
+            // `on_event` matches the required callback signature.
+            let tap = unsafe {
+                CGEventTapCreate(
+                    K_CG_SESSION_EVENT_TAP,
+                    K_CG_HEAD_INSERT_EVENT_TAP,
+                    K_CG_EVENT_TAP_OPTION_LISTEN_ONLY,
+                    mask,
+                    on_event,
+                    state.cast::<c_void>(),
+                )
+            };
+            if tap.is_null() {
+                // NULL means the permission is missing, not that the API is broken.
+                let _ = ready_tx.send(Err(
+                    "macOS refused the input tap, which means Input Monitoring permission \
+                     is missing. Grant it in System Settings > Privacy & Security > Input \
+                     Monitoring, then restart seam — the permission does not apply to an \
+                     already-running program."
+                        .to_owned(),
+                ));
+                // SAFETY: nothing took ownership of `state`, so reclaim it.
+                drop(unsafe { Box::from_raw(state) });
+                return;
+            }
+
+            // SAFETY: `state` is uniquely owned here; the tap exists but its callback
+            // cannot run until the run loop starts below.
+            unsafe { (*state).tap = tap };
+
+            // SAFETY: `tap` is a valid Mach port; all four calls take it or the resulting
+            // source, and `kCFRunLoopCommonModes` is a framework-owned constant. Common
+            // modes matter: AppKit enters private run loop modes during menu tracking and
+            // drags, and a default-mode-only source stops firing during them.
+            unsafe {
+                let source = CFMachPortCreateRunLoopSource(core::ptr::null(), tap, 0);
+                CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+                CGEventTapEnable(tap, 1);
+            }
+
+            let _ = ready_tx.send(Ok(()));
+            // SAFETY: blocks this thread forever, servicing the tap.
+            unsafe { CFRunLoopRun() };
+        })
+        .map_err(|e| Error::Platform(format!("could not start the input thread: {e}")))?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(receiver),
+        Ok(Err(message)) => Err(Error::PermissionDenied {
+            what: "watch the mouse and keyboard".into(),
+            where_to: message,
+        }),
+        Err(_) => Err(Error::Platform("the input thread stopped before starting".into())),
+    }
+}

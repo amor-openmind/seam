@@ -68,6 +68,10 @@ enum Command {
         /// Port to listen on. Chosen by the OS unless given — you should not need this.
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// Also dial these addresses. Needed where an inbound firewall blocks discovery:
+        /// dialling out is not blocked, so the link still forms.
+        #[arg(long = "connect", value_name = "HOST:PORT")]
+        connect: Vec<String>,
     },
 }
 
@@ -105,7 +109,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Forget { peer } => forget(&dir, &peer),
-        Command::Run { port } => daemon(&dir, identity, port).await,
+        Command::Run { port, connect } => daemon(&dir, identity, port, connect).await,
     }
 }
 
@@ -456,7 +460,12 @@ fn forget(dir: &std::path::Path, query: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- daemon
 
-async fn daemon(dir: &std::path::Path, identity: Arc<Identity>, port: u16) -> Result<()> {
+async fn daemon(
+    dir: &std::path::Path,
+    identity: Arc<Identity>,
+    port: u16,
+    connect: Vec<String>,
+) -> Result<()> {
     let store = Arc::new(store::load_peers(dir));
     let endpoint =
         Arc::new(Endpoint::bind(Arc::clone(&identity), format!("0.0.0.0:{port}").parse()?)?);
@@ -471,9 +480,38 @@ async fn daemon(dir: &std::path::Path, identity: Arc<Identity>, port: u16) -> Re
         tracing::warn!("no paired machines yet — run `seam pair` on this and another machine");
     }
 
+    // Every authorised link, so captured pointer motion can be sent to all of them.
+    let links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    // Dial out where asked. Outbound is what works when an inbound firewall blocks
+    // discovery, so this is the path that forms a link on a locked-down machine.
+    for address in &connect {
+        let Ok(target) = address.parse::<SocketAddr>() else {
+            tracing::warn!(%address, "not a HOST:PORT address");
+            continue;
+        };
+        match endpoint.connect(target).await {
+            Ok(link) => {
+                if let Err(e) = link.authorize(&store) {
+                    tracing::warn!(%target, "refused: {e}");
+                    continue;
+                }
+                tracing::info!(peer = %link.peer_id(), %target, "connected to peer");
+                let link = Arc::new(link);
+                links.lock().await.push(Arc::clone(&link));
+                tokio::spawn(receive_from(link));
+            }
+            Err(e) => tracing::warn!(%target, "could not connect: {e}"),
+        }
+    }
+
+    start_pointer_forwarding(Arc::clone(&links));
+
     let accepting = {
         let endpoint = Arc::clone(&endpoint);
         let store = Arc::clone(&store);
+        let links = Arc::clone(&links);
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 match incoming {
@@ -482,7 +520,9 @@ async fn daemon(dir: &std::path::Path, identity: Arc<Identity>, port: u16) -> Re
                         match link.authorize(&store) {
                             Ok(()) => {
                                 tracing::info!(%peer, remote = %link.remote_address(), "peer connected");
-                                tokio::spawn(hold(link));
+                                let link = Arc::new(link);
+                                links.lock().await.push(Arc::clone(&link));
+                                tokio::spawn(receive_from(link));
                             }
                             Err(e) => {
                                 // Never silent: a refused peer says why (goal O5).
@@ -505,13 +545,97 @@ async fn daemon(dir: &std::path::Path, identity: Arc<Identity>, port: u16) -> Re
     Ok(())
 }
 
-/// Keep a link open and report its health until the peer goes away.
-async fn hold(link: Link) {
+/// Receive motion from a peer and reproduce it on this machine.
+async fn receive_from(link: Arc<Link>) {
     let peer = link.peer_id();
-    let mut ticker = tokio::time::interval(Duration::from_secs(10));
+    let Ok(desktop) = seam_input::desktop() else {
+        tracing::warn!(%peer, "cannot read this machine's displays, so incoming motion is ignored");
+        return;
+    };
+
     loop {
-        ticker.tick().await;
-        tracing::debug!(%peer, rtt = ?link.rtt(), "link healthy");
+        match link.recv_datagram().await {
+            Ok(seam_proto::Frame::Motion(motion)) => {
+                let (px, py) = motion.cursor.to_px();
+                // The sender's coordinates are its own; clamp onto a real display here so
+                // a mismatched resolution can never strand the pointer somewhere invisible.
+                let (x, y) = desktop.clamp_onto_a_display(px, py);
+                if let Err(e) = seam_input::inject_motion(x, y) {
+                    tracing::warn!(%peer, "could not move the pointer: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::info!(%peer, "link closed: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Capture this machine's pointer and send it to every connected peer.
+///
+/// **Mirror mode.** The capture is listen-only, so the local pointer keeps moving too:
+/// this proves the whole path end to end without any code being able to suppress input,
+/// which is the failure that can freeze a Mac until it is rebooted.
+fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>) {
+    #[cfg(target_os = "macos")]
+    {
+        let observed = match seam_input::macos::observe_pointer() {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::warn!("not forwarding this machine's pointer: {e}");
+                return;
+            }
+        };
+        tracing::info!("forwarding this machine's pointer to connected peers (mirror mode)");
+
+        // The blocking receiver lives on its own thread so nothing on the async runtime
+        // can stall the input path.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(i32, i32)>(256);
+        std::thread::spawn(move || {
+            while let Ok(p) = observed.recv() {
+                // Drop rather than block: motion is self-correcting, and a stalled input
+                // thread is what makes macOS disable the tap.
+                let _ = tx.try_send((p.x, p.y));
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut buf = Vec::with_capacity(64);
+            let mut seq: u32 = 0;
+            let mut travel_x: i32 = 0;
+            let mut travel_y: i32 = 0;
+            let mut last: Option<(i32, i32)> = None;
+
+            while let Some((x, y)) = rx.recv().await {
+                if let Some((lx, ly)) = last {
+                    travel_x = travel_x.wrapping_add(x - lx);
+                    travel_y = travel_y.wrapping_add(y - ly);
+                }
+                last = Some((x, y));
+                seq = seq.wrapping_add(1);
+
+                let frame = seam_proto::Frame::Motion(seam_proto::Motion {
+                    seq,
+                    cursor: seam_proto::Point::from_px(x, y),
+                    travel_x,
+                    travel_y,
+                });
+
+                let peers = links.lock().await;
+                for link in peers.iter() {
+                    if let Err(e) = link.send_datagram(&frame, &mut buf) {
+                        tracing::debug!(peer = %link.peer_id(), "dropped a motion frame: {e}");
+                    }
+                }
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = links;
+        tracing::info!("this machine receives input only; capture is not built for it yet");
     }
 }
 
@@ -542,9 +666,11 @@ mod tests {
 
     #[test]
     fn the_port_is_optional_and_defaults_to_os_chosen() {
-        let Command::Run { port } = Cli::try_parse_from(["seam", "run"]).unwrap().command else {
+        let Command::Run { port, connect } = Cli::try_parse_from(["seam", "run"]).unwrap().command
+        else {
             panic!("expected run");
         };
         assert_eq!(port, 0, "0 means the OS picks, so the user never has to");
+        assert!(connect.is_empty(), "dialling out is opt-in, never required");
     }
 }

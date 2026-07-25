@@ -17,12 +17,15 @@
 //! local machine**. Not forwarding a keystroke is a bug. Leaving someone unable to use
 //! their computer is not a bug, it is damage.
 
-#![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
+#![cfg_attr(not(any(target_os = "macos", target_os = "windows")), forbid(unsafe_code))]
 
 pub mod screen;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 pub use screen::{Desktop, Display, MM, Millis, PixelRect};
 
@@ -52,7 +55,11 @@ pub fn desktop() -> Result<Desktop, Error> {
     {
         macos::desktop()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::desktop()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Err(Error::Unsupported("display enumeration"))
     }
@@ -64,7 +71,11 @@ pub fn cursor_position() -> Result<(i32, i32), Error> {
     {
         macos::cursor_position()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::cursor_position()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Err(Error::Unsupported("cursor position"))
     }
@@ -76,7 +87,11 @@ pub fn warp_cursor(x: i32, y: i32) -> Result<(), Error> {
     {
         macos::warp_cursor(x, y)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::warp_cursor(x, y)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (x, y);
         Err(Error::Unsupported("cursor warping"))
@@ -92,6 +107,28 @@ pub fn release_input() {
     #[cfg(target_os = "macos")]
     {
         macos::force_restore_cursor();
+    }
+}
+
+/// Move the pointer by injecting a real input event, so applications see genuine movement
+/// rather than a teleport.
+///
+/// This is what a receiving machine calls for every incoming motion frame.
+pub fn inject_motion(x: i32, y: i32) -> Result<(), Error> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::inject_motion_verified(x, y)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS has no silent-failure equivalent of UIPI, and warping is both lower
+        // latency and unambiguous, so injection is the same operation there.
+        macos::warp_cursor(x, y)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (x, y);
+        Err(Error::Unsupported("motion injection"))
     }
 }
 
