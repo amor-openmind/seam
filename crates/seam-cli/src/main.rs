@@ -1334,11 +1334,29 @@ fn start_pointer_forwarding(
                     && u.changed
                 {
                     detached = handover(u, detached);
-                    parked = match u.focus {
-                        // Remember where the cursor was left, and hold it there.
-                        Focus::Remote(_) => parked.or_else(|| seam_input::cursor_position().ok()),
-                        Focus::Local => None,
-                    };
+                    match u.focus {
+                        // Remember where the cursor was left, and hold it there. Logged,
+                        // because if this read fails the pin and the drift check below
+                        // never run at all - and a silently vacuous check would look
+                        // exactly like a clean pass.
+                        Focus::Remote(_) if parked.is_none() => {
+                            match seam_input::cursor_position() {
+                                Ok((px, py)) => {
+                                    tracing::info!(
+                                        x = px,
+                                        y = py,
+                                        "holding the local cursor here while the pointer is away"
+                                    );
+                                    parked = Some((px, py));
+                                }
+                                Err(e) => tracing::warn!(
+                                    "cannot pin the local cursor; its position is unreadable: {e}"
+                                ),
+                            }
+                        }
+                        Focus::Local => parked = None,
+                        Focus::Remote(_) => {}
+                    }
                 }
 
                 // Pin the local cursor while a peer owns the pointer.

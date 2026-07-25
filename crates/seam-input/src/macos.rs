@@ -25,6 +25,75 @@ use seam_proto::LogicalText;
 
 type CGDirectDisplayID = u32;
 type CGError = i32;
+
+// SAFETY CONTRACT: private window-server API, shipped by Synergy and Barrier for two
+// decades for exactly one purpose. `CGDisplayHideCursor` from a process without
+// foreground status is silently ignored - it returns success and does nothing - unless
+// the connection has asked for background cursor control first. There is no public API
+// for this; the alternative is a foreground GUI agent whose only job is owning the
+// cursor image.
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn _CGSDefaultConnection() -> u32;
+    fn CGSSetConnectionProperty(
+        cid: u32,
+        target_cid: u32,
+        key: *const c_void,
+        value: *const c_void,
+    ) -> CGError;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFStringCreateWithCString(
+        alloc: *const c_void,
+        c_str: *const u8,
+        encoding: u32,
+    ) -> *const c_void;
+    static kCFBooleanTrue: *const c_void;
+}
+
+const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+/// Ask the window server to honour cursor calls from this background process.
+///
+/// This is the difference between seam and Barrier that kept the arrow visible: every
+/// cursor-hide call seam ever made was accepted and ignored. Barrier sets the
+/// `SetsCursorInBackground` property on its window-server connection before each
+/// hide/show (OSXScreen.mm), and with it a background process's cursor calls take
+/// effect. Idempotent; the outcome is logged once so the daemon log shows whether this
+/// macOS still honours it.
+fn allow_background_cursor_control() -> CGError {
+    static OUTCOME: std::sync::OnceLock<CGError> = std::sync::OnceLock::new();
+    *OUTCOME.get_or_init(|| {
+        // SAFETY: creates a CFString, hands it to the window server, releases it. The
+        // connection id is this process's own.
+        unsafe {
+            let key = CFStringCreateWithCString(
+                core::ptr::null(),
+                c"SetsCursorInBackground".as_ptr().cast(),
+                K_CF_STRING_ENCODING_UTF8,
+            );
+            if key.is_null() {
+                return -1;
+            }
+            let cid = _CGSDefaultConnection();
+            let status = CGSSetConnectionProperty(cid, cid, key, kCFBooleanTrue);
+            CFRelease(key);
+            if status == K_CG_ERROR_SUCCESS {
+                tracing::info!("window server granted background cursor control");
+            } else {
+                tracing::warn!(
+                    status,
+                    "window server refused background cursor control - the cursor \
+                     image cannot be hidden from a daemon on this macOS"
+                );
+            }
+            status
+        }
+    })
+}
+
 type Boolean = u8;
 
 const K_CG_ERROR_SUCCESS: CGError = 0;
@@ -224,6 +293,7 @@ impl CursorGuard {
             )));
         }
         if hide {
+            let _ = allow_background_cursor_control();
             // SAFETY: the display argument is documented as ignored.
             unsafe { CGDisplayHideCursor(CGMainDisplayID()) };
         }
@@ -251,6 +321,10 @@ impl Drop for CursorGuard {
         // was hidden is harmless — the counter saturates at visible. Deliberately
         // over-showing: CGDisplayShowCursor is refcounted, and an unbalanced hide leaves
         // the user with no cursor at all, which is far worse than a redundant call.
+        if self.hidden {
+            let _ = allow_background_cursor_control();
+        }
+        // SAFETY: reattaching is always valid, and the over-show is refcount-saturating.
         unsafe {
             if self.hidden {
                 for _ in 0..4 {
@@ -1095,6 +1169,17 @@ mod tap_behaviour {
             "a tap that was just created and is delivering events must report alive, or \
              the watchdog will release input from a machine that is working perfectly"
         );
+    }
+
+    /// Does THIS macOS still honour Barrier's background-cursor trick?
+    ///
+    /// Private API, so it can vanish in any release. 0 means the window server granted
+    /// it and `CGDisplayHideCursor` from the daemon will actually hide the arrow.
+    #[test]
+    fn window_server_grants_background_cursor_control() {
+        let status = allow_background_cursor_control();
+        eprintln!("SetsCursorInBackground -> {status} (0 = granted)");
+        assert_eq!(status, 0, "window server refused background cursor control");
     }
 
     /// Does warping actually move the cursor from this process?
