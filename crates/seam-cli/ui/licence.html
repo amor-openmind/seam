@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en"><head>
+
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>seam — licence</title>
+<link rel="stylesheet" href="_ds/tokens.css">
+<style>
+.shell{max-width:640px;margin:0 auto;padding:32px 24px 72px}
+h1{font:400 var(--text-3xl)/1.1 var(--font-display);margin-bottom:6px}
+h1 .stitch{color:var(--text-accent)}
+p.lede{color:var(--text-secondary);font:400 var(--text-md)/1.65 var(--font-sans);max-width:50ch;margin-bottom:28px}
+.card{padding:22px;margin-bottom:16px}
+.field{margin-bottom:14px}
+.field label{display:block;font:500 var(--text-sm)/1.3 var(--font-sans);margin-bottom:6px}
+.field input{width:100%;padding:12px 14px;border:1px solid var(--border-line);border-radius:var(--radius-md);
+  font:400 var(--text-sm)/1.4 var(--font-mono);background:var(--surface-card);color:var(--text-primary)}
+.field input:focus{outline:2px solid var(--border-focus);outline-offset:-1px;border-color:var(--border-focus)}
+.field .hint{margin-top:6px;font:400 var(--text-xs)/1.5 var(--font-sans);color:var(--text-tertiary)}
+.acts{display:flex;gap:10px;flex-wrap:wrap}
+.state{margin-top:14px;padding:13px 15px;border-radius:var(--radius-md);font:400 var(--text-sm)/1.6 var(--font-sans);display:flex;gap:11px;align-items:flex-start}
+.state .mk{font:600 var(--text-md)/1.4 var(--font-mono);flex:none}
+.state.ok{background:var(--feedback-success-bg);border:1px solid var(--feedback-success-line);color:var(--feedback-success-fg)}
+.state.bad{background:var(--feedback-danger-bg);border:1px solid var(--feedback-danger-line);color:var(--feedback-danger-fg)}
+.state b{font-weight:600}
+.facts{margin-top:22px}
+.fact{display:flex;gap:12px;padding:12px 0;border-top:1px dashed var(--border-line)}
+.fact:first-child{border-top:0}
+.fact .mk{flex:none;width:18px;font:600 var(--text-sm)/1.5 var(--font-mono);color:var(--text-tertiary)}
+.fact .t{font:500 var(--text-sm)/1.4 var(--font-sans)}
+.fact .d{font:400 var(--text-xs)/1.6 var(--font-sans);color:var(--text-secondary)}
+@media (max-width:560px){.shell{padding:20px 16px 48px}h1{font-size:var(--text-2xl)}}
+</style></head><body>
+<div class="shell">
+  <h1>seam<span class="stitch">.</span></h1>
+  <p class="lede">This machine needs a licence before it can share input. Paste the one you were given — it is checked here, on this machine, and never sent anywhere.</p>
+
+  <section class="card">
+    <div class="field">
+      <label for="lic">Your licence</label>
+      <input id="lic" data-licence-input type="text" spellcheck="false" autocomplete="off" placeholder="seam-…" aria-describedby="lic-hint">
+      <div class="hint" id="lic-hint">Begins with <code>seam-</code>. Long, and safe to paste in full.</div>
+    </div>
+    <div class="acts"><button class="btn primary" data-activate>Activate this machine</button></div>
+
+    <div class="state ok" data-licence-ok>
+      <span class="mk">✓</span>
+      <div>Activated for <b data-licence-name>—</b><span data-licence-expiry></span>. This machine is ready — seam is running.</div>
+    </div>
+    <div class="state bad" data-licence-bad>
+      <span class="mk">×</span>
+      <div data-licence-error>That licence was not accepted.</div>
+    </div>
+  </section>
+
+  <div class="facts">
+    <div class="fact"><span class="mk">•</span><div><div class="t">Nothing is sent anywhere</div><div class="d">The licence is checked against a key built into this copy of seam. It works on a machine that has never been online.</div></div></div>
+    <div class="fact"><span class="mk">•</span><div><div class="t">One licence, every machine you were given it for</div><div class="d">Activate each machine once. The licence lives with seam's settings and survives restarts and updates.</div></div></div>
+    <div class="fact"><span class="mk">•</span><div><div class="t">Nothing is captured until it is accepted</div><div class="d">seam does not watch input, open a port or reach the network before a licence is present.</div></div></div>
+  </div>
+</div>
+<script src="_ds/shared.js"></script>
+<script src="_ds/page-licence.js"></script>
+</body></html>

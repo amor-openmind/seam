@@ -736,3 +736,16 @@ repo:
 The join script and the update flow point at the public repo, so nothing else changes.
 Note the current repository is public and its history contains the full source; making it
 private later does not retract what has already been fetched or forked.
+
+### Rule: one seam per machine, and pages that know when they are stale
+
+Launching seam when one is already running **takes over**: the new one asks the old one to
+stop through its own quit endpoint — the same path the Quit button takes, so input is
+released and the cursor restored — then claims the port. Two daemons on one machine is
+never what anyone wanted, and the previous behaviour (open the old one's page) made a
+freshly downloaded version appear to do nothing.
+
+Pages notice. A page whose daemon stops answering for four polls says so rather than
+polling a port that may now belong to a different seam. Clicking a download on the update
+page stops the running seam first, so the old copy is not holding the port or the input tap
+when the new one starts.

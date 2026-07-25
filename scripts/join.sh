@@ -12,7 +12,7 @@
 # Re-running is cheap: an already-installed matching version is launched, not downloaded.
 set -eu
 
-REPO="amor-openmind/seam"
+REPO="amor-openmind/seam-releases"
 SERVER="${SEAM_SERVER:-}"
 [ -n "$SERVER" ] || { echo "seam: set SEAM_SERVER to the machine running seam, e.g. 192.168.2.69:24810" >&2; exit 1; }
 

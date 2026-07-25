@@ -5,76 +5,83 @@
 <title>seam — update</title>
 <link rel="stylesheet" href="_ds/tokens.css">
 <style>
-.shell{max-width:640px;margin:0 auto;padding:28px 24px 64px}
-header.top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:22px}
+.shell{max-width:700px;margin:0 auto;padding:24px 24px 72px}
+header.top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px;gap:16px;flex-wrap:wrap}
 header.top h1{font:400 var(--text-2xl)/1.1 var(--font-display)}
-.group{margin-bottom:20px}
-.group>.label{display:block;margin-bottom:9px}
-.card{padding:18px 20px}
-.ver{display:flex;align-items:center;gap:14px;margin-bottom:14px}
-.ver .from,.ver .to{font:400 var(--text-sm)/1.2 var(--font-mono);padding:5px 10px;border-radius:var(--radius-sm);border:1px solid var(--border-line)}
-.ver .to{background:var(--surface-accent-soft);border-color:var(--indigo-100);color:var(--indigo-800);font-weight:500}
-.ver .arrow{color:var(--text-tertiary)}
-.notes{font:400 var(--text-sm)/1.6 var(--font-sans);color:var(--text-secondary);margin-bottom:14px}
-.notes li{margin-left:18px;margin-bottom:4px}
-.fleet{margin:14px 0;border-top:1px dashed var(--border-line)}
-.m{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px dashed var(--border-subtle);font:400 var(--text-sm)/1.3 var(--font-sans)}
-.m .nm{flex:1}
+header.top .machine{font:400 var(--text-xs)/1.4 var(--font-mono);color:var(--text-secondary);text-align:right}
+p.lede{color:var(--text-secondary);font:400 var(--text-sm)/1.6 var(--font-sans);max-width:54ch;margin-bottom:22px}
+.card{padding:20px;margin-bottom:16px}
+.card h2{font:600 var(--text-md)/1.3 var(--font-sans);margin-bottom:12px}
+/* Current — shown when nothing newer exists */
+.current{display:flex;align-items:center;gap:13px;padding:15px 17px;border-radius:var(--radius-md);background:var(--feedback-success-bg);border:1px solid var(--feedback-success-line);color:var(--feedback-success-fg)}
+.current .mk{font:600 var(--text-lg)/1 var(--font-mono)}
+.current .t{font:600 var(--text-sm)/1.4 var(--font-sans)}
+.current .d{font:400 var(--text-xs)/1.5 var(--font-sans)}
+/* Available — the reactive state */
+.avail{padding:16px 18px;border-radius:var(--radius-md);background:var(--surface-accent-soft);border:1px solid var(--indigo-100)}
+.vers{display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+.vers .from{font:400 var(--text-sm)/1.2 var(--font-mono);color:var(--text-secondary)}
+.vers .arrow{color:var(--text-tertiary)}
+.vers .to{font:600 var(--text-md)/1.2 var(--font-mono);color:var(--indigo-800);background:var(--paper-000);border:1px solid var(--indigo-100);border-radius:var(--radius-sm);padding:4px 10px}
+.vers .age{font:400 var(--text-2xs)/1.2 var(--font-mono);color:var(--text-tertiary)}
+.notes{font:400 var(--text-sm)/1.65 var(--font-sans);color:var(--indigo-800);margin-bottom:12px;white-space:pre-wrap;max-height:9em;overflow-y:auto}
+.acts{display:flex;gap:9px;flex-wrap:wrap}
+/* Fleet — who is behind, which is what actually matters */
+.fleet{margin-top:6px}
+.m{display:flex;align-items:center;gap:11px;padding:10px 0;border-top:1px dashed var(--border-line);font:400 var(--text-sm)/1.35 var(--font-sans)}
+.m:first-child{border-top:0}
+.m .nm{flex:1;min-width:0}
 .m .v{font:400 var(--text-xs)/1.2 var(--font-mono);color:var(--text-secondary)}
-.acts{display:flex;gap:9px;flex-wrap:wrap;margin-top:4px}
-.warn{margin-top:14px;padding:11px 13px;border-radius:var(--radius-md);background:var(--feedback-warning-bg);border:1px solid var(--feedback-warning-line);color:var(--feedback-warning-fg);font:400 var(--text-xs)/1.55 var(--font-sans)}
+.fleet-empty{padding:12px 0;color:var(--text-tertiary);font:400 var(--text-sm)/1.5 var(--font-sans)}
+.warn{margin-top:14px;padding:12px 14px;border-radius:var(--radius-md);background:var(--feedback-warning-bg);border:1px solid var(--feedback-warning-line);color:var(--feedback-warning-fg);font:400 var(--text-xs)/1.6 var(--font-sans)}
 .warn b{font-weight:600}
-.bar{height:8px;border-radius:999px;background:var(--surface-sunken);overflow:hidden;margin:12px 0 8px}
-.bar .fill{height:100%;background:var(--action-primary);border-radius:999px}
-.sub{font:400 var(--text-2xs)/1.4 var(--font-mono);color:var(--text-secondary)}
-@media (max-width:560px){.shell{padding:20px 16px 48px}}
+.checked{margin-top:10px;font:400 var(--text-2xs)/1.4 var(--font-mono);color:var(--text-tertiary)}
+@media (max-width:560px){.shell{padding:18px 14px 48px}}
 </style></head><body>
 <div class="shell">
-  <header class="top"><h1>Update</h1><span class="label">whole fleet, or none</span></header>
+  <header class="top"><h1>Update</h1><div class="machine"></div></header>
+  <p class="lede">seam watches the downloads page and tells you here when something newer exists. Nothing is installed without you asking.</p>
 
-  <div class="group">
-    <span class="label">state · available</span>
-    <section class="card">
-      <div class="ver"><span class="from">v0.3.7</span><span class="arrow">→</span><span class="to">v0.3.8</span></div>
-      <ul class="notes">
-        <li>Clipboard files stream and resume instead of stopping at 64 MB.</li>
-        <li>Windows machines can share their own keyboard and mouse.</li>
-      </ul>
-      <div class="fleet">
-        <div class="m"><span class="pill connected"><span class="dot"></span>this machine</span><span class="nm">Mac-mini</span><span class="v">v0.3.7</span></div>
-        <div class="m"><span class="pill connected"><span class="dot"></span>connected</span><span class="nm">AMorIMac</span><span class="v">v0.3.7</span></div>
-        <div class="m"><span class="pill degraded"><span class="dot"></span>behind</span><span class="nm">om-amorabbi23</span><span class="v">v0.3.2</span></div>
+  <section class="card">
+    <h2>This machine</h2>
+
+    <div class="current" data-up-current>
+      <span class="mk">✓</span>
+      <div><div class="t">Up to date</div><div class="d">Running <span data-up-running>—</span>, the newest release.</div></div>
+    </div>
+
+    <div class="avail" data-up-available>
+      <div class="vers">
+        <span class="from" data-up-running>—</span>
+        <span class="arrow">→</span>
+        <span class="to" data-up-latest>—</span>
+        <span class="age" data-up-age></span>
       </div>
+      <div class="notes" data-up-notes></div>
       <div class="acts">
-        <button class="btn primary">Download for this machine</button>
-        <button class="btn ghost">Read the full notes</button>
+        <a class="btn primary" data-up-download href="#" target="_blank" rel="noreferrer">Download <span data-up-latest>—</span></a>
+        <a class="btn ghost" data-up-page href="#" target="_blank" rel="noreferrer">Release notes</a>
       </div>
-      <p class="warn"><b>Machines must match.</b> Clipboard images and files need the same version on both ends, and a machine on an older protocol closes the link rather than guessing. Update every machine before relying on it.</p>
-    </section>
-  </div>
+    </div>
 
-  <div class="group">
-    <span class="label">state · downloading</span>
-    <section class="card">
-      <div class="ver"><span class="from">v0.3.7</span><span class="arrow">→</span><span class="to">v0.3.8</span></div>
-      <div class="bar" role="progressbar" aria-valuenow="58" aria-valuemin="0" aria-valuemax="100"><div class="fill" style="width:58%"></div></div>
-      <div class="sub">2.4 MB of 4.1 MB · checksum verified on arrival</div>
-    </section>
-  </div>
+    <div class="checked" data-up-checked></div>
+  </section>
 
-  <div class="group">
-    <span class="label">state · ready to restart</span>
-    <section class="card">
-      <div class="ver"><span class="from">v0.3.7</span><span class="arrow">→</span><span class="to">v0.3.8 · verified</span></div>
-      <div class="acts">
-        <button class="btn primary">Restart seam now</button>
-        <button class="btn">Later</button>
+  <section class="card">
+    <h2>The rest of the fleet</h2>
+    <div class="fleet">
+      <div class="m" data-up-machine>
+        <span class="pill connected"><span class="dot"></span>up to date</span>
+        <span class="nm">—</span>
+        <span class="v">—</span>
       </div>
-      <p class="warn"><b>macOS will ask for permissions again.</b> Input Monitoring and Accessibility are tied to the exact binary, so a new version starts with none. Grant both, or this machine will type on itself as well as the others.</p>
-    </section>
-  </div>
+    </div>
+    <p class="fleet-empty" data-up-fleet-empty>No other machines connected.</p>
+    <p class="warn"><b>Every machine must run the same version.</b> Clipboard images and files need matching protocol on both ends, and a machine that is behind closes the link rather than guessing — so a half-updated fleet looks like seam breaking. Update them together.</p>
+  </section>
 </div>
 <script src="_ds/nav.js"></script>
 <script src="_ds/shared.js"></script>
+<script src="_ds/page-update.js"></script>
 <script src="_ds/quit.js"></script>
 </body></html>

@@ -35,11 +35,20 @@
     post: function (path) { return fetch(path, { method: "POST" }).then(tick).catch(function () {}); }
   };
 
+  var missed = 0;
   function tick() {
     return fetch("/state")
       .then(function (r) { return r.json(); })
-      .then(function (s) { listeners.forEach(function (fn) { try { fn(s); } catch (e) {} }); })
-      .catch(function () {});
+      .then(function (s) {
+        missed = 0;
+        listeners.forEach(function (fn) { try { fn(s); } catch (e) {} });
+      })
+      .catch(function () {
+        // A few misses is a hiccup; a run of them means this daemon is gone — replaced by
+        // a newer seam, or stopped. Saying so beats polling a port that may now belong to
+        // something else.
+        if (++missed === 4) window.dispatchEvent(new Event("seam:replaced"));
+      });
   }
 
   // Header and navigation exist on every page.

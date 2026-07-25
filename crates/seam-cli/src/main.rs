@@ -760,6 +760,7 @@ async fn daemon(
 
     load_settings_into_ui(dir);
 
+    start_update_watch();
     start_auto_dial(&discovery, &store, &links, &geometry, &clipboard, &endpoint);
 
     // Crash recovery: a previous seam that died while the cursor was concealed leaves
@@ -1070,6 +1071,22 @@ async fn route(
     } else if method == "POST" && path == "/action/release" {
         UI_RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
         ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+    } else if method == "POST" && path == "/action/activate" {
+        // The licence arrives in the body; a key in a URL would end up in logs.
+        let key = request.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+        let dir = ui_port_note.parent().unwrap_or(ui_port_note);
+        match licence::activate(dir, key) {
+            Ok(l) => (
+                "200 OK",
+                "application/json",
+                format!(r#"{{"ok":true,"name":"{}"}}"#, l.name.replace('"', "'")),
+            ),
+            Err(e) => (
+                "200 OK",
+                "application/json",
+                format!(r#"{{"ok":false,"error":"{}"}}"#, e.to_string().replace('"', "'")),
+            ),
+        }
     } else if path == "/join" {
         // The only thing a joining machine trusts this server for: which version to
         // fetch. The bytes come from GitHub over TLS and are checked against that
@@ -1079,7 +1096,7 @@ async fn route(
             "200 OK",
             "application/json",
             format!(
-                r#"{{"version":"{}","repo":"amor-openmind/seam"}}"#,
+                r#"{{"version":"{}","repo":"amor-openmind/seam-releases"}}"#,
                 env!("CARGO_PKG_VERSION")
             ),
         )
@@ -1266,6 +1283,17 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/update.html", include_str!("../ui/update.html"), "text/html; charset=utf-8"),
     ("/ideas.html", include_str!("../ui/ideas.html"), "text/html; charset=utf-8"),
     ("/join.html", include_str!("../ui/join.html"), "text/html; charset=utf-8"),
+    ("/licence.html", include_str!("../ui/licence.html"), "text/html; charset=utf-8"),
+    (
+        "/_ds/page-licence.js",
+        include_str!("../ui/_ds/page-licence.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "/_ds/page-update.js",
+        include_str!("../ui/_ds/page-update.js"),
+        "text/javascript; charset=utf-8",
+    ),
     (
         "/_ds/page-join.js",
         include_str!("../ui/_ds/page-join.js"),
@@ -1513,6 +1541,77 @@ fn strip_ansi(line: &str) -> String {
     out
 }
 
+/// What the last check of the downloads page found.
+static UI_UPDATE: std::sync::Mutex<Option<(String, String, String)>> =
+    std::sync::Mutex::new(None);
+
+/// Poll the public releases repo so the update page can react rather than be read.
+///
+/// The daemon does the looking, not the page: a browser cannot reach the releases API
+/// from a loopback page without exposing that page to the network, and the daemon is
+/// already running. Hourly is deliberate — a release is not urgent, and a background
+/// program hammering an API is a bad neighbour.
+fn start_update_watch() {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            ticker.tick().await;
+            let Ok(output) = tokio::process::Command::new("curl")
+                .args([
+                    "-fsSL",
+                    "--max-time",
+                    "10",
+                    "-H",
+                    "Accept: application/vnd.github+json",
+                    "https://api.github.com/repos/amor-openmind/seam-releases/releases/latest",
+                ])
+                .output()
+                .await
+            else {
+                continue;
+            };
+            let body = String::from_utf8_lossy(&output.stdout);
+            // Two fields, so a hand-rolled read rather than a JSON dependency for this.
+            let field = |key: &str| -> Option<String> {
+                let needle = format!("\"{key}\":\"");
+                let start = body.find(&needle)? + needle.len();
+                let rest = &body[start..];
+                let end = rest.find('"')?;
+                Some(rest[..end].to_owned())
+            };
+            let Some(tag) = field("tag_name") else { continue };
+            let latest = tag.trim_start_matches('v').to_owned();
+            let published = field("published_at").unwrap_or_default();
+            if let Ok(mut slot) = UI_UPDATE.lock() {
+                *slot = Some((latest, published, tag));
+            }
+        }
+    });
+}
+
+/// The licence, as the page sees it: who it is for, and when it stops.
+fn licence_json(dir: &std::path::Path) -> String {
+    licence::stored(dir).map_or_else(
+        || "null".to_owned(),
+        |l| format!(r#"{{"name":"{}","expires":{}}}"#, l.name.replace('"', "'"), l.expires_day),
+    )
+}
+
+/// What the last check of the downloads page found, with the links a person would follow.
+fn update_json() -> String {
+    UI_UPDATE.lock().ok().and_then(|slot| slot.clone()).map_or_else(
+        || "null".to_owned(),
+        |(latest, published, tag)| {
+            const RELEASES: &str = "https://github.com/amor-openmind/seam-releases/releases";
+            let asset = if cfg!(target_os = "windows") { "seam.exe" } else { "seam-macos-arm64" };
+            format!(
+                r#"{{"latest":"{latest}","published":"{}","page":"{RELEASES}/tag/{tag}","asset":"{RELEASES}/download/{tag}/{asset}","checked":"just now"}}"#,
+                published.split('T').next().unwrap_or(""),
+            )
+        },
+    )
+}
+
 /// The live state the UI binds to. Assembled by hand — ten fields do not justify serde.
 async fn ui_state_json(
     name: &str,
@@ -1599,7 +1698,7 @@ async fn ui_state_json(
     }
 
     format!(
-        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"seamPort":{},"focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"activity":[{}],"peers":[{peers}],"health":[{health}]}}"#,
+        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"seamPort":{},"focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"licence":{},"update":{},"activity":[{}],"peers":[{peers}],"health":[{health}]}}"#,
         env!("CARGO_PKG_VERSION"),
         name.replace('"', "'"),
         std::env::consts::OS,
@@ -1621,6 +1720,8 @@ async fn ui_state_json(
         shares.1,
         shares.2,
         starts_at_login(),
+        licence_json(dir),
+        update_json(),
         recent_activity(dir),
     )
 }
@@ -1638,6 +1739,21 @@ fn bind_or_show_running(
     match Endpoint::bind(Arc::clone(identity), format!("0.0.0.0:{port}").parse()?) {
         Ok(endpoint) => Ok(std::ops::ControlFlow::Continue(Arc::new(endpoint))),
         Err(e) if is_address_in_use(&e) => {
+            // A newly launched seam takes over. Two daemons on one machine is never what
+            // anyone wanted - the second used to open the first one's page, which quietly
+            // meant a fresh download appeared to do nothing. Ask the running one to stop,
+            // then take the port. Its pages close themselves when it goes.
+            if stop_running_instance(dir) {
+                tracing::info!("stopped the seam that was already running; taking over");
+                for _ in 0..20 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if let Ok(endpoint) =
+                        Endpoint::bind(Arc::clone(identity), format!("0.0.0.0:{port}").parse()?)
+                    {
+                        return Ok(std::ops::ControlFlow::Continue(Arc::new(endpoint)));
+                    }
+                }
+            }
             tracing::info!("seam is already running on this machine; opening its page");
             // If the note is missing the daemon is still running — say that, rather than
             // open_ui's "seam is not running", which would be flatly untrue.
@@ -1757,6 +1873,28 @@ fn set_start_at_login(enable: bool) -> bool {
         let _ = (enable, exe);
         false
     }
+}
+
+/// Ask the seam already running here to stop, so a newly launched one can take over.
+///
+/// Uses its own quit endpoint rather than signals: it is the same path the Quit button
+/// takes, so input is released, the cursor is restored and its pages show the stopped
+/// screen instead of hanging on a dead port.
+fn stop_running_instance(dir: &std::path::Path) -> bool {
+    use std::io::Write as _;
+    let Ok(text) = std::fs::read_to_string(dir.join("ui-port")) else { return false };
+    let Ok(port) = text.trim().parse::<u16>() else { return false };
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut socket) =
+        std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500))
+    else {
+        return false;
+    };
+    let request = format!(
+        "POST /action/quit HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    socket.write_all(request.as_bytes()).is_ok()
 }
 
 /// Is this bind failure "something is already listening"?
