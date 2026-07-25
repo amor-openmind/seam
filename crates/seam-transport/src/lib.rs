@@ -32,11 +32,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod discovery;
 pub mod endpoint;
 pub mod identity;
 pub mod pairing;
 mod tls;
 
+pub use discovery::{DiscoveredPeer, Discovery, DiscoveryEvent, PeerStream};
 pub use endpoint::{Endpoint, Link};
 pub use identity::{Fingerprint, Identity, Trust, TrustStore, TrustedPeer};
 pub use pairing::{CODE_DIGITS, EXPORTER_LABEL, PairingCode};
@@ -96,4 +98,7 @@ pub enum Error {
 
     #[error("could not receive from the peer: {0}")]
     Recv(String),
+
+    #[error("peer discovery is unavailable on this network: {0}")]
+    Discovery(String),
 }

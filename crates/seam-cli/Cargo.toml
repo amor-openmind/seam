@@ -1,0 +1,27 @@
+[package]
+name = "seam-cli"
+description = "The seam daemon and command-line interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "seam"
+path = "src/main.rs"
+
+[dependencies]
+seam-proto = { path = "../seam-proto" }
+seam-transport = { path = "../seam-transport" }
+
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[lints]
+workspace = true

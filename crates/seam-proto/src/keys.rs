@@ -141,18 +141,30 @@ impl Modifiers {
 
     /// Whether these modifiers make the event a **command chord** rather than text entry.
     ///
-    /// Shift and the lock keys are excluded deliberately: `Shift+A` and `CapsLock`
-    /// are text entry, whereas `Ctrl`/`Alt`/`Gui` mean "invoke a command".
+    /// Only `Ctrl` and `Gui` (Command/Windows) qualify. Everything else — Shift, the lock
+    /// keys, and **both `Alt` keys** — can participate in composing a character.
     ///
-    /// `RIGHT_ALT` (`AltGr`) alone is **not** a command chord — on European layouts it is
-    /// how you type `@`, `€`, `\` and `{}`. Treating `AltGr` as a command modifier is
-    /// real bug in this class of software; it makes `@` untypeable across machines.
-    /// `AltGr` is therefore excluded from the command-chord test.
+    /// # Why Alt is not a command modifier
+    ///
+    /// It is tempting to treat Alt as "invoke a command", and it is wrong on every
+    /// platform, in two different ways:
+    ///
+    /// - On Windows and Linux, `RIGHT_ALT` is **`AltGr`**, which is how European layouts
+    ///   type `@`, `€`, `\`, `{` and `}`. On a German Windows layout `@` is `AltGr+Q`.
+    /// - On macOS, **`Option` is the composition modifier** and appears as a plain `Alt`.
+    ///   On a German Apple keyboard `@` is `Option+L` and `€` is `Option+E`.
+    ///
+    /// So the same character is `Option+L` on one machine and `AltGr+Q` on another — the
+    /// exact pair of layouts on this project's development fleet. Classifying either as a
+    /// command chord replays the *physical* key and types `l` or `q` instead of `@`.
+    ///
+    /// Alt-driven commands (`Alt+Tab`, `Alt+F` for a menu) are still handled correctly,
+    /// because they produce **no text**, and [`super::resolve_replay`] replays the
+    /// physical key whenever there is no text to reproduce. The presence of text is the
+    /// real discriminator; the modifier mask only settles the ambiguous cases.
     #[must_use]
     pub const fn is_command_chord(self) -> bool {
-        let gui_or_ctrl = self.0 & (Self::ANY_CTRL.0 | Self::ANY_GUI.0) != 0;
-        let plain_left_alt = self.0 & Self::LEFT_ALT.0 != 0;
-        gui_or_ctrl || plain_left_alt
+        self.0 & (Self::ANY_CTRL.0 | Self::ANY_GUI.0) != 0
     }
 }
 
@@ -363,9 +375,54 @@ mod tests {
         assert!(!Modifiers::ANY_SHIFT.is_command_chord());
         assert!(!Modifiers::CAPS_LOCK.is_command_chord());
 
+        // Plain Alt is macOS's Option, which composes text. Alt-driven *commands* are
+        // still routed by position because they produce no text at all.
+        assert!(!Modifiers::LEFT_ALT.is_command_chord());
+
         assert!(Modifiers::LEFT_CTRL.is_command_chord());
         assert!(Modifiers::LEFT_GUI.is_command_chord());
-        assert!(Modifiers::LEFT_ALT.is_command_chord());
+        assert!(Modifiers::RIGHT_GUI.is_command_chord());
+    }
+
+    #[test]
+    fn german_apple_keyboard_types_at_and_euro_across_machines() {
+        // Real hardware on the development fleet: an Apple Magic Keyboard with the German
+        // layout, driving two Windows machines. macOS composes `@` as Option+L and `€` as
+        // Option+E; Windows German composes the same characters as AltGr+Q and AltGr+E.
+        // Replaying the physical key would type `l` and `e`.
+        for (physical, ch) in [(PhysicalKey(0x0F), '@'), (PhysicalKey(0x08), '€')] {
+            let text = LogicalText::from_char(ch);
+            let replay = resolve_replay(LayoutPolicy::Auto, physical, text, Modifiers::LEFT_ALT);
+            assert_eq!(replay, Replay::Text(text), "Option+key must reproduce {ch}");
+        }
+    }
+
+    #[test]
+    fn alt_driven_commands_still_replay_by_position() {
+        // Alt+Tab and Alt+F produce no text, so they are routed by position even though
+        // Alt is no longer treated as a command modifier.
+        for key in [PhysicalKey::TAB, PhysicalKey(0x09)] {
+            let replay =
+                resolve_replay(LayoutPolicy::Auto, key, LogicalText::NONE, Modifiers::LEFT_ALT);
+            assert_eq!(replay, Replay::Physical(key));
+        }
+    }
+
+    #[test]
+    fn qwertz_letters_keep_their_glyph_and_their_shortcut() {
+        // A German keyboard swaps Y and Z relative to US. Both behaviours must hold at
+        // once: typing produces the glyph, and Cmd+Z stays undo.
+        let z_glyph = LogicalText::from_char('z');
+        assert_eq!(
+            resolve_replay(LayoutPolicy::Auto, PhysicalKey::Y, z_glyph, Modifiers::NONE),
+            Replay::Text(z_glyph),
+            "the physical Y key on QWERTZ must type z"
+        );
+        assert_eq!(
+            resolve_replay(LayoutPolicy::Auto, PhysicalKey::Y, z_glyph, Modifiers::LEFT_GUI),
+            Replay::Physical(PhysicalKey::Y),
+            "Cmd+Z must stay addressed by position"
+        );
     }
 
     #[test]

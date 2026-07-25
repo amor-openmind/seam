@@ -55,6 +55,15 @@ impl Fingerprint {
         &self.0
     }
 
+    /// Reconstruct from raw bytes, e.g. a persisted pairing or an mDNS advertisement.
+    ///
+    /// Building one from untrusted bytes is safe: a `Fingerprint` is a claim, and every
+    /// path that grants access compares it against the trust store first.
+    #[must_use]
+    pub const fn from_bytes(raw: [u8; 32]) -> Self {
+        Self(raw)
+    }
+
     /// The [`PeerId`] this fingerprint yields.
     ///
     /// 128 bits of a SHA-256 preimage-resistant hash: finding a certificate that collides
