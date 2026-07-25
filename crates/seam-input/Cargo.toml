@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+arboard = "3.6.1"
 seam-proto = { path = "../seam-proto" }
 thiserror = "2.0.19"
 tracing = "0.1.44"

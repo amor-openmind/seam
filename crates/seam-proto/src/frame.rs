@@ -189,6 +189,17 @@ pub enum Frame {
         state: KeyState,
     },
 
+    /// The sender's clipboard changed. Carried on a reliable stream.
+    ///
+    /// `generation` increases with every change on the originating machine, so a receiver
+    /// can ignore an echo of what it just applied. Without it two machines bounce the same
+    /// text between each other forever.
+    ClipboardText {
+        seq: u32,
+        generation: u64,
+        text: String,
+    },
+
     /// Liveness probe. `t_send_us` is the sender's clock in microseconds.
     Ping {
         nonce: u64,
@@ -221,11 +232,13 @@ mod kind {
     pub(super) const KEY_STATE_QUERY: u8 = 0x31;
     pub(super) const KEY_STATE_FULL: u8 = 0x32;
 
+    pub(super) const CLIPBOARD_TEXT: u8 = 0x50;
+
     pub(super) const PING: u8 = 0x40;
     pub(super) const PONG: u8 = 0x41;
 
     // Reserved, assigned but not yet implemented:
-    //   0x50..=0x5F  clipboard offer / request / data
+    //   0x51..=0x5F  clipboard images and file lists
     //   0x60..=0x6F  file transfer
 }
 
@@ -317,6 +330,12 @@ impl Frame {
                 w.u32(*seq);
                 encode_key_state(&mut w, state);
             }
+            Self::ClipboardText { seq, generation, text } => {
+                w.u8(kind::CLIPBOARD_TEXT);
+                w.u32(*seq);
+                w.u64(*generation);
+                w.string(text)?;
+            }
             Self::Ping { nonce, t_send_us } => {
                 w.u8(kind::PING);
                 w.u64(*nonce);
@@ -394,6 +413,11 @@ impl Frame {
             kind::KEY_STATE_FULL => {
                 Self::KeyStateFull { seq: r.u32()?, state: decode_key_state(r)? }
             }
+            kind::CLIPBOARD_TEXT => Self::ClipboardText {
+                seq: r.u32()?,
+                generation: r.u64()?,
+                text: r.string()?.to_owned(),
+            },
             kind::PING => Self::Ping { nonce: r.u64()?, t_send_us: r.u64()? },
             kind::PONG => Self::Pong { nonce: r.u64()?, t_send_us: r.u64()?, t_echo_us: r.u64()? },
             other => return Err(Error::UnknownFrameKind(other)),
@@ -514,6 +538,12 @@ mod tests {
             Frame::KeyStateDigest { seq: 9, digest: 0xDEAD_BEEF_CAFE_F00D, count: 2 },
             Frame::KeyStateQuery { seq: 10 },
             Frame::KeyStateFull { seq: 11, state: keys },
+            Frame::ClipboardText {
+                seq: 12,
+                generation: 7,
+                // Non-Latin text, because a clipboard that mangles it is useless here.
+                text: "سلام — hello — @€".into(),
+            },
             Frame::Ping { nonce: 0x1234, t_send_us: 1_700_000_000_000_000 },
             Frame::Pong { nonce: 0x1234, t_send_us: 1, t_echo_us: 2 },
         ]

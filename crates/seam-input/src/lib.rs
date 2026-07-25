@@ -231,3 +231,67 @@ mod tests {
         }
     }
 }
+
+/// This machine's text clipboard.
+///
+/// # Why `arboard`
+///
+/// It handles text and images correctly on every target platform. Its documented gaps are
+/// **file lists**: it never writes `CFSTR_PREFERREDDROPEFFECT` on Windows, so a cut cannot
+/// be represented, and it omits `x-special/gnome-copied-files` on Linux, so files pasted
+/// into a file manager do not arrive. Files therefore need their own implementation later;
+/// text does not, and reimplementing three pasteboard APIs to prove a point would be
+/// worse, not better.
+pub mod clipboard {
+    use crate::Error;
+
+    /// Read the clipboard's text, if it currently holds any.
+    ///
+    /// An empty clipboard, or one holding only an image or files, is `None` rather than an
+    /// error: it is a completely normal state and not worth a log line every poll.
+    pub fn read_text() -> Result<Option<String>, Error> {
+        let mut board = arboard::Clipboard::new()
+            .map_err(|e| Error::Platform(format!("clipboard unavailable: {e}")))?;
+        match board.get_text() {
+            Ok(text) if !text.is_empty() => Ok(Some(text)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Replace the clipboard's text.
+    pub fn write_text(text: &str) -> Result<(), Error> {
+        let mut board = arboard::Clipboard::new()
+            .map_err(|e| Error::Platform(format!("clipboard unavailable: {e}")))?;
+        board
+            .set_text(text.to_owned())
+            .map_err(|e| Error::Platform(format!("could not set the clipboard: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::clipboard;
+
+    #[test]
+    fn text_round_trips_through_the_real_clipboard() {
+        // Restores whatever was there, so running the tests does not eat the user's
+        // clipboard.
+        let Ok(before) = clipboard::read_text() else {
+            eprintln!("skipped: no clipboard on this machine");
+            return;
+        };
+
+        // Non-Latin and composed characters, because a clipboard that mangles them is
+        // useless on this project's own fleet.
+        let sample = "سلام — hello — @€ 🙂";
+        if clipboard::write_text(sample).is_err() {
+            eprintln!("skipped: clipboard is not writable here");
+            return;
+        }
+        assert_eq!(clipboard::read_text().unwrap().as_deref(), Some(sample));
+
+        if let Some(before) = before {
+            let _ = clipboard::write_text(&before);
+        }
+    }
+}

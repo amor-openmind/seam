@@ -510,6 +510,8 @@ async fn daemon(
     // "the pointer will not leave the screen".
     let geometry: Geometry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
+    let clipboard: Clipboard = Arc::new(tokio::sync::Mutex::new(ClipboardState::default()));
+
     // Every authorised link, so captured pointer motion can be sent to all of them.
     let links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -531,7 +533,7 @@ async fn daemon(
                 let link = Arc::new(link);
                 links.lock().await.push(Arc::clone(&link));
                 announce_geometry(&link).await;
-                tokio::spawn(receive_from(link, Arc::clone(&geometry)));
+                tokio::spawn(receive_from(link, Arc::clone(&geometry), Arc::clone(&clipboard)));
             }
             Err(e) => tracing::warn!(%target, "could not connect: {e}"),
         }
@@ -539,11 +541,14 @@ async fn daemon(
 
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry));
 
+    start_clipboard_sync(Arc::clone(&links), Arc::clone(&clipboard));
+
     let accepting = {
         let endpoint = Arc::clone(&endpoint);
         let store = Arc::clone(&store);
         let links = Arc::clone(&links);
         let geometry = Arc::clone(&geometry);
+        let clipboard = Arc::clone(&clipboard);
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 match incoming {
@@ -555,7 +560,11 @@ async fn daemon(
                                 let link = Arc::new(link);
                                 links.lock().await.push(Arc::clone(&link));
                                 announce_geometry(&link).await;
-                                tokio::spawn(receive_from(link, Arc::clone(&geometry)));
+                                tokio::spawn(receive_from(
+                                    link,
+                                    Arc::clone(&geometry),
+                                    Arc::clone(&clipboard),
+                                ));
                             }
                             Err(e) => {
                                 // Never silent: a refused peer says why (goal O5).
@@ -582,8 +591,8 @@ async fn daemon(
 }
 
 /// Receive motion from a peer and reproduce it on this machine.
-async fn receive_from(link: Arc<Link>, geometry: Geometry) {
-    tokio::spawn(receive_reliable(Arc::clone(&link), geometry));
+async fn receive_from(link: Arc<Link>, geometry: Geometry, clipboard: Clipboard) {
+    tokio::spawn(receive_reliable(Arc::clone(&link), geometry, clipboard));
     let peer = link.peer_id();
     let Ok(desktop) = seam_input::desktop() else {
         tracing::warn!(%peer, "cannot read this machine's displays, so incoming motion is ignored");
@@ -638,6 +647,80 @@ async fn receive_from(link: Arc<Link>, geometry: Geometry) {
             }
         }
     }
+}
+
+/// Move the local cursor out of the way while another machine has the pointer.
+///
+/// Detaching stops the cursor tracking the mouse, but it stays wherever it was — usually
+/// mid-screen, where it looks like a second pointer. Parking it in the bottom-right corner
+/// makes it unobtrusive without needing foreground status, which a daemon does not have.
+#[cfg(target_os = "macos")]
+fn park_cursor() {
+    let Ok(desktop) = seam_input::desktop() else { return };
+    let bb = desktop.bounding_box();
+    if bb.is_empty() {
+        return;
+    }
+    let _ = seam_input::warp_cursor(bb.right() - 1, bb.bottom() - 1);
+}
+
+/// Shared clipboard state.
+type Clipboard = Arc<tokio::sync::Mutex<ClipboardState>>;
+
+#[derive(Default, Debug)]
+struct ClipboardState {
+    /// The last text seen on this machine, whether typed here or received from a peer.
+    last_seen: Option<String>,
+    /// Highest generation applied from a peer, so an echo is recognised and dropped.
+    applied_generation: u64,
+    /// This machine's own change counter.
+    generation: u64,
+}
+
+/// Watch this machine's clipboard and share every change with all peers.
+///
+/// **All peers, not just the focused one.** A clipboard is not a pointer: copying on one
+/// machine and pasting on another is the whole point, and requiring the pointer to be
+/// somewhere first would defeat it.
+///
+/// macOS offers no clipboard-change notification — `NSPasteboard.changeCount` polling is
+/// the only supported mechanism — so this polls. 300 ms is below the threshold where a
+/// person notices, and the read is cheap.
+fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboard: Clipboard) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(300));
+        // Seed with whatever is already on the clipboard, so starting the daemon does not
+        // immediately broadcast the user's existing clipboard to every machine.
+        if let Ok(text) = seam_input::clipboard::read_text() {
+            clipboard.lock().await.last_seen = text;
+        }
+
+        loop {
+            ticker.tick().await;
+            let Ok(Some(text)) = seam_input::clipboard::read_text() else { continue };
+
+            let frame = {
+                let mut state = clipboard.lock().await;
+                if state.last_seen.as_deref() == Some(text.as_str()) {
+                    continue;
+                }
+                state.last_seen = Some(text.clone());
+                state.generation += 1;
+                seam_proto::Frame::ClipboardText { seq: 0, generation: state.generation, text }
+            };
+
+            let peers = links.lock().await;
+            if peers.is_empty() {
+                continue;
+            }
+            tracing::info!(peers = peers.len(), "clipboard changed; sharing");
+            for link in peers.iter() {
+                if let Err(e) = link.send_reliable(&frame).await {
+                    tracing::warn!(peer = %link.peer_id(), "could not share the clipboard: {e}");
+                }
+            }
+        }
+    });
 }
 
 /// Peer id to real screen size, as reported by that peer.
@@ -726,15 +809,22 @@ fn handover(
             // silently switches this machine's input back on — which looks exactly like
             // every machine responding at once.
             drop(detached);
-            // Hide the cursor as well as freezing it. Left visible it sits at the edge
-            // while the real pointer is on another screen, so the user sees two cursors
-            // and cannot tell which one has input.
-            //
-            // The guard drains the hide refcount on every exit path, because an
-            // unbalanced hide leaves the machine with no cursor at all — much worse than
-            // a stray one.
-            let guard = seam_input::macos::CursorGuard::detach(true).ok();
+            // Hiding is attempted, but `CGDisplayHideCursor` only affects the cursor for
+            // a *foreground* application, and a daemon is not one — so it silently does
+            // nothing here. The cursor is therefore parked out of the way instead, which
+            // is what Barrier and Synergy do for the same reason.
+            let guard = match seam_input::macos::CursorGuard::detach(true) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    // Worth saying out loud: without the detach the local cursor keeps
+                    // tracking the mouse, and the user sees it wander while another
+                    // machine has the pointer.
+                    tracing::warn!("could not freeze this machine's cursor: {e}");
+                    None
+                }
+            };
             seam_input::macos::set_suppress_local(true);
+            park_cursor();
             guard
         }
         Focus::Local => {
@@ -819,7 +909,7 @@ fn log_event(frame: &seam_proto::Frame) {
 }
 
 /// Receive buttons, scroll and keystrokes, which travel reliably.
-async fn receive_reliable(link: Arc<Link>, geometry: Geometry) {
+async fn receive_reliable(link: Arc<Link>, geometry: Geometry, clipboard: Clipboard) {
     let peer = link.peer_id();
     loop {
         match link.recv_reliable().await {
@@ -853,6 +943,23 @@ async fn receive_reliable(link: Arc<Link>, geometry: Geometry) {
             Ok(seam_proto::Frame::Scroll(sc)) => {
                 if let Err(e) = seam_input::inject_scroll(sc.dx, sc.dy) {
                     tracing::warn!(%peer, "could not scroll: {e}");
+                }
+            }
+            Ok(seam_proto::Frame::ClipboardText { generation, text, .. }) => {
+                let mut state = clipboard.lock().await;
+                if generation <= state.applied_generation {
+                    // An echo, or something older than what we already have.
+                    continue;
+                }
+                match seam_input::clipboard::write_text(&text) {
+                    Ok(()) => {
+                        tracing::info!(%peer, chars = text.chars().count(), "clipboard received");
+                        state.applied_generation = generation;
+                        // Remember what we just wrote, so the poller does not see it as a
+                        // local change and send it straight back.
+                        state.last_seen = Some(text);
+                    }
+                    Err(e) => tracing::warn!(%peer, "could not set the clipboard: {e}"),
                 }
             }
             Ok(seam_proto::Frame::Hello(hello)) => {
@@ -964,6 +1071,15 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geom
                         suppressing = seam_input::macos::is_suppressing_local(),
                         "pointer"
                     );
+                }
+
+                // Re-park on every event. If the detach failed — or the OS moved the
+                // cursor for some other reason — this keeps it pinned rather than letting
+                // it wander visibly while another machine has the pointer.
+                if matches!(graph.focus(), Focus::Remote(_))
+                    && matches!(event, Observed::Motion { .. })
+                {
+                    park_cursor();
                 }
 
                 let Some(target) = (match graph.focus() {
