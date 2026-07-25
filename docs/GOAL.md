@@ -554,6 +554,29 @@ Mac mini vouches for the laptop"), which quietly turns one compromised machine i
 compromised fleet. The star with pushed fleet state gives the right display without that
 trade.
 
+## 12f. Can clients be a web page instead of a binary? No — and what can
+
+Asked directly, so answered directly: **a browser cannot inject mouse or keyboard events
+into the operating system.** That sandbox is the reason browsing is safe; if a page could
+move the cursor, every site could. Any machine that *receives* input must run native code.
+No amount of work changes this.
+
+What can travel over a URL is the **control surface**, which is most of what a person
+opens seam to look at. Recorded as the next design-led feature:
+
+- Serve the fleet page on the network, not only loopback, so any machine — including a
+  phone — can watch the desk, switch machines off, release the pointer and quit, with
+  nothing installed.
+- Authenticate it with the six-digit confirmation seam already uses for pairing, shown on
+  the host and entered once per device. A password would be the configuration this project
+  has spent its life avoiding.
+- Default to read-only. Viewing which machine holds the pointer and quitting the daemon
+  are different permissions, and the page already knows which actions are which.
+
+The full idea list, with cost and with the reasoning for the two ideas that are declined
+(a full mesh, and reaching the Windows secure desktop), is authored in Claude Design as
+`ideas.html` and served by the binary at `/ideas.html`.
+
 ## 12b. Review discipline — added after a self-inflicted vulnerability
 
 A line-by-line review of the newest code found that the fleet-page server validated

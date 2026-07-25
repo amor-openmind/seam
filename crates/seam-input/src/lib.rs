@@ -343,9 +343,15 @@ pub mod clipboard {
 mod clipboard_tests {
     use super::clipboard;
 
+    /// There is one system pasteboard, so these tests cannot overlap: whichever runs
+    /// second would otherwise read what the first left behind. Poisoning is ignored on
+    /// purpose — one test failing must not cascade into the rest.
+    static PASTEBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_file_list_round_trips_through_the_real_pasteboard() {
+        let _serial = PASTEBOARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join("seam-file-clip-test");
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("seam sample — پرونده.txt");
@@ -362,6 +368,7 @@ mod clipboard_tests {
 
     #[test]
     fn an_image_round_trips_through_the_real_clipboard() {
+        let _serial = PASTEBOARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Restores nothing: images replace the clipboard, same as a real screenshot.
         let pixels: Vec<u8> = (0..16).flat_map(|i| [i * 16, 255 - i * 16, 128, 255]).collect();
         if clipboard::write_image(4, 4, &pixels).is_err() {
@@ -379,6 +386,7 @@ mod clipboard_tests {
 
     #[test]
     fn text_round_trips_through_the_real_clipboard() {
+        let _serial = PASTEBOARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Restores whatever was there, so running the tests does not eat the user's
         // clipboard.
         let Ok(before) = clipboard::read_text() else {

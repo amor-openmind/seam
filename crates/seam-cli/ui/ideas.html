@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en"><head>
+
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>seam — what to build next</title>
+<link rel="stylesheet" href="_ds/tokens.css">
+<style>
+.shell{max-width:860px;margin:0 auto;padding:24px 24px 72px}
+header.top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px;gap:16px;flex-wrap:wrap}
+header.top h1{font:400 var(--text-2xl)/1.1 var(--font-display)}
+header.top .machine{font:400 var(--text-xs)/1.4 var(--font-mono);color:var(--text-secondary);text-align:right}
+p.lede{color:var(--text-secondary);font:400 var(--text-md)/1.6 var(--font-sans);max-width:56ch;margin-bottom:26px}
+h2.sec{font:600 var(--text-sm)/1.2 var(--font-mono);letter-spacing:.12em;text-transform:uppercase;color:var(--text-tertiary);margin:28px 0 12px}
+.idea{padding:18px 20px;margin-bottom:12px}
+.idea .head{display:flex;align-items:flex-start;gap:12px;margin-bottom:8px}
+.idea .t{flex:1;font:600 var(--text-md)/1.35 var(--font-sans)}
+.idea .d{font:400 var(--text-sm)/1.65 var(--font-sans);color:var(--text-secondary)}
+.idea .d b{color:var(--text-primary);font-weight:600}
+.idea .why{margin-top:10px;padding:10px 12px;border-radius:var(--radius-md);background:var(--surface-sunken);font:400 var(--text-xs)/1.6 var(--font-sans);color:var(--text-secondary)}
+.idea .why b{color:var(--text-primary)}
+.tag{font:500 10px/1 var(--font-mono);letter-spacing:.08em;text-transform:uppercase;padding:4px 8px;border-radius:999px;white-space:nowrap}
+.tag.small{background:var(--sage-050);color:var(--sage-700)}
+.tag.medium{background:var(--amber-050);color:var(--amber-700)}
+.tag.large{background:var(--rust-050);color:var(--rust-700)}
+.tag.impossible{background:var(--paper-200);color:var(--ink-600)}
+.verdict{display:flex;gap:14px;align-items:flex-start;padding:16px 18px;border-radius:var(--radius-lg);background:var(--feedback-info-bg);border:1px solid var(--feedback-info-line);color:var(--feedback-info-fg);margin-bottom:8px}
+.verdict .mk{font:600 var(--text-xl)/1 var(--font-mono)}
+.verdict .t{font:600 var(--text-md)/1.35 var(--font-sans);margin-bottom:4px}
+.verdict .d{font:400 var(--text-sm)/1.6 var(--font-sans)}
+@media (max-width:560px){.shell{padding:18px 14px 48px}.idea .head{flex-wrap:wrap}}
+</style></head><body>
+<div class="shell">
+  <header class="top"><h1>What to build next</h1><div class="machine"></div></header>
+  <p class="lede">Each idea carries what it costs and, where it matters, why the obvious version of it does not work.</p>
+
+  <h2 class="sec">The question that was asked</h2>
+  <div class="verdict">
+    <span class="mk">ⓘ</span>
+    <div>
+      <div class="t">Clients cannot be a web page — but the control panel can</div>
+      <div class="d">A browser cannot move your cursor or press your keys; that sandbox is the reason browsing is safe at all. Any machine that <b>receives</b> input must run native code. What can travel over a URL is everything <i>about</i> the fleet — which is most of what a person opens seam to look at.</div>
+    </div>
+  </div>
+
+  <div class="idea card">
+    <div class="head"><span class="t">Open the fleet page from any machine</span><span class="tag medium">medium</span></div>
+    <div class="d">The page is loopback-only today. Serve it on the network as well and every machine — including a phone — can watch the desk, switch machines off, release the pointer and stop seam, without installing anything.</div>
+    <div class="why"><b>The catch that decides the design:</b> the moment it leaves loopback it needs to authenticate, and a password would be a configuration seam has spent its life avoiding. It already has the answer — the same six-digit confirmation used for pairing, shown on the host machine and typed once per device, then remembered.</div>
+  </div>
+
+  <div class="idea card">
+    <div class="head"><span class="t">Read-only view by default</span><span class="tag small">small</span></div>
+    <div class="d">A phone on the sofa should be able to see which machine has the pointer without being able to quit the daemon. Viewing and controlling are different permissions and the page already knows which actions are which.</div>
+  </div>
+
+  <h2 class="sec">Making it whole</h2>
+
+  <div class="idea card">
+    <div class="head"><span class="t">Windows machines share their own input</span><span class="tag large">large</span></div>
+    <div class="d">Today only macOS captures; Windows replays. That is why there is no “make this the server” switch — it would be a control that lies. This is the single change that would make the fleet symmetric.</div>
+    <div class="why"><b>Cost:</b> a low-level keyboard and mouse hook, its own suppression story, and the elevated-window problem all over again on the capture side. Comparable to the entire macOS capture path, which took this project most of its life.</div>
+  </div>
+
+  <div class="idea card">
+    <div class="head"><span class="t">Large clipboard transfers that stream and resume</span><span class="tag medium">medium</span></div>
+    <div class="d">Copies over 64 MB are refused rather than sent half-finished. Offer, pull, chunk and resume from the receiver's high-water mark — already specified, not built.</div>
+  </div>
+
+  <div class="idea card">
+    <div class="head"><span class="t">The fleet, visible from every machine</span><span class="tag small">small</span></div>
+    <div class="d">A client lists only the machine it paired with, because pairing is pairwise and the fleet is a star. The centre should push its peer list so every machine can <b>show</b> the fleet — display only, never a basis for trust.</div>
+  </div>
+
+  <div class="idea card">
+    <div class="head"><span class="t">Drag a file across the edge</span><span class="tag large">large</span></div>
+    <div class="d">Carry a real drag between machines: pick a file up on one screen, cross the boundary, drop it on another. The clipboard already moves files; this is the gesture people actually reach for.</div>
+  </div>
+
+  <h2 class="sec">Fewer surprises</h2>
+
+  <div class="idea card">
+    <div class="head"><span class="t">Tests around the screens</span><span class="tag small">small</span></div>
+    <div class="d">Three regressions in a row were features breaking something that already worked: a refactor dropped the origin check, navigation broke the quit button, and closed links were never removed. None had a test.</div>
+    <div class="why"><b>Worth more than it looks:</b> every one of those shipped, and every one was found by a person rather than by the build.</div>
+  </div>
+
+  <div class="idea card">
+    <div class="head"><span class="t">A signed, notarised macOS build</span><span class="tag medium">medium</span></div>
+    <div class="d">macOS ties Accessibility and Input Monitoring to the exact binary, so every update silently loses both and the machine starts mirroring instead of switching. A stable signing identity keeps permissions across updates — removing the most repeated confusion this project has produced.</div>
+  </div>
+
+  <div class="idea card">
+    <div class="head"><span class="t">Say it out loud when a machine falls behind</span><span class="tag small">small</span></div>
+    <div class="d">Mismatched versions close the link rather than guessing, which is correct and invisible. The fleet page knows every machine's version and should say plainly which one needs updating.</div>
+  </div>
+
+  <h2 class="sec">Not worth building</h2>
+
+  <div class="idea card">
+    <div class="head"><span class="t">A full mesh, every machine paired with every other</span><span class="tag impossible">declined</span></div>
+    <div class="d">It would let every machine see every other directly — at the cost of n² confirmations by hand, or transitive trust, which quietly turns one compromised machine into a compromised fleet. Pushing the fleet list from the centre gives the same view without the trade.</div>
+  </div>
+
+  <div class="idea card">
+    <div class="head"><span class="t">Reaching the login and UAC screens</span><span class="tag impossible">blocked</span></div>
+    <div class="d">The Windows secure desktop needs a Microsoft-signed UIAccess binary. No KVM reaches it without one, Barrier included. Better stated than quietly broken.</div>
+  </div>
+</div>
+<script src="_ds/nav.js"></script>
+<script src="_ds/shared.js"></script>
+</body></html>
