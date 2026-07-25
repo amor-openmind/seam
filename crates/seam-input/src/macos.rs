@@ -1019,6 +1019,43 @@ mod tap_behaviour {
         seen
     }
 
+    /// Does detaching actually WORK from a daemon, or merely return success?
+    ///
+    /// Run with `--ignored --nocapture` and move the mouse for five seconds. Everything
+    /// else about this bug has been argued rather than measured, and the two facts that
+    /// matter cannot be separated any other way: the call returning 0 and the call having
+    /// an effect are different claims, and only the second one stops the cursor.
+    #[test]
+    #[ignore = "needs a human to move the mouse"]
+    fn does_detaching_actually_freeze_the_cursor() {
+        let _rx = observe_pointer().ok();
+        let guard = CursorGuard::detach(true);
+        eprintln!("detach: {:?}", guard.as_ref().map(|_| "ok"));
+        set_suppress_local(true);
+
+        let mut seen = Vec::new();
+        for _ in 0..25 {
+            if let Ok(p) = cursor_position() {
+                seen.push(p);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        set_suppress_local(false);
+        drop(guard);
+
+        let first = seen.first().copied().unwrap_or((0, 0));
+        let moved = seen.iter().filter(|&&p| p != first).count();
+        eprintln!("samples={} moved={} first={:?} last={:?}", seen.len(), moved, first, seen.last());
+        eprintln!(
+            "{}",
+            if moved == 0 {
+                "FROZE: detaching works from a daemon; something else moves the cursor"
+            } else {
+                "TRACKED: detaching returns success but has NO effect from a daemon"
+            }
+        );
+    }
+
     /// Can a **daemon** decouple the cursor from the mouse?
     ///
     /// This matters because it decides whether the mirrored-cursor bug is fixable at all
