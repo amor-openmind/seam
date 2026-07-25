@@ -1312,6 +1312,7 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/_ds/bind.js", include_str!("../ui/_ds/bind.js"), "text/javascript; charset=utf-8"),
     ("/_ds/shared.js", include_str!("../ui/_ds/shared.js"), "text/javascript; charset=utf-8"),
     ("/_ds/nav.js", include_str!("../ui/_ds/nav.js"), "text/javascript; charset=utf-8"),
+    ("/_ds/activity.js", include_str!("../ui/_ds/activity.js"), "text/javascript; charset=utf-8"),
     ("/_ds/quit.js", include_str!("../ui/_ds/quit.js"), "text/javascript; charset=utf-8"),
     ("/join.sh", include_str!("../../../scripts/join.sh"), "text/x-shellscript; charset=utf-8"),
     ("/join.ps1", include_str!("../../../scripts/join.ps1"), "text/plain; charset=utf-8"),
@@ -2452,6 +2453,7 @@ fn start_auto_dial(
                     if already {
                         continue;
                     }
+                    tracing::info!(peer = %peer.name, "found a paired machine; connecting");
                     for address in &peer.addresses {
                         if let Ok(link) = endpoint.connect(*address).await
                             && link.authorize(&store).is_ok()
