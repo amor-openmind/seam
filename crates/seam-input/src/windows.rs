@@ -388,3 +388,122 @@ pub fn inject_key(usage: u16, down: bool) -> Result<(), Error> {
     };
     send_one(input)
 }
+
+// ---------------------------------------------------------------- file clipboard
+
+// SAFETY CONTRACT: the classic Win32 clipboard file-list protocol. Explorer copies
+// files as CF_HDROP — a global memory block holding a DROPFILES header and a
+// double-null-terminated list of wide paths — and pastes anything that provides the
+// same. Declared by hand like the rest of this backend.
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn OpenClipboard(hwnd: *mut core::ffi::c_void) -> i32;
+    fn CloseClipboard() -> i32;
+    fn EmptyClipboard() -> i32;
+    fn IsClipboardFormatAvailable(format: u32) -> i32;
+    fn GetClipboardData(format: u32) -> *mut core::ffi::c_void;
+    fn SetClipboardData(format: u32, mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+}
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn DragQueryFileW(
+        drop: *mut core::ffi::c_void,
+        index: u32,
+        out: *mut u16,
+        capacity: u32,
+    ) -> u32;
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GlobalAlloc(flags: u32, bytes: usize) -> *mut core::ffi::c_void;
+    fn GlobalLock(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn GlobalUnlock(mem: *mut core::ffi::c_void) -> i32;
+    fn GlobalFree(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+}
+
+const CF_HDROP: u32 = 15;
+const GMEM_MOVEABLE: u32 = 0x0002;
+
+/// The absolute paths of files currently on the clipboard, if any.
+pub fn read_file_list() -> Result<Option<Vec<std::path::PathBuf>>, Error> {
+    use std::os::windows::ffi::OsStringExt;
+    // SAFETY: documented clipboard sequence; the clipboard is closed on every path.
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP) == 0 {
+            return Ok(None);
+        }
+        if OpenClipboard(core::ptr::null_mut()) == 0 {
+            // Another program holds it; a poll simply tries again next tick.
+            return Ok(None);
+        }
+        let drop = GetClipboardData(CF_HDROP);
+        if drop.is_null() {
+            CloseClipboard();
+            return Ok(None);
+        }
+        let count = DragQueryFileW(drop, u32::MAX, core::ptr::null_mut(), 0);
+        let mut paths = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let needed = DragQueryFileW(drop, index, core::ptr::null_mut(), 0);
+            if needed == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u16; needed as usize + 1];
+            let written =
+                DragQueryFileW(drop, index, buffer.as_mut_ptr(), needed + 1) as usize;
+            paths.push(std::ffi::OsString::from_wide(&buffer[..written]).into());
+        }
+        CloseClipboard();
+        Ok(if paths.is_empty() { None } else { Some(paths) })
+    }
+}
+
+/// Put a list of local files on the clipboard, exactly as Explorer would.
+pub fn write_file_list(paths: &[std::path::PathBuf]) -> Result<(), Error> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // DROPFILES: offset-to-paths, drop point, non-client flag, wide flag — then every
+    // path NUL-terminated, then one more NUL to end the list.
+    let mut wide: Vec<u16> = Vec::new();
+    for path in paths {
+        wide.extend(path.as_os_str().encode_wide());
+        wide.push(0);
+    }
+    wide.push(0);
+    let header: [u32; 5] = [20, 0, 0, 0, 1];
+    let total = 20 + wide.len() * 2;
+
+    // SAFETY: documented clipboard handoff. On success the system owns the memory; on
+    // any failure it is freed here.
+    unsafe {
+        let mem = GlobalAlloc(GMEM_MOVEABLE, total);
+        if mem.is_null() {
+            return Err(Error::Platform("out of clipboard memory".into()));
+        }
+        let locked = GlobalLock(mem);
+        if locked.is_null() {
+            GlobalFree(mem);
+            return Err(Error::Platform("could not lock clipboard memory".into()));
+        }
+        core::ptr::copy_nonoverlapping(header.as_ptr().cast::<u8>(), locked.cast(), 20);
+        core::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            locked.cast::<u8>().add(20).cast::<u16>(),
+            wide.len(),
+        );
+        GlobalUnlock(mem);
+
+        if OpenClipboard(core::ptr::null_mut()) == 0 {
+            GlobalFree(mem);
+            return Err(Error::Platform("the clipboard is held by another program".into()));
+        }
+        EmptyClipboard();
+        if SetClipboardData(CF_HDROP, mem).is_null() {
+            CloseClipboard();
+            GlobalFree(mem);
+            return Err(Error::Platform("the clipboard refused the file list".into()));
+        }
+        CloseClipboard();
+    }
+    Ok(())
+}

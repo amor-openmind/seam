@@ -213,6 +213,18 @@ pub enum Frame {
         rgba: Vec<u8>,
     },
 
+    /// Files or folders on the clipboard, carried by content.
+    ///
+    /// Each entry is a path *relative to the copy* ("report.pdf", "photos/a.jpg") plus
+    /// its bytes. Capped rather than streamed: this exists to move documents between
+    /// machines on a desk, not to replicate disks. A copy over the cap is refused with
+    /// a log line, never truncated silently — half a folder is worse than none.
+    ClipboardFiles {
+        seq: u32,
+        generation: u64,
+        entries: Vec<(String, Vec<u8>)>,
+    },
+
     /// Liveness probe. `t_send_us` is the sender's clock in microseconds.
     Ping {
         nonce: u64,
@@ -247,6 +259,7 @@ mod kind {
 
     pub(super) const CLIPBOARD_TEXT: u8 = 0x50;
     pub(super) const CLIPBOARD_IMAGE: u8 = 0x51;
+    pub(super) const CLIPBOARD_FILES: u8 = 0x52;
 
     pub(super) const PING: u8 = 0x40;
     pub(super) const PONG: u8 = 0x41;
@@ -259,6 +272,10 @@ mod kind {
 /// Largest clipboard image accepted on the wire: bigger than any screenshot on this
 /// project's fleet, small enough that a hostile length cannot balloon memory.
 const MAX_IMAGE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Largest clipboard file payload accepted on the wire. Senders cap at 64 MB; the
+/// decoder allows headroom over that but still refuses anything hostile.
+const MAX_FILES_BYTES: usize = 96 * 1024 * 1024;
 
 impl Frame {
     /// Whether this frame may travel on an unreliable datagram.
@@ -349,13 +366,13 @@ impl Frame {
                 encode_key_state(&mut w, state);
             }
             Self::ClipboardText { seq, generation, text } => {
-                w.u8(kind::CLIPBOARD_TEXT);
-                w.u32(*seq);
-                w.u64(*generation);
-                w.string(text)?;
+                encode_clipboard_text(&mut w, *seq, *generation, text)?;
             }
             Self::ClipboardImage { seq, generation, width, height, rgba } => {
                 encode_clipboard_image(&mut w, *seq, *generation, *width, *height, rgba)?;
+            }
+            Self::ClipboardFiles { seq, generation, entries } => {
+                encode_clipboard_files(&mut w, *seq, *generation, entries)?;
             }
             Self::Ping { nonce, t_send_us } => {
                 w.u8(kind::PING);
@@ -454,6 +471,24 @@ impl Frame {
                 }
                 Self::ClipboardImage { seq, generation, width, height, rgba: r.bytes(len)?.to_vec() }
             }
+            kind::CLIPBOARD_FILES => {
+                let seq = r.u32()?;
+                let generation = r.u64()?;
+                let count = r.u16()? as usize;
+                let mut entries = Vec::with_capacity(count.min(64));
+                let mut total: usize = 0;
+                for _ in 0..count {
+                    let path = r.string()?.to_owned();
+                    let len = r.u32()? as usize;
+                    total = total.saturating_add(len);
+                    // Same rule as images: refuse before allocating.
+                    if total > MAX_FILES_BYTES {
+                        return Err(Error::TooLong);
+                    }
+                    entries.push((path, r.bytes(len)?.to_vec()));
+                }
+                Self::ClipboardFiles { seq, generation, entries }
+            }
             kind::PING => Self::Ping { nonce: r.u64()?, t_send_us: r.u64()? },
             kind::PONG => Self::Pong { nonce: r.u64()?, t_send_us: r.u64()?, t_echo_us: r.u64()? },
             other => return Err(Error::UnknownFrameKind(other)),
@@ -497,6 +532,36 @@ fn read_peer_id(r: &mut Reader<'_>) -> Result<[u8; 16], Error> {
     let mut out = [0u8; 16];
     out.copy_from_slice(b);
     Ok(out)
+}
+
+fn encode_clipboard_files(
+    w: &mut Writer<'_>,
+    seq: u32,
+    generation: u64,
+    entries: &[(String, Vec<u8>)],
+) -> Result<(), Error> {
+    w.u8(kind::CLIPBOARD_FILES);
+    w.u32(seq);
+    w.u64(generation);
+    w.u16(u16::try_from(entries.len()).map_err(|_| Error::TooLong)?);
+    for (path, bytes) in entries {
+        w.string(path)?;
+        w.u32(u32::try_from(bytes.len()).map_err(|_| Error::TooLong)?);
+        w.bytes(bytes);
+    }
+    Ok(())
+}
+
+fn encode_clipboard_text(
+    w: &mut Writer<'_>,
+    seq: u32,
+    generation: u64,
+    text: &str,
+) -> Result<(), Error> {
+    w.u8(kind::CLIPBOARD_TEXT);
+    w.u32(seq);
+    w.u64(generation);
+    w.string(text)
 }
 
 fn encode_clipboard_image(
@@ -604,6 +669,14 @@ mod tests {
                 width: 2,
                 height: 1,
                 rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
+            },
+            Frame::ClipboardFiles {
+                seq: 14,
+                generation: 9,
+                entries: vec![
+                    ("گزارش.txt".into(), b"salam".to_vec()),
+                    ("photos/a.bin".into(), vec![0, 1, 2, 3]),
+                ],
             },
             Frame::Ping { nonce: 0x1234, t_send_us: 1_700_000_000_000_000 },
             Frame::Pong { nonce: 0x1234, t_send_us: 1, t_echo_us: 2 },

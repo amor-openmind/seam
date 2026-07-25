@@ -292,6 +292,39 @@ pub mod clipboard {
             .map_err(|e| Error::Platform(format!("could not set the clipboard image: {e}")))
     }
 
+    /// The absolute paths of files currently on the clipboard, if any.
+    pub fn read_file_list() -> Result<Option<Vec<std::path::PathBuf>>, Error> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::macos::read_file_list()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            crate::windows::read_file_list()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Err(Error::Unsupported("file clipboard"))
+        }
+    }
+
+    /// Put a list of local files on the clipboard, as the native file manager would.
+    pub fn write_file_list(paths: &[std::path::PathBuf]) -> Result<(), Error> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::macos::write_file_list(paths)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            crate::windows::write_file_list(paths)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = paths;
+            Err(Error::Unsupported("file clipboard"))
+        }
+    }
+
     /// Replace the clipboard's text.
     pub fn write_text(text: &str) -> Result<(), Error> {
         let mut board = arboard::Clipboard::new()
@@ -305,6 +338,23 @@ pub mod clipboard {
 #[cfg(test)]
 mod clipboard_tests {
     use super::clipboard;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_list_round_trips_through_the_real_pasteboard() {
+        let dir = std::env::temp_dir().join("seam-file-clip-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("seam sample — پرونده.txt");
+        std::fs::write(&file, b"clipboard file round trip").unwrap();
+
+        crate::macos::write_file_list(std::slice::from_ref(&file)).unwrap();
+        let read = crate::macos::read_file_list().unwrap();
+        assert_eq!(
+            read.as_deref(),
+            Some(std::slice::from_ref(&file)),
+            "the path must survive URL encoding, spaces and non-Latin letters intact"
+        );
+    }
 
     #[test]
     fn an_image_round_trips_through_the_real_clipboard() {

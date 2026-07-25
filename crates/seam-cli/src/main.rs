@@ -787,6 +787,53 @@ async fn apply_clipboard_image(
     }
 }
 
+/// Apply clipboard files from a peer: spool them locally, point this machine's
+/// clipboard at the spooled copies, then relay around the star like text and images.
+async fn apply_clipboard_files(
+    peer: seam_proto::PeerId,
+    generation: u64,
+    entries: Vec<(String, Vec<u8>)>,
+    clipboard: &Clipboard,
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+) {
+    let mut state = clipboard.lock().await;
+    if generation <= state.applied_generation {
+        return;
+    }
+    let spooled = match spool_clipboard_files(generation, &entries) {
+        Ok(tops) => tops,
+        Err(e) => {
+            tracing::warn!(%peer, "could not store the received files: {e}");
+            return;
+        }
+    };
+    match seam_input::clipboard::write_file_list(&spooled) {
+        Ok(()) => {
+            let bytes: usize = entries.iter().map(|(_, b)| b.len()).sum();
+            tracing::info!(%peer, files = entries.len(), bytes, "clipboard files received");
+            state.applied_generation = generation;
+            state.files_sig = Some(files_signature(&spooled));
+            state.last_seen = None;
+            state.image_sig = None;
+            drop(state);
+
+            let relay = seam_proto::Frame::ClipboardFiles { seq: 0, generation, entries };
+            for other in links.lock().await.iter() {
+                if other.peer_id() == peer {
+                    continue;
+                }
+                if let Err(e) = other.send_reliable(&relay).await {
+                    tracing::warn!(
+                        peer = %other.peer_id(),
+                        "could not relay the clipboard files: {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(%peer, "could not point the clipboard at the files: {e}"),
+    }
+}
+
 /// The moment input was last seen. Used by the watchdog.
 #[cfg(target_os = "macos")]
 static LAST_INPUT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
@@ -863,6 +910,119 @@ struct ClipboardState {
     /// Signature of the last image seen or applied, so an echo is recognised without
     /// keeping megabytes of pixels around.
     image_sig: Option<u64>,
+    /// Signature of the last file list seen or applied, same purpose.
+    files_sig: Option<u64>,
+}
+
+/// Total cap for clipboard file transfers. A copy over this is refused with a log
+/// line, never truncated — half a folder is worse than none.
+const MAX_CLIPBOARD_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Signature of what the file clipboard points at: paths, sizes and mtimes — no
+/// contents — so the poll stays cheap no matter how big the copy is.
+fn files_signature(paths: &[std::path::PathBuf]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    for path in paths {
+        path.hash(&mut hasher);
+        if let Ok(meta) = std::fs::metadata(path) {
+            meta.len().hash(&mut hasher);
+            if let Ok(modified) = meta.modified() {
+                modified.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+/// Read the copied files into wire entries: path-relative-to-the-copy plus bytes.
+/// Folders are walked; symlinks are skipped — a clipboard copy is contents, not
+/// filesystem structure.
+fn gather_clipboard_files(
+    paths: &[std::path::PathBuf],
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut entries = Vec::new();
+    let mut total: usize = 0;
+    let mut add = |rel: String, bytes: Vec<u8>, total: &mut usize| {
+        *total = total.saturating_add(bytes.len());
+        entries.push((rel, bytes));
+    };
+    for top in paths {
+        let Some(name) = top.file_name() else { continue };
+        let name = name.to_string_lossy().into_owned();
+        let meta = std::fs::symlink_metadata(top)
+            .map_err(|e| format!("{} is unreadable: {e}", top.display()))?;
+        if meta.is_file() {
+            let bytes =
+                std::fs::read(top).map_err(|e| format!("{} is unreadable: {e}", top.display()))?;
+            add(name, bytes, &mut total);
+        } else if meta.is_dir() {
+            let mut stack = vec![(top.clone(), name)];
+            while let Some((dir, rel)) = stack.pop() {
+                let listing = std::fs::read_dir(&dir)
+                    .map_err(|e| format!("{} is unreadable: {e}", dir.display()))?;
+                for entry in listing {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    let path = entry.path();
+                    let child = format!("{rel}/{}", entry.file_name().to_string_lossy());
+                    let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+                    if meta.is_file() {
+                        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                        add(child, bytes, &mut total);
+                    } else if meta.is_dir() {
+                        stack.push((path, child));
+                    }
+                }
+            }
+        }
+        if total > MAX_CLIPBOARD_FILE_BYTES {
+            return Err(format!(
+                "the copy is over {} MB; a clipboard is for documents, not disks",
+                MAX_CLIPBOARD_FILE_BYTES / (1024 * 1024)
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+/// Write received entries under the state directory and return the top-level paths to
+/// put on this machine's clipboard. The previous receipt is swept first, so pasted
+/// copies do not accumulate forever.
+fn spool_clipboard_files(
+    generation: u64,
+    entries: &[(String, Vec<u8>)],
+) -> Result<Vec<std::path::PathBuf>> {
+    let root = store::state_dir()?.join("clipboard-files");
+    if let Ok(previous) = std::fs::read_dir(&root) {
+        for old in previous.flatten() {
+            let _ = std::fs::remove_dir_all(old.path());
+        }
+    }
+    let dir = root.join(format!("gen-{generation}"));
+    std::fs::create_dir_all(&dir)?;
+    let mut tops: Vec<std::path::PathBuf> = Vec::new();
+    for (rel, bytes) in entries {
+        let relpath = std::path::Path::new(rel);
+        // A received path is untrusted input. Anything but plain components — absolute
+        // paths, drive prefixes, '..' — could escape the spool and overwrite real files.
+        let mut components = relpath.components();
+        let Some(first @ std::path::Component::Normal(_)) = components.next() else {
+            anyhow::bail!("refusing a path that could escape the spool: {rel:?}");
+        };
+        if components.clone().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            anyhow::bail!("refusing a path that could escape the spool: {rel:?}");
+        }
+        let dest = dir.join(relpath);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, bytes)?;
+        let top = dir.join(first.as_os_str());
+        if !tops.contains(&top) {
+            tops.push(top);
+        }
+    }
+    Ok(tops)
 }
 
 /// Cheap identity for clipboard images: dimensions plus a streaming hash of the pixels.
@@ -912,12 +1072,49 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
         if let Ok(Some((w, h, rgba))) = seam_input::clipboard::read_image() {
             clipboard.lock().await.image_sig = Some(image_signature(w, h, &rgba));
         }
+        if let Ok(Some(paths)) = seam_input::clipboard::read_file_list() {
+            clipboard.lock().await.files_sig = Some(files_signature(&paths));
+        }
 
         loop {
             ticker.tick().await;
 
-            // Text first: cheapest to read, and a clipboard holds one thing at a time,
-            // so when text is present there is nothing else to poll.
+            // Files before text, deliberately: Finder puts a copied file's NAME on the
+            // pasteboard as text as well, so a text-first check would share the
+            // filename and mask the files themselves.
+            if let Ok(Some(paths)) = seam_input::clipboard::read_file_list() {
+                let sig = files_signature(&paths);
+                if clipboard.lock().await.files_sig == Some(sig) {
+                    continue;
+                }
+                match gather_clipboard_files(&paths) {
+                    Ok(entries) if !entries.is_empty() => {
+                        let frame = {
+                            let mut state = clipboard.lock().await;
+                            state.files_sig = Some(sig);
+                            state.generation += 1;
+                            seam_proto::Frame::ClipboardFiles {
+                                seq: 0,
+                                generation: state.generation,
+                                entries,
+                            }
+                        };
+                        share_with_all(&links, &frame, "files").await;
+                    }
+                    Ok(_) => clipboard.lock().await.files_sig = Some(sig),
+                    Err(reason) => {
+                        // Remember the signature regardless, or this repeats every poll.
+                        clipboard.lock().await.files_sig = Some(sig);
+                        tracing::warn!(
+                            files = paths.len(),
+                            "not sharing the copied files: {reason}"
+                        );
+                    }
+                }
+                continue;
+            }
+
+            // Text next: cheapest to read, and by far the most common.
             if let Ok(Some(text)) = seam_input::clipboard::read_text() {
                 let frame = {
                     let mut state = clipboard.lock().await;
@@ -1323,6 +1520,9 @@ async fn receive_reliable(
                     }
                     Err(e) => tracing::warn!(%peer, "could not set the clipboard: {e}"),
                 }
+            }
+            Ok(seam_proto::Frame::ClipboardFiles { generation, entries, .. }) => {
+                apply_clipboard_files(peer, generation, entries, &clipboard, &links).await;
             }
             Ok(seam_proto::Frame::ClipboardImage { generation, width, height, rgba, .. }) => {
                 apply_clipboard_image(peer, generation, width, height, rgba, &clipboard, &links)

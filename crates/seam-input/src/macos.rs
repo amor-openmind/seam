@@ -1183,6 +1183,200 @@ pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
     }
 }
 
+// ---------------------------------------------------------------- file clipboard
+
+// SAFETY CONTRACT: the Carbon Pasteboard API — C, documented, and still the only way
+// to read and write file references on the pasteboard without Objective-C. Finder
+// copies files as `public.file-url` flavors, one per item, and pastes anything that
+// provides the same.
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn PasteboardCreate(name: *const c_void, out: *mut *mut c_void) -> i32;
+    fn PasteboardSynchronize(pasteboard: *mut c_void) -> u32;
+    fn PasteboardGetItemCount(pasteboard: *mut c_void, count: *mut isize) -> i32;
+    fn PasteboardGetItemIdentifier(
+        pasteboard: *mut c_void,
+        index: isize,
+        item: *mut *mut c_void,
+    ) -> i32;
+    fn PasteboardCopyItemFlavorData(
+        pasteboard: *mut c_void,
+        item: *mut c_void,
+        flavor: *const c_void,
+        out: *mut *const c_void,
+    ) -> i32;
+    fn PasteboardClear(pasteboard: *mut c_void) -> i32;
+    fn PasteboardPutItemFlavor(
+        pasteboard: *mut c_void,
+        item: *mut c_void,
+        flavor: *const c_void,
+        data: *const c_void,
+        flags: u32,
+    ) -> i32;
+    fn CFDataCreate(alloc: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
+    fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
+    fn CFDataGetLength(data: *const c_void) -> isize;
+}
+
+/// The name of the general clipboard — the value of Apple's `kPasteboardClipboard`,
+/// spelled out because the constant's data symbol does not link from the umbrella
+/// framework while the functions do.
+fn clipboard_name() -> *const c_void {
+    static NAME: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *NAME.get_or_init(|| {
+        // SAFETY: creates one immortal CFString.
+        unsafe {
+            CFStringCreateWithCString(
+                core::ptr::null(),
+                c"com.apple.pasteboard.clipboard".as_ptr().cast(),
+                K_CF_STRING_ENCODING_UTF8,
+            ) as usize
+        }
+    }) as *const c_void
+}
+
+/// The pasteboard flavor Finder uses for a copied file: a percent-encoded file URL.
+fn file_url_flavor() -> *const c_void {
+    static FLAVOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FLAVOR.get_or_init(|| {
+        // SAFETY: creates one immortal CFString.
+        unsafe {
+            CFStringCreateWithCString(
+                core::ptr::null(),
+                c"public.file-url".as_ptr().cast(),
+                K_CF_STRING_ENCODING_UTF8,
+            ) as usize
+        }
+    }) as *const c_void
+}
+
+/// Percent-decode the path of a `file://` URL. Returns `None` for anything else.
+fn path_from_file_url(url: &[u8]) -> Option<std::path::PathBuf> {
+    let rest = url.strip_prefix(b"file://")?;
+    // Strip an authority ("localhost") if present; the path starts at the next '/'.
+    let path_start = rest.iter().position(|&b| b == b'/')?;
+    let raw = &rest[path_start..];
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'%' if i + 2 < raw.len() => {
+                let hex = core::str::from_utf8(&raw[i + 1..i + 3]).ok()?;
+                bytes.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b => {
+                bytes.push(b);
+                i += 1;
+            }
+        }
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    Some(std::path::PathBuf::from(text))
+}
+
+/// Percent-encode a path into a `file://` URL, the exact inverse of the above.
+fn file_url_from_path(path: &std::path::Path) -> String {
+    use std::fmt::Write as _;
+    let mut url = String::from("file://");
+    for &b in path.to_string_lossy().as_bytes() {
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/');
+        if unreserved {
+            url.push(b as char);
+        } else {
+            let _ = write!(url, "%{b:02X}");
+        }
+    }
+    url
+}
+
+/// The absolute paths of files currently on the clipboard, if any.
+pub fn read_file_list() -> Result<Option<Vec<std::path::PathBuf>>, Error> {
+    // SAFETY: documented Carbon Pasteboard sequence; every CF object copied out is
+    // released on the single exit path of its scope.
+    unsafe {
+        let mut pasteboard: *mut c_void = core::ptr::null_mut();
+        if PasteboardCreate(clipboard_name(), &raw mut pasteboard) != 0
+            || pasteboard.is_null()
+        {
+            return Err(Error::Platform("the pasteboard is unavailable".into()));
+        }
+        PasteboardSynchronize(pasteboard);
+        let mut count: isize = 0;
+        if PasteboardGetItemCount(pasteboard, &raw mut count) != 0 {
+            CFRelease(pasteboard.cast_const());
+            return Ok(None);
+        }
+        let mut paths = Vec::new();
+        for index in 1..=count {
+            let mut item: *mut c_void = core::ptr::null_mut();
+            if PasteboardGetItemIdentifier(pasteboard, index, &raw mut item) != 0 {
+                continue;
+            }
+            let mut data: *const c_void = core::ptr::null();
+            if PasteboardCopyItemFlavorData(pasteboard, item, file_url_flavor(), &raw mut data)
+                != 0
+                || data.is_null()
+            {
+                continue; // not a file item
+            }
+            let len = usize::try_from(CFDataGetLength(data)).unwrap_or(0);
+            let bytes = core::slice::from_raw_parts(CFDataGetBytePtr(data), len);
+            if let Some(path) = path_from_file_url(bytes) {
+                paths.push(path);
+            }
+            CFRelease(data);
+        }
+        CFRelease(pasteboard.cast_const());
+        Ok(if paths.is_empty() { None } else { Some(paths) })
+    }
+}
+
+/// Put a list of local files on the clipboard, exactly as Finder would.
+pub fn write_file_list(paths: &[std::path::PathBuf]) -> Result<(), Error> {
+    // SAFETY: documented Carbon Pasteboard sequence, mirrored from the read path.
+    unsafe {
+        let mut pasteboard: *mut c_void = core::ptr::null_mut();
+        if PasteboardCreate(clipboard_name(), &raw mut pasteboard) != 0
+            || pasteboard.is_null()
+        {
+            return Err(Error::Platform("the pasteboard is unavailable".into()));
+        }
+        PasteboardSynchronize(pasteboard);
+        if PasteboardClear(pasteboard) != 0 {
+            CFRelease(pasteboard.cast_const());
+            return Err(Error::Platform("could not take ownership of the pasteboard".into()));
+        }
+        for (i, path) in paths.iter().enumerate() {
+            let url = file_url_from_path(path);
+            let data = CFDataCreate(
+                core::ptr::null(),
+                url.as_ptr(),
+                isize::try_from(url.len()).unwrap_or(0),
+            );
+            if data.is_null() {
+                continue;
+            }
+            let status = PasteboardPutItemFlavor(
+                pasteboard,
+                core::ptr::without_provenance_mut(i + 1),
+                file_url_flavor(),
+                data,
+                0,
+            );
+            CFRelease(data);
+            if status != 0 {
+                CFRelease(pasteboard.cast_const());
+                return Err(Error::Platform(format!(
+                    "the pasteboard refused a file item (error {status})"
+                )));
+            }
+        }
+        CFRelease(pasteboard.cast_const());
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tap_behaviour {
     //! Live experiments against a real event tap.
@@ -1194,6 +1388,10 @@ mod tap_behaviour {
 
     use super::*;
     use std::time::Duration;
+
+    /// Tap and pasteboard state is process-global, so these tests cannot overlap.
+    /// The panic-poisoned case is fine to unwrap-or: a prior failure must not cascade.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // SAFETY CONTRACT: documented CoreGraphics event-construction API.
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -1251,7 +1449,7 @@ mod tap_behaviour {
     /// healthy tap, that whole failure comes straight back.
     #[test]
     fn a_live_tap_reports_itself_alive() {
-        assert_eq!(capture_is_alive(), None, "no tap has been created yet");
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Ok(_rx) = observe_pointer() else {
             eprintln!("skipped: Input Monitoring permission not granted");
             return;
@@ -1270,6 +1468,7 @@ mod tap_behaviour {
     /// it and `CGDisplayHideCursor` from the daemon will actually hide the arrow.
     #[test]
     fn window_server_grants_background_cursor_control() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let status = allow_background_cursor_control();
         eprintln!("SetsCursorInBackground -> {status} (0 = granted)");
         assert_eq!(status, 0, "window server refused background cursor control");
@@ -1282,6 +1481,7 @@ mod tap_behaviour {
     /// cursor by warping cannot work however often it is called.
     #[test]
     fn warping_actually_moves_the_cursor() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Ok(before) = cursor_position() else {
             eprintln!("skipped: no cursor");
             return;
@@ -1315,6 +1515,7 @@ mod tap_behaviour {
     #[test]
     #[ignore = "needs a human to move the mouse"]
     fn does_detaching_actually_freeze_the_cursor() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _rx = observe_pointer().ok();
         let guard = CursorGuard::detach(true);
         eprintln!("detach: {:?}", guard.as_ref().map(|_| "ok"));
@@ -1359,6 +1560,7 @@ mod tap_behaviour {
     /// Proving the real device path needs a human hand on a real mouse.
     #[test]
     fn a_daemon_can_detach_the_cursor_from_the_mouse() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: documented CoreGraphics calls; the association is always restored.
         let detached = unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
         unsafe { CGAssociateMouseAndMouseCursorPosition(1) };
@@ -1377,6 +1579,7 @@ mod tap_behaviour {
     /// events that would return it are the ones being withheld.
     #[test]
     fn movement_is_still_observed_while_detached_and_suppressing() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Ok(rx) = observe_pointer() else {
             eprintln!("skipped: Input Monitoring permission not granted");
             return;
@@ -1417,6 +1620,7 @@ mod tap_behaviour {
     /// Suppression must not outlive the guard, whatever happens.
     #[test]
     fn dropping_the_guard_always_restores_local_input() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let guard = CursorGuard::detach(false).ok();
         set_suppress_local(true);
         assert!(is_suppressing_local());
