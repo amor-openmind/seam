@@ -96,6 +96,17 @@ pub(crate) struct Graph {
     current: usize,
     x: i32,
     y: i32,
+    /// Events to ignore the OS cursor for, after returning to this machine.
+    ///
+    /// Returning warps the real cursor to where the layout says the pointer is, but events
+    /// already in flight were stamped with the *old* location — the boundary the pointer
+    /// just crossed. Adopting one of those puts the pointer straight back on the edge and
+    /// it re-crosses on the very next event, 20 ms later, which is exactly what a real
+    /// session showed: every return followed immediately by another crossing.
+    ///
+    /// So the OS cursor is ignored briefly after a return, until the warp has certainly
+    /// taken effect.
+    settling: u8,
 }
 
 impl Graph {
@@ -111,6 +122,7 @@ impl Graph {
             current: 0,
             x: width / 2,
             y: height / 2,
+            settling: 0,
         }
     }
 
@@ -175,6 +187,7 @@ impl Graph {
     }
 
     pub(crate) fn return_home(&mut self) {
+        self.settling = SETTLING_EVENTS;
         self.current = 0;
         self.x = self.nodes[0].width / 2;
         self.y = self.nodes[0].height / 2;
@@ -204,6 +217,11 @@ impl Graph {
     /// Barrier and Synergy use.
     pub(crate) fn sync_local_cursor(&mut self, x: i32, y: i32) {
         if self.current != 0 {
+            return;
+        }
+        if self.settling > 0 {
+            // Still waiting for the warp to be reflected in the events we receive.
+            self.settling -= 1;
             return;
         }
         let node = &self.nodes[0];
@@ -243,9 +261,18 @@ impl Graph {
                 break;
             };
 
-            // Enter at the matching edge, carrying the *overshoot* across rather than
-            // snapping to the border. Discarding it would make a fast flick stop at the
-            // first screen it reaches, and would quietly throw away real hand movement.
+            // Enter *at* the matching edge, a small margin in — the overshoot is
+            // deliberately discarded.
+            //
+            // Carrying it across seemed more faithful, and is much worse to use: pushing
+            // hard off an edge lands the pointer as deep inside the neighbour as the
+            // shove was long, so returning means retracing that whole distance. Reported
+            // as "it takes many movements to get back; once doesn't work".
+            //
+            // Landing at the edge means one small movement always brings the pointer
+            // home, which is how Barrier and Synergy behave and what the hand expects.
+            // The cost is that a single fast flick crosses one screen rather than two.
+            //
             // The position along the edge is scaled, so screens of different sizes line
             // up proportionally instead of by raw pixel row.
             let target = &self.nodes[next];
@@ -253,26 +280,24 @@ impl Graph {
             match edge {
                 Edge::Left => {
                     self.y = scale(self.y, h, th);
-                    self.x += tw;
-                    // Arrive a margin inside the far edge, not on it.
-                    self.x = self.x.min(tw - 1 - ENTRY_MARGIN.min(tw / 4));
+                    self.x = tw - 1 - ENTRY_MARGIN.min(tw / 4);
                 }
                 Edge::Right => {
                     self.y = scale(self.y, h, th);
-                    self.x -= w;
-                    self.x = self.x.max(ENTRY_MARGIN.min(tw / 4));
+                    self.x = ENTRY_MARGIN.min(tw / 4);
                 }
                 Edge::Top => {
                     self.x = scale(self.x, w, tw);
-                    self.y += th;
-                    self.y = self.y.min(th - 1 - ENTRY_MARGIN.min(th / 4));
+                    self.y = th - 1 - ENTRY_MARGIN.min(th / 4);
                 }
                 Edge::Bottom => {
                     self.x = scale(self.x, w, tw);
-                    self.y -= h;
-                    self.y = self.y.max(ENTRY_MARGIN.min(th / 4));
+                    self.y = ENTRY_MARGIN.min(th / 4);
                 }
             }
+            // Having just arrived, ignore the OS cursor for a few events: anything already
+            // in flight still reports the position on the far side of the boundary.
+            self.settling = SETTLING_EVENTS;
             self.current = next;
         }
 
@@ -295,6 +320,12 @@ impl Graph {
 /// deliberately back through the margin to cross again. Every KVM needs some form of this;
 /// Barrier calls it a switch delay.
 const ENTRY_MARGIN: i32 = 12;
+
+/// How many events to ignore the OS cursor for after a crossing.
+///
+/// Events arrive roughly every 20 ms, so this is a settling window of about 100 ms — long
+/// enough for a warp to be reflected in what we receive, short enough to be invisible.
+const SETTLING_EVENTS: u8 = 5;
 
 /// Map a position along an edge onto a screen of a different size, so a 1080-tall screen
 /// and a 2160-tall one line up proportionally rather than by raw pixel row.
@@ -445,13 +476,28 @@ mod tests {
     }
 
     #[test]
-    fn one_fast_movement_can_cross_two_screens() {
+    fn a_fast_flick_crosses_one_screen_and_stops_there() {
+        // Deliberate: the overshoot is discarded so the pointer lands at the edge it
+        // entered by, which is what makes one small movement enough to come back.
         let mut g = Graph::new(1000, 1000);
         g.place(imac(), Edge::Left, None, 1000, 1000);
         g.place(laptop(), Edge::Left, Some(imac()), 1000, 1000);
 
         let update = g.apply_motion(-2500, 0);
-        assert_eq!(update.focus, Focus::Remote(laptop()), "a flick must not stop halfway");
+        assert_eq!(update.focus, Focus::Remote(imac()), "should stop at the first screen");
+    }
+
+    #[test]
+    fn a_hard_shove_still_returns_with_one_small_movement() {
+        // The reported problem: pushing hard onto a peer used to land the pointer as deep
+        // inside as the shove was long, so getting back meant retracing all of it.
+        let mut g = fleet();
+        g.sync_local_cursor(0, 540);
+        g.apply_motion(-3000, 0);
+        assert_eq!(g.focus(), Focus::Remote(imac()));
+
+        let update = g.apply_motion(ENTRY_MARGIN + 1, 0);
+        assert_eq!(update.focus, Focus::Local, "one small movement must bring it home");
     }
 
     #[test]
@@ -694,27 +740,30 @@ mod entry_position {
     }
 
     #[test]
-    fn a_fast_crossing_lands_deep_inside_rather_than_at_the_edge() {
-        // A flick carries its overshoot, so the pointer ends up well inside the
-        // neighbour — and therefore has to travel back before it can return.
+    fn a_fast_crossing_still_lands_at_the_edge() {
+        // However hard the shove, the pointer arrives at the edge it entered by. This is
+        // what stops a hard push from burying it deep inside the neighbour.
         let mut g = pair();
         g.sync_local_cursor(0, 540);
         let update = g.apply_motion(-800, 0);
         assert_eq!(update.focus, Focus::Remote(imac()));
-        assert_eq!(update.x, 1120, "1920 - 800");
+        assert_eq!(update.x, 1907, "a margin inside the far edge, regardless of overshoot");
     }
 
     #[test]
-    fn returning_needs_only_the_distance_actually_travelled_in() {
-        // The pointer must not require more movement to get out than it took to get in.
-        let mut g = pair();
-        g.sync_local_cursor(0, 540);
-        g.apply_motion(-800, 0);
-        assert_eq!(g.focus(), Focus::Remote(imac()));
+    fn the_distance_back_does_not_depend_on_how_hard_it_was_pushed() {
+        // Returning must cost the same whether the pointer arrived gently or was flung.
+        let mut gentle = pair();
+        gentle.sync_local_cursor(0, 540);
+        gentle.apply_motion(-1, 0);
 
-        // 800 in, so 800 out must reach the boundary exactly.
-        let update = g.apply_motion(800, 0);
-        assert_eq!(update.focus, Focus::Local, "the same distance back must return it");
+        let mut flung = pair();
+        flung.sync_local_cursor(0, 540);
+        flung.apply_motion(-5000, 0);
+
+        let step = ENTRY_MARGIN + 1;
+        assert_eq!(gentle.apply_motion(step, 0).focus, Focus::Local);
+        assert_eq!(flung.apply_motion(step, 0).focus, Focus::Local);
     }
 
     #[test]
