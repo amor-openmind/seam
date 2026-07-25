@@ -600,25 +600,54 @@ async fn daemon(
             tracing::warn!(%address, "not a HOST:PORT address");
             continue;
         };
-        match endpoint.connect(target).await {
-            Ok(link) => {
-                if let Err(e) = link.authorize(&store) {
-                    tracing::warn!(%target, "refused: {e}");
-                    continue;
+        // Keep trying, forever, rather than once at startup.
+        //
+        // A single attempt means the machines can only ever be started in one order: a
+        // client launched before its server logged "could not connect" and then sat there
+        // doing nothing for the rest of the session, which reads as pairing being broken.
+        // Nothing about seam should care which machine was switched on first.
+        //
+        // The same loop reconnects after the link drops, so a server restart no longer
+        // strands every client either.
+        let endpoint = endpoint.clone();
+        let store = Arc::clone(&store);
+        let links = Arc::clone(&links);
+        let geometry = Arc::clone(&geometry);
+        let clipboard = Arc::clone(&clipboard);
+        tokio::spawn(async move {
+            // Back off up to 5 s: fast enough that starting the server feels immediate,
+            // slow enough not to spin when nothing is there.
+            let mut delay = Duration::from_millis(500);
+            loop {
+                match endpoint.connect(target).await {
+                    Ok(link) => {
+                        if let Err(e) = link.authorize(&store) {
+                            tracing::warn!(%target, "refused: {e}");
+                            return;
+                        }
+                        tracing::info!(peer = %link.peer_id(), %target, "connected to peer");
+                        delay = Duration::from_millis(500);
+                        let link = Arc::new(link);
+                        register_link(&links, &link).await;
+                        announce_geometry(&link).await;
+                        // Returns when the peer goes away, and then we try again.
+                        receive_from(
+                            Arc::clone(&link),
+                            Arc::clone(&geometry),
+                            Arc::clone(&clipboard),
+                            Arc::clone(&links),
+                        )
+                        .await;
+                        tracing::info!(%target, "peer went away; reconnecting");
+                    }
+                    Err(e) => {
+                        tracing::debug!(%target, "not reachable yet ({e}); retrying");
+                    }
                 }
-                tracing::info!(peer = %link.peer_id(), %target, "connected to peer");
-                let link = Arc::new(link);
-                register_link(&links, &link).await;
-                announce_geometry(&link).await;
-                tokio::spawn(receive_from(
-                    link,
-                    Arc::clone(&geometry),
-                    Arc::clone(&clipboard),
-                    Arc::clone(&links),
-                ));
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(5));
             }
-            Err(e) => tracing::warn!(%target, "could not connect: {e}"),
-        }
+        });
     }
 
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry), dir.to_path_buf());
