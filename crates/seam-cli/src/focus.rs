@@ -107,6 +107,8 @@ pub(crate) struct Graph {
     /// So the OS cursor is ignored briefly after a return, until the warp has certainly
     /// taken effect.
     settling: u8,
+    /// Motion events left before another crossing is allowed.
+    lockout: u8,
 }
 
 impl Graph {
@@ -123,6 +125,7 @@ impl Graph {
             x: width / 2,
             y: height / 2,
             settling: 0,
+            lockout: 0,
         }
     }
 
@@ -235,6 +238,32 @@ impl Graph {
         self.x = self.x.saturating_add(dx);
         self.y = self.y.saturating_add(dy);
 
+        // A crossing that just happened locks out the next few, and this is the whole
+        // reason focus stopped oscillating.
+        //
+        // Landing ENTRY_MARGIN inside the new screen is not enough on its own: a fast
+        // mouse reports 30-60 px in a single event, far more than the margin, so the very
+        // next event carried the pointer straight back out of the edge it had just come
+        // in through. The log showed focus alternating between two machines every 20 ms —
+        // the event rate — and while it read "back on this machine" suppression was off,
+        // so half of every keystroke and every motion landed on the local machine as well
+        // as the remote one. From a chair that is "it types on both".
+        //
+        // The margin was always a distance answering a velocity question. This is the
+        // directional lockout Barrier uses instead.
+        if self.lockout > 0 {
+            self.lockout -= 1;
+            let node = &self.nodes[self.current];
+            self.x = self.x.clamp(0, node.width - 1);
+            self.y = self.y.clamp(0, node.height - 1);
+            return Update {
+                focus: self.focus(),
+                changed: self.current != before,
+                x: self.x,
+                y: self.y,
+            };
+        }
+
         // Loop, because one fast flick can cross more than one screen.
         for _ in 0..8 {
             let node = &self.nodes[self.current];
@@ -298,6 +327,7 @@ impl Graph {
             // Having just arrived, ignore the OS cursor for a few events: anything already
             // in flight still reports the position on the far side of the boundary.
             self.settling = SETTLING_EVENTS;
+            self.lockout = CROSSING_LOCKOUT;
             self.current = next;
         }
 
@@ -327,6 +357,13 @@ const ENTRY_MARGIN: i32 = 12;
 /// enough for a warp to be reflected in what we receive, short enough to be invisible.
 const SETTLING_EVENTS: u8 = 5;
 
+/// Motion events that must pass after a crossing before another is allowed.
+///
+/// At roughly 50 Hz this is about 160 ms: longer than any in-flight event, far shorter
+/// than a deliberate move back. It bounds how fast focus can change no matter how fast the
+/// mouse moves, which a distance margin cannot do.
+const CROSSING_LOCKOUT: u8 = 8;
+
 /// Map a position along an edge onto a screen of a different size, so a 1080-tall screen
 /// and a 2160-tall one line up proportionally rather than by raw pixel row.
 fn scale(value: i32, from: i32, to: i32) -> i32 {
@@ -351,6 +388,19 @@ pub(crate) struct Update {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Let the post-crossing lockout drain, as real mouse movement does.
+    ///
+    /// A crossing locks out the next few so a fast mouse cannot bounce straight back
+    /// (`oscillation::a_fast_mouse_cannot_bounce_straight_back_across_an_edge`). A person
+    /// moving the mouse produces a stream of events and never notices; a test that calls
+    /// `apply_motion` twice does, so it has to spend the lockout explicitly.
+    fn drain_lockout(g: &mut Graph) {
+        for _ in 0..CROSSING_LOCKOUT {
+            g.apply_motion(0, 0);
+        }
+    }
+
 
     fn imac() -> PeerId {
         PeerId([1; 16])
@@ -391,6 +441,7 @@ mod tests {
         g.sync_local_cursor(0, 500);
         g.apply_motion(-1, 0);
         assert_eq!(g.focus(), Focus::Remote(imac()));
+        drain_lockout(&mut g);
 
         g.sync_local_cursor(1280, 540);
         assert_eq!(g.focus(), Focus::Remote(imac()), "must stay on the peer");
@@ -415,6 +466,7 @@ mod tests {
         g.apply_motion(-5000, 0);
         assert_eq!(g.focus(), Focus::Remote(imac()));
 
+        drain_lockout(&mut g);
         let update = g.apply_motion(5000, 0);
         assert!(update.changed);
         assert_eq!(update.focus, Focus::Local);
@@ -436,6 +488,7 @@ mod tests {
         let mut g = fleet();
         g.apply_motion(-1281, 0);
         assert_eq!(g.focus(), Focus::Remote(imac()));
+        drain_lockout(&mut g);
 
         // Pointer sits at y=540 on a 1080-tall screen; 541 puts it just past the bottom.
         let update = g.apply_motion(0, 541);
@@ -448,8 +501,10 @@ mod tests {
     fn leaving_the_top_of_the_laptop_returns_to_the_left_machine() {
         let mut g = fleet();
         g.apply_motion(-1281, 0);
+        drain_lockout(&mut g);
         g.apply_motion(0, 541);
         assert_eq!(g.focus(), Focus::Remote(laptop()));
+        drain_lockout(&mut g);
 
         // The pointer enters the laptop a margin below its top edge, so it must be moved
         // deliberately back through that margin to leave again.
@@ -496,6 +551,7 @@ mod tests {
         g.apply_motion(-3000, 0);
         assert_eq!(g.focus(), Focus::Remote(imac()));
 
+        drain_lockout(&mut g);
         let update = g.apply_motion(ENTRY_MARGIN + 1, 0);
         assert_eq!(update.focus, Focus::Local, "one small movement must bring it home");
     }
@@ -720,6 +776,19 @@ mod entry_position {
 
     use super::*;
 
+    /// Let the post-crossing lockout drain, as real mouse movement does.
+    ///
+    /// A crossing locks out the next few so a fast mouse cannot bounce straight back
+    /// (`oscillation::a_fast_mouse_cannot_bounce_straight_back_across_an_edge`). A person
+    /// moving the mouse produces a stream of events and never notices; a test that calls
+    /// `apply_motion` twice does, so it has to spend the lockout explicitly.
+    fn drain_lockout(g: &mut Graph) {
+        for _ in 0..CROSSING_LOCKOUT {
+            g.apply_motion(0, 0);
+        }
+    }
+
+
     fn imac() -> PeerId {
         PeerId([1; 16])
     }
@@ -756,10 +825,12 @@ mod entry_position {
         let mut gentle = pair();
         gentle.sync_local_cursor(0, 540);
         gentle.apply_motion(-1, 0);
+        drain_lockout(&mut gentle);
 
         let mut flung = pair();
         flung.sync_local_cursor(0, 540);
         flung.apply_motion(-5000, 0);
+        drain_lockout(&mut flung);
 
         let step = ENTRY_MARGIN + 1;
         assert_eq!(gentle.apply_motion(step, 0).focus, Focus::Local);
@@ -814,6 +885,7 @@ mod entry_position {
         g.sync_local_cursor(0, 540);
         g.apply_motion(-1, 0);
         assert_eq!(g.focus(), Focus::Remote(imac()));
+        drain_lockout(&mut g);
         // Past the entry margin, it is still escapable — wrong or stale geometry must
         // never trap the pointer behind a boundary thousands of pixels away.
         assert_eq!(
@@ -821,5 +893,58 @@ mod entry_position {
             Focus::Local,
             "a short deliberate movement must still return it"
         );
+    }
+}
+
+#[cfg(test)]
+mod oscillation {
+    use super::*;
+
+    fn fleet() -> Graph {
+        let mac = seam_proto::PeerId([1; 16]);
+        let imac = seam_proto::PeerId([2; 16]);
+        let mut g = Graph::new(1920, 1080);
+        g.place(imac, Edge::Left, None, 2048, 1152);
+        let _ = mac;
+        g
+    }
+
+    #[test]
+    fn a_fast_mouse_cannot_bounce_straight_back_across_an_edge() {
+        // The reported bug, as arithmetic: cross left, then immediately move right by more
+        // than the entry margin. Before the lockout this crossed back on the very next
+        // event, and focus alternated at the event rate — which is why input landed on
+        // both machines at once.
+        let mut g = fleet();
+        g.apply_motion(-2000, 0);
+        let crossed = g.current;
+        assert_ne!(crossed, 0, "should have left the local screen");
+
+        // A single fast event, far larger than ENTRY_MARGIN.
+        let update = g.apply_motion(60, 0);
+        assert_eq!(g.current, crossed, "must not bounce back on the next event");
+        assert!(!update.changed, "focus must not change during the lockout");
+    }
+
+    #[test]
+    fn the_pointer_can_still_come_back_deliberately() {
+        // The lockout must not strand the pointer: after it expires, moving back works.
+        let mut g = fleet();
+        g.apply_motion(-2000, 0);
+        for _ in 0..CROSSING_LOCKOUT {
+            g.apply_motion(1, 0);
+        }
+        g.apply_motion(5000, 0);
+        assert_eq!(g.current, 0, "the pointer must be able to return home");
+    }
+
+    #[test]
+    fn the_lockout_expires_rather_than_latching() {
+        let mut g = fleet();
+        g.apply_motion(-2000, 0);
+        for _ in 0..20 {
+            g.apply_motion(0, 1);
+        }
+        assert_eq!(g.lockout, 0, "the lockout must drain, never latch");
     }
 }
