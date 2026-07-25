@@ -976,7 +976,21 @@ fn handover(
             // it while enabling suppression means moving from one peer to another
             // silently switches this machine's input back on — which looks exactly like
             // every machine responding at once.
-            drop(detached);
+            // Keep the SAME guard across a peer-to-peer hop.
+            //
+            // Dropping it reattaches the cursor to the mouse, and creating the next one
+            // detaches it again. Between those two calls the cursor is live, so every hop
+            // - Mac to iMac to laptop - opened a window where local movement showed on
+            // this machine. Measurement says the detach itself works from a daemon
+            // (`does_detaching_actually_freeze_the_cursor` reports FROZE), so these
+            // windows are what is left.
+            //
+            // The cursor only needs to be reattached when input comes *home*, which is
+            // the `Focus::Local` arm below.
+            if let Some(guard) = detached {
+                seam_input::macos::set_suppress_local(true);
+                return Some(guard);
+            }
             // Hiding is attempted, but `CGDisplayHideCursor` only affects the cursor for
             // a *foreground* application, and a daemon is not one — so it silently does
             // nothing here. The cursor is therefore parked out of the way instead, which
