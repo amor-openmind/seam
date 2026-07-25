@@ -9,7 +9,7 @@
 //! bugs in this software category.
 //!
 //! **`SendInput` blocked by UIPI fails silently.** Microsoft's own documentation is
-//! explicit: *"neither GetLastError nor the return value will indicate the failure was
+//! explicit: *"neither `GetLastError` nor the return value will indicate the failure was
 //! caused by UIPI blocking."* So when the user focuses an elevated window, injection
 //! stops with no error at all. seam therefore verifies by reading the cursor back, so it
 //! can say "input is being blocked by an elevated window" instead of appearing to work.
@@ -486,10 +486,13 @@ pub fn write_file_list(paths: &[std::path::PathBuf]) -> Result<(), Error> {
             return Err(Error::Platform("could not lock clipboard memory".into()));
         }
         core::ptr::copy_nonoverlapping(header.as_ptr().cast::<u8>(), locked.cast(), 20);
+        // Written as bytes: the header is 20 bytes long, so the wide list lands on an
+        // even offset, but a u16 copy through a u8 pointer is what the cast lint exists
+        // to stop - and byte-for-byte is identical on the wire.
         core::ptr::copy_nonoverlapping(
-            wide.as_ptr(),
-            locked.cast::<u8>().add(20).cast::<u16>(),
-            wide.len(),
+            wide.as_ptr().cast::<u8>(),
+            locked.cast::<u8>().add(20),
+            wide.len() * 2,
         );
         GlobalUnlock(mem);
 
@@ -506,4 +509,107 @@ pub fn write_file_list(paths: &[std::path::PathBuf]) -> Result<(), Error> {
         CloseClipboard();
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- elevation
+
+// SAFETY CONTRACT: token inspection and the documented UAC relaunch verb. Elevation is
+// what decides whether injection reaches elevated windows: Windows silently discards
+// input from a lower-integrity process (UIPI), so a non-elevated seam goes dead the
+// moment an admin PowerShell or Task Manager takes focus.
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn OpenProcessToken(
+        process: *mut core::ffi::c_void,
+        access: u32,
+        token: *mut *mut core::ffi::c_void,
+    ) -> i32;
+    fn GetTokenInformation(
+        token: *mut core::ffi::c_void,
+        class: u32,
+        info: *mut core::ffi::c_void,
+        len: u32,
+        needed: *mut u32,
+    ) -> i32;
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+}
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteW(
+        hwnd: *mut core::ffi::c_void,
+        verb: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show: i32,
+    ) -> isize;
+}
+
+/// Is this process running elevated?
+///
+/// Decides whether injection will reach elevated windows. UIPI failures are silent —
+/// no error, no return code — which is why this must be asked up front rather than
+/// discovered one dead pointer at a time.
+#[must_use]
+pub fn is_elevated() -> bool {
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION: u32 = 20; // TokenElevation
+    // SAFETY: documented token query on our own process; the handle is always closed.
+    unsafe {
+        let mut token = core::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) == 0 {
+            return false;
+        }
+        let mut elevation: u32 = 0;
+        let mut needed: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_ELEVATION,
+            (&raw mut elevation).cast(),
+            u32::try_from(core::mem::size_of::<u32>()).unwrap_or(4),
+            &raw mut needed,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation != 0
+    }
+}
+
+/// Relaunch this executable elevated, prompting UAC once.
+///
+/// `Ok(true)`: the elevated copy is starting and the caller should exit.
+/// `Ok(false)`: the user declined the prompt — carry on non-elevated, degraded.
+pub fn relaunch_elevated(args: &[String]) -> Result<bool, Error> {
+    use std::os::windows::ffi::OsStrExt;
+    let exe = std::env::current_exe()
+        .map_err(|e| Error::Platform(format!("cannot find this executable: {e}")))?;
+    let mut file: Vec<u16> = exe.as_os_str().encode_wide().collect();
+    file.push(0);
+    // Quote each argument; embedded quotes are not expected in seam's own flags.
+    let joined = args
+        .iter()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut params: Vec<u16> = std::ffi::OsString::from(joined).encode_wide().collect();
+    params.push(0);
+    let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+
+    // SAFETY: documented ShellExecuteW call with NUL-terminated wide strings.
+    let handle = unsafe {
+        ShellExecuteW(
+            core::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            core::ptr::null(),
+            1, // SW_SHOWNORMAL
+        )
+    };
+    // Values above 32 mean the launch happened; below are error codes, of which the
+    // only expected one here is the user pressing No on the UAC prompt.
+    Ok(handle > 32)
 }

@@ -77,6 +77,10 @@ enum Command {
         /// Port to listen on. Chosen by the OS unless given — you should not need this.
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// Windows: stay non-elevated instead of prompting UAC once at start. Input
+        /// injection then dies whenever an elevated window has focus (UIPI).
+        #[arg(long, default_value_t = false)]
+        no_elevate: bool,
         /// Also dial these addresses. Needed where an inbound firewall blocks discovery:
         /// dialling out is not blocked, so the link still forms.
         #[arg(long = "connect", value_name = "HOST:PORT")]
@@ -170,7 +174,33 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Forget { peer } => forget(&dir, &peer),
-        Command::Run { port, connect } => daemon(&dir, identity, port, connect).await,
+        Command::Run { port, connect, no_elevate } => {
+            #[cfg(target_os = "windows")]
+            if !no_elevate && !seam_input::windows::is_elevated() {
+                // UIPI is the reason: Windows silently discards injected input while an
+                // elevated window - an admin PowerShell, Task Manager - has focus, so a
+                // non-elevated seam goes dead exactly when those windows are used. One
+                // UAC prompt at startup buys injection that works everywhere but the
+                // secure desktop.
+                tracing::info!(
+                    "requesting administrator rights so input keeps working when an \
+                     elevated window has focus (--no-elevate to skip)"
+                );
+                let mut args: Vec<String> = std::env::args().skip(1).collect();
+                args.push("--no-elevate".into()); // the elevated copy must not loop
+                match seam_input::windows::relaunch_elevated(&args) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => tracing::warn!(
+                        "running without administrator rights: the pointer and keyboard \
+                         will freeze whenever an elevated window has focus"
+                    ),
+                    Err(e) => tracing::warn!("could not relaunch elevated: {e}"),
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = no_elevate;
+            daemon(&dir, identity, port, connect).await
+        }
     }
 }
 
@@ -266,6 +296,20 @@ fn doctor(dir: &std::path::Path, identity: &Identity) -> Result<()> {
     }
 
     report_input_forwarding();
+
+    // Windows only: whether injection survives elevated-window focus. UIPI failures are
+    // silent, so this is the one place they can be seen before they are felt.
+    #[cfg(target_os = "windows")]
+    {
+        println!("\n  elevation");
+        if seam_input::windows::is_elevated() {
+            println!("    elevated — injection reaches admin windows and Task Manager");
+        } else {
+            println!("    NOT ELEVATED — the pointer and keyboard freeze whenever an");
+            println!("    elevated window (admin PowerShell, Task Manager) has focus.");
+            println!("    'seam run' offers to fix this with one UAC prompt.");
+        }
+    }
 
     Ok(())
 }
@@ -1802,7 +1846,7 @@ mod tests {
 
     #[test]
     fn the_port_is_optional_and_defaults_to_os_chosen() {
-        let Command::Run { port, connect } = Cli::try_parse_from(["seam", "run"]).unwrap().command
+        let Command::Run { port, connect, .. } = Cli::try_parse_from(["seam", "run"]).unwrap().command
         else {
             panic!("expected run");
         };

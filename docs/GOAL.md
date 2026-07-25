@@ -371,6 +371,20 @@ exercised against the real German Apple keyboard on this fleet.
 
 ---
 
+### Resolved: elevated windows no longer kill injection (v0.2.2)
+
+Focusing an elevated window on Windows — an admin PowerShell, Task Manager — made the
+shared pointer and keyboard freeze there: UIPI silently discards injected input from a
+lower-integrity process, with no error anywhere. seam now detects a non-elevated start
+and relaunches itself once through UAC (`--no-elevate` opts out and the elevated copy
+passes it to itself so it cannot loop); `doctor` states the elevation and its exact
+consequence. Declining the prompt logs precisely what will freeze and when. Out of scope
+and said so: the secure desktop (the UAC prompt itself, Ctrl+Alt+Del) needs a signed
+UIAccess binary and stays local.
+
+This also retires the reliability goal's weakest point: it is now written down as R7 —
+**injection must survive elevated-window focus**.
+
 ## 11. Known gaps, precisely stated
 
 Recorded so the next session starts from evidence rather than rediscovery.
