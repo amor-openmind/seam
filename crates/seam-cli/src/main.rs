@@ -9,6 +9,10 @@
 mod layout;
 mod store;
 
+/// The target triple this binary was compiled for, so a cross-compiled build identifies
+/// itself precisely.
+const BUILD_TARGET: &str = env!("SEAM_BUILD_TARGET");
+
 use std::io::{BufRead as _, Write as _};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -45,6 +49,13 @@ enum Command {
     Pair {
         /// The peer to dial, by name. Omit to wait for an incoming request instead.
         peer: Option<String>,
+        /// Dial this address directly, e.g. `192.0.2.10:51820`, skipping discovery.
+        ///
+        /// Discovery needs to *receive* multicast, which a restrictive inbound firewall
+        /// blocks. Dialling out is almost never blocked, so this always works — and it is
+        /// the documented last tier of discovery, not a workaround.
+        #[arg(long, value_name = "HOST:PORT")]
+        at: Option<String>,
         #[arg(long, default_value_t = 60)]
         timeout: u64,
     },
@@ -86,8 +97,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Discover { r#for } => {
             discover(Duration::from_secs(r#for), identity.peer_id()).await
         }
-        Command::Pair { peer, timeout } => {
-            pair(&dir, identity, peer, Duration::from_secs(timeout)).await
+        Command::Pair { peer, at, timeout } => {
+            pair(&dir, identity, peer, at, Duration::from_secs(timeout)).await
         }
         Command::Peers => {
             peers(&dir);
@@ -104,6 +115,9 @@ fn doctor(dir: &std::path::Path, identity: &Identity) -> Result<()> {
     println!("seam doctor\n");
 
     println!("  this machine");
+    // Version first: the commonest support question is "which build is this?", and an
+    // old binary silently behaving like a new one wastes more time than any other bug.
+    println!("    seam         v{} ({})", env!("CARGO_PKG_VERSION"), BUILD_TARGET);
     println!("    name         {}", Discovery::default_display_name(identity.peer_id()));
     println!("    id           {}", identity.peer_id());
     println!("    fingerprint  {}", identity.fingerprint().to_grouped_hex());
@@ -237,6 +251,7 @@ async fn pair(
     dir: &std::path::Path,
     identity: Arc<Identity>,
     peer: Option<String>,
+    at: Option<String>,
     timeout: Duration,
 ) -> Result<()> {
     let mut store = store::load_peers(dir);
@@ -247,11 +262,24 @@ async fn pair(
     let mut discovery = Discovery::new()?;
     discovery.advertise(&name, identity.peer_id(), identity.fingerprint(), port)?;
 
-    let link = if let Some(query) = peer {
+    let link = if let Some(address) = at {
+        let target: SocketAddr = address
+            .parse()
+            .with_context(|| format!("{address:?} is not a HOST:PORT address"))?;
+        println!("Dialling {target} directly...");
+        endpoint.connect(target).await.map_err(anyhow::Error::from)
+    } else if let Some(query) = peer {
         dial_for_pairing(&endpoint, identity.peer_id(), &query, timeout).await
     } else {
         {
-            println!("Waiting for the other machine to run `seam pair {name}`...\n");
+            println!("Waiting for the other machine to connect.\n");
+            println!("  On the other machine run either:");
+            println!("      seam pair {name}");
+            println!("  or, if its firewall blocks discovery, dial this machine directly:");
+            for address in local_addresses(port) {
+                println!("      seam pair --at {address}");
+            }
+            println!();
             match tokio::time::timeout(timeout, endpoint.accept()).await {
                 Ok(Some(link)) => link.map_err(anyhow::Error::from),
                 Ok(None) => bail!("this machine stopped listening before anyone connected"),
@@ -338,6 +366,22 @@ async fn connect_any(endpoint: &Endpoint, addresses: &[SocketAddr]) -> Result<Li
         return Err(e.into());
     }
     bail!("that machine advertised no reachable address")
+}
+
+/// Addresses another machine could dial this one on.
+fn local_addresses(port: u16) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for probe in ["8.8.8.8:9", "192.168.0.1:9", "10.0.0.1:9"] {
+        let Ok(target) = probe.parse::<SocketAddr>() else { continue };
+        let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else { continue };
+        if socket.connect(target).is_ok()
+            && let Ok(local) = socket.local_addr()
+            && !out.iter().any(|a: &SocketAddr| a.ip() == local.ip())
+        {
+            out.push(SocketAddr::new(local.ip(), port));
+        }
+    }
+    out
 }
 
 fn confirm(prompt: &str) -> Result<bool> {

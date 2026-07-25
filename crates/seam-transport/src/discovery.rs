@@ -131,7 +131,10 @@ impl Discovery {
         let instance = format!("seam-{peer_id}");
 
         let properties = [
-            (PROP_PEER_ID, peer_id.to_string()),
+            // The FULL id, not the short display form. Advertising the 8-character
+            // display form and then comparing it against a full 16-byte PeerId can never
+            // match, which made a machine unable to recognise its own advertisement.
+            (PROP_PEER_ID, hex(&peer_id.0)),
             (PROP_FINGERPRINT, hex(fingerprint.as_bytes())),
             (PROP_PROTOCOL, seam_proto::PROTOCOL_VERSION.to_string()),
             (PROP_NAME, name.to_owned()),
@@ -283,7 +286,7 @@ fn resolve(info: &mdns_sd::ResolvedService) -> DiscoveredPeer {
     addresses.sort_by_key(|a| (a.is_ipv6(), a.to_string()));
 
     DiscoveredPeer {
-        advertised_peer_id: info.get_property_val_str(PROP_PEER_ID).and_then(parse_peer_id_prefix),
+        advertised_peer_id: info.get_property_val_str(PROP_PEER_ID).and_then(parse_peer_id),
         advertised_fingerprint: info
             .get_property_val_str(PROP_FINGERPRINT)
             .and_then(parse_fingerprint),
@@ -297,10 +300,9 @@ fn resolve(info: &mdns_sd::ResolvedService) -> DiscoveredPeer {
     }
 }
 
-/// The advertised id is the short display form, so it only pins the first 4 bytes.
-/// That is enough to correlate a record with a known peer for display; the full identity
-/// comes from the handshake.
-fn parse_peer_id_prefix(text: &str) -> Option<PeerId> {
+/// Parse an advertised peer id. Shorter values are accepted and zero-padded so an older
+/// peer advertising the short form still correlates, rather than vanishing from the list.
+fn parse_peer_id(text: &str) -> Option<PeerId> {
     let bytes = unhex(text)?;
     let mut id = [0u8; 16];
     if bytes.len() > id.len() {
