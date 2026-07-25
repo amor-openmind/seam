@@ -1255,6 +1255,11 @@ fn note_transfer(what: &str, detail: String) {
     }
 }
 
+/// Each peer's seam version, learned from its announcement. A fleet must run matching
+/// versions, and until this existed the page could only say "version unknown".
+static UI_VERSIONS: std::sync::Mutex<Vec<(seam_proto::PeerId, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// What each peer can do — capture and share input, or only replay it. Learned from
 /// the peer's own announcement, never assumed.
 static UI_ROLES: std::sync::Mutex<Vec<(seam_proto::PeerId, &'static str)>> =
@@ -1559,6 +1564,47 @@ fn strip_ansi(line: &str) -> String {
 static UI_UPDATE: std::sync::Mutex<Option<(String, String, String)>> =
     std::sync::Mutex::new(None);
 
+/// Show a native notification. Best effort and deliberately silent on failure: a machine
+/// that cannot post a notification must still run seam.
+fn notify(title: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        // osascript rather than a notification crate: no dependency, and it degrades to
+        // nothing on a machine where notifications are refused.
+        let script = format!(
+            "display notification {} with title {}",
+            applescript_string(body),
+            applescript_string(title)
+        );
+        let _ = std::process::Command::new("osascript").args(["-e", &script]).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, \
+             ContentType=WindowsRuntime] | Out-Null; \
+             $t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(0); \
+             $t.GetElementsByTagName('text').Item(0).AppendChild($t.CreateTextNode('{}'))|Out-Null; \
+             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('seam')\
+             .Show([Windows.UI.Notifications.ToastNotification]::new($t))",
+            format!("{title} — {body}").replace('\'', "")
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .spawn();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (title, body);
+    }
+}
+
+/// Quote a string for `AppleScript`, where the only escape that matters is the quote itself.
+#[cfg(target_os = "macos")]
+fn applescript_string(text: &str) -> String {
+    format!("\"{}\"", text.replace(['\\', '"'], ""))
+}
+
 /// Poll the public releases repo so the update page can react rather than be read.
 ///
 /// The daemon does the looking, not the page: a browser cannot reach the releases API
@@ -1586,16 +1632,39 @@ fn start_update_watch() {
             };
             let body = String::from_utf8_lossy(&output.stdout);
             // Two fields, so a hand-rolled read rather than a JSON dependency for this.
+            // GitHub pretty-prints its JSON, so the colon is followed by a space:
+            // `"tag_name": "v0.7.1"`. Matching `"tag_name":"` found nothing and the check
+            // silently never succeeded, which the page reported for hours as "not checked
+            // yet" — a parser that fails closed and says nothing is worse than one that
+            // errors.
             let field = |key: &str| -> Option<String> {
-                let needle = format!("\"{key}\":\"");
-                let start = body.find(&needle)? + needle.len();
-                let rest = &body[start..];
-                let end = rest.find('"')?;
-                Some(rest[..end].to_owned())
+                let at = body.find(&format!("\"{key}\""))?;
+                let rest = &body[at..];
+                let colon = rest.find(':')?;
+                let open = rest[colon..].find('"')? + colon + 1;
+                let end = rest[open..].find('"')? + open;
+                Some(rest[open..end].to_owned())
             };
             let Some(tag) = field("tag_name") else { continue };
             let latest = tag.trim_start_matches('v').to_owned();
             let published = field("published_at").unwrap_or_default();
+            // Say it out loud, once per version. A page nobody has open cannot tell
+            // anyone anything, and a fleet that must run matching versions needs the
+            // machine to speak up rather than wait to be visited.
+            let is_new = latest != env!("CARGO_PKG_VERSION");
+            let already_told = UI_UPDATE
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone())
+                .is_some_and(|(seen, _, _)| seen == latest);
+            if is_new && !already_told {
+                tracing::warn!(
+                    latest = %latest,
+                    running = env!("CARGO_PKG_VERSION"),
+                    "a newer seam is available — every machine must run the same version"
+                );
+                notify(&format!("seam {latest} is available"), "Every machine must run the same version.");
+            }
             if let Ok(mut slot) = UI_UPDATE.lock() {
                 *slot = Some((latest, published, tag));
             }
@@ -1623,15 +1692,17 @@ fn lan_address() -> Option<String> {
 /// added afterwards joins it; deriving this fresh each time would let it flip whenever
 /// connections raced.
 fn first_machine(dir: &std::path::Path) -> bool {
-    if dir.join("first-machine").exists() {
-        return true;
-    }
     if dir.join("joined").exists() {
         return false;
     }
-    let alone = store::pairing_order(dir).is_empty();
-    let _ = std::fs::write(dir.join(if alone { "first-machine" } else { "joined" }), "");
-    alone
+    // Anything else is the machine seam was installed on. Having paired peers does NOT
+    // make a machine a client — the original server has more pairings than anyone, and
+    // reading them as evidence of joining relabelled it as a client on its own fleet.
+    // Only dialling out marks a machine as joined, and `daemon` writes that when it does.
+    if !dir.join("first-machine").exists() {
+        let _ = std::fs::write(dir.join("first-machine"), "");
+    }
+    true
 }
 
 /// The licence, as the page sees it: who it is for, and when it stops.
@@ -1705,8 +1776,13 @@ async fn ui_state_json(
         let enabled = UI_DISABLED.lock().is_ok_and(|off| !off.contains(&peer));
         let _ = write!(
             peers,
-            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}","role":"{role}","enabled":{enabled}}}"#,
-            link.remote_address()
+            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}","role":"{role}","enabled":{enabled},"version":"{}"}}"#,
+            link.remote_address(),
+            UI_VERSIONS
+                .lock()
+                .ok()
+                .and_then(|v| v.iter().find(|(p, _)| *p == peer).map(|(_, ver)| ver.clone()))
+                .unwrap_or_default()
         );
     }
 
@@ -2505,7 +2581,12 @@ async fn announce_geometry(link: &Link) {
     let hello = seam_proto::Frame::Hello(seam_proto::Hello {
         version: seam_proto::PROTOCOL_VERSION,
         peer: seam_proto::PeerId::NIL,
-        name: String::new(),
+        // The display name carries this machine's seam version after a tab. The field is
+        // already free-form display text, so this needs no new frame and no protocol
+        // change — and a fleet that must run matching versions has no way to show which
+        // machine is behind without it. Older peers send a bare name and are reported as
+        // an unknown version rather than assumed to match.
+        name: format!("\t{}", env!("CARGO_PKG_VERSION")),
         width: u32::try_from(bb.width).unwrap_or(0),
         height: u32::try_from(bb.height).unwrap_or(0),
         scale: desktop.primary().map_or(256, |d| d.scale),
@@ -2894,6 +2975,12 @@ async fn receive_reliable(
                 if w > 0 && h > 0 {
                     tracing::info!(%peer, w, h, "peer reported its screen size");
                     geometry.lock().await.insert(peer, (w, h));
+                    if let Some((_, version)) = hello.name.split_once('\t')
+                        && let Ok(mut versions) = UI_VERSIONS.lock()
+                    {
+                        versions.retain(|(p, _)| *p != peer);
+                        versions.push((peer, version.to_owned()));
+                    }
                 }
             }
             Ok(_) => {}
