@@ -1346,6 +1346,40 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Binary design assets referenced by the mirrored pages.
+///
+/// Kept separate from `UI_PAGES` so text remains embedded with `include_str!` (and is
+/// therefore UTF-8 checked at compile time) while images retain their exact bytes.
+const UI_ASSETS: &[(&str, &[u8], &str)] = &[
+    (
+        "/_ds/assets/logo/seam-logo-32.png",
+        include_bytes!("../ui/_ds/assets/logo/seam-logo-32.png"),
+        "image/png",
+    ),
+    (
+        "/_ds/assets/logo/seam-logo-128.png",
+        include_bytes!("../ui/_ds/assets/logo/seam-logo-128.png"),
+        "image/png",
+    ),
+];
+
+fn ui_asset_response(request: &str, path: &str, port: u16) -> Option<Vec<u8>> {
+    let (_, asset, content_type) = UI_ASSETS.iter().find(|(route, _, _)| *route == path)?;
+    let (status, content_type, body): (&str, &str, &[u8]) = if request_is_local(request, port) {
+        ("200 OK", content_type, asset)
+    } else {
+        ("403 Forbidden", "text/plain", b"refused")
+    };
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len(),
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    Some(response)
+}
+
 /// Serve the fleet UI on a loopback port, and record the port for `seam ui`.
 ///
 /// Loopback only, read-only, no external requests possible. Hand-rolled GET handling
@@ -1403,6 +1437,10 @@ fn start_ui_server(
                 }
                 let request = String::from_utf8_lossy(&buf);
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
+                if let Some(response) = ui_asset_response(&request, path, port) {
+                    let _ = socket.write_all(&response).await;
+                    return;
+                }
                 let (status, ctype, body) =
                     route(
                         &request,
@@ -1458,7 +1496,12 @@ fn request_is_local(request: &str, port: u16) -> bool {
 
 #[cfg(test)]
 mod ui_origin {
-    use super::request_is_local;
+    use super::{
+        UI_ASSETS, UI_PAGES, request_is_local, serve_activation_only, start_ui_server,
+        ui_asset_response,
+    };
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     fn get(headers: &str) -> String {
         format!("POST /action/quit HTTP/1.1\r\n{headers}\r\n\r\n")
@@ -1492,6 +1535,136 @@ mod ui_origin {
     fn a_non_browser_caller_is_allowed() {
         // curl and scripts send no Origin; they already run as the user.
         assert!(request_is_local(&get("Host: 127.0.0.1:5000"), 5000));
+    }
+
+    #[test]
+    fn every_embedded_logo_is_a_real_png() {
+        assert_eq!(UI_ASSETS.len(), 2);
+        for (path, bytes, content_type) in UI_ASSETS {
+            assert!(
+                std::path::Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+            );
+            assert_eq!(*content_type, "image/png");
+            assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+            assert!(bytes.len() > 100, "{path} is unexpectedly small");
+        }
+    }
+
+    #[test]
+    fn an_embedded_logo_response_preserves_the_exact_png_bytes() {
+        let path = UI_ASSETS[0].0;
+        let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:5000\r\n\r\n");
+        let response = ui_asset_response(&request, path, 5000).expect("known logo route");
+        let split = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP response has a header terminator");
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n"));
+        assert_eq!(&response[split + 4..], UI_ASSETS[0].1);
+    }
+
+    #[test]
+    fn an_embedded_logo_refuses_a_foreign_origin() {
+        let path = UI_ASSETS[0].0;
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:5000\r\nOrigin: https://evil.example\r\n\r\n"
+        );
+        let response = ui_asset_response(&request, path, 5000).expect("known logo route");
+        assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"));
+        assert!(response.ends_with(b"\r\n\r\nrefused"));
+    }
+
+    #[test]
+    fn a_non_asset_path_stays_with_the_text_router() {
+        assert!(ui_asset_response("GET / HTTP/1.1\r\n\r\n", "/", 5000).is_none());
+    }
+
+    async fn wait_for_ui_port(dir: &std::path::Path) -> u16 {
+        for _ in 0..100 {
+            if let Ok(port) = std::fs::read_to_string(dir.join("ui-port"))
+                && let Ok(port) = port.trim().parse()
+            {
+                return port;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("UI server did not publish its port");
+    }
+
+    async fn fetch(port: u16, path: &str) -> Vec<u8> {
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("test UI server accepts a loopback connection");
+        socket
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes())
+            .await
+            .expect("request writes");
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response).await.expect("response reads");
+        response
+    }
+
+    #[tokio::test]
+    async fn fleet_server_serves_the_embedded_logo() {
+        let dir = std::env::temp_dir().join(format!("seam-logo-fleet-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test state directory");
+        start_ui_server(
+            dir.clone(),
+            "test".to_owned(),
+            seam_proto::PeerId([1; 16]),
+            24810,
+            Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        );
+        let port = wait_for_ui_port(&dir).await;
+        let response = fetch(port, UI_ASSETS[0].0).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n"));
+        assert!(response.ends_with(UI_ASSETS[0].1));
+        std::fs::remove_dir_all(dir).expect("test state directory removes");
+    }
+
+    #[tokio::test]
+    async fn activation_server_serves_the_embedded_logo() {
+        let dir =
+            std::env::temp_dir().join(format!("seam-logo-activation-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test state directory");
+        let server_dir = dir.clone();
+        let server = tokio::spawn(async move { serve_activation_only(&server_dir, false).await });
+        let port = wait_for_ui_port(&dir).await;
+        let response = fetch(port, UI_ASSETS[1].0).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n"));
+        assert!(response.ends_with(UI_ASSETS[1].1));
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(dir).expect("test state directory removes");
+    }
+
+    #[test]
+    fn every_html_page_uses_the_embedded_favicon() {
+        let pages: Vec<_> = UI_PAGES
+            .iter()
+            .filter(|(_, _, content_type)| content_type.starts_with("text/html"))
+            .collect();
+        assert!(!pages.is_empty());
+        for (path, html, _) in pages {
+            assert!(
+                html.contains(r#"href="_ds/assets/logo/seam-logo-32.png""#),
+                "{path} has no seam favicon"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_brand_surfaces_use_the_full_lockup() {
+        for path in ["/", "/index.html", "/onboarding.html", "/licence.html"] {
+            let (_, html, _) = UI_PAGES
+                .iter()
+                .find(|(route, _, _)| *route == path)
+                .expect("primary brand page must be embedded");
+            assert!(html.contains(r#"class="brand-lockup""#), "{path}");
+            assert!(html.contains("seam-logo-128.png"), "{path}");
+        }
     }
 }
 
@@ -2045,6 +2218,10 @@ async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result
                     let request = String::from_utf8_lossy(&buf[..n]);
                     let path = request.split_whitespace().nth(1).unwrap_or("/");
                     let method = request.split_whitespace().next().unwrap_or("GET");
+                    if let Some(response) = ui_asset_response(&request, path, port) {
+                        let _ = socket.write_all(&response).await;
+                        return;
+                    }
 
                     let (status, ctype, body) = if !request_is_local(&request, port) {
                         ("403 Forbidden", "text/plain", "refused".to_owned())
