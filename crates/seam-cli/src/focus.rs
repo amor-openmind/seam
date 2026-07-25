@@ -491,3 +491,155 @@ mod tests {
         assert_eq!(Edge::parse("sideways"), None);
     }
 }
+
+#[cfg(test)]
+mod round_trip {
+    //! Simulation of the daemon's actual event loop.
+    //!
+    //! These exist because a series of regressions all shared one shape: each was correct
+    //! in isolation and wrong in sequence. Testing `apply_motion` alone cannot catch them,
+    //! because the daemon does two things per event — adopt the OS cursor while local, then
+    //! apply movement — and the bugs lived in the interaction.
+    //!
+    //! The simulated OS cursor behaves like the real one: it tracks movement while input is
+    //! local, and **freezes** once the pointer leaves, because the daemon detaches it.
+
+    use super::*;
+
+    fn imac() -> PeerId {
+        PeerId([1; 16])
+    }
+
+    /// Stands in for the daemon loop and the OS cursor together.
+    struct Machine {
+        graph: Graph,
+        /// Where macOS thinks the cursor is.
+        cursor: (i32, i32),
+        width: i32,
+        height: i32,
+    }
+
+    impl Machine {
+        fn new() -> Self {
+            let (width, height) = (2560, 1080);
+            let mut graph = Graph::new(width, height);
+            graph.place(imac(), Edge::Left, None, 1920, 1080);
+            Self { graph, cursor: (width / 2, height / 2), width, height }
+        }
+
+        /// One mouse movement, processed exactly as the daemon processes it.
+        fn r#move(&mut self, dx: i32, dy: i32) -> Update {
+            let local_before = self.graph.focus() == Focus::Local;
+            if local_before {
+                // The OS moves its own cursor, clamped to the screen.
+                self.cursor.0 = (self.cursor.0 + dx).clamp(0, self.width - 1);
+                self.cursor.1 = (self.cursor.1 + dy).clamp(0, self.height - 1);
+            }
+            // The daemon adopts the OS position while local, then applies movement.
+            self.graph.sync_local_cursor(self.cursor.0, self.cursor.1);
+            let update = self.graph.apply_motion(dx, dy);
+
+            if update.changed && update.focus == Focus::Local {
+                // Returning focus warps the real cursor to match the layout.
+                self.cursor = (update.x, update.y);
+            }
+            update
+        }
+    }
+
+    #[test]
+    fn the_pointer_leaves_and_comes_back() {
+        // The whole round trip, which is what kept breaking.
+        let mut m = Machine::new();
+
+        // Walk left to the edge, then across.
+        let mut crossed = false;
+        for _ in 0..100 {
+            if m.r#move(-40, 0).focus != Focus::Local {
+                crossed = true;
+                break;
+            }
+        }
+        assert!(crossed, "the pointer never left this machine");
+
+        // Walk back right.
+        let mut returned = false;
+        for _ in 0..100 {
+            if m.r#move(40, 0).focus == Focus::Local {
+                returned = true;
+                break;
+            }
+        }
+        assert!(returned, "the pointer never came back to this machine");
+    }
+
+    #[test]
+    fn it_survives_many_round_trips() {
+        // A one-way bug can pass a single crossing and fail on the second.
+        let mut m = Machine::new();
+        for trip in 0..5 {
+            let mut left = false;
+            for _ in 0..200 {
+                if m.r#move(-40, 0).focus != Focus::Local {
+                    left = true;
+                    break;
+                }
+            }
+            assert!(left, "failed to leave on trip {trip}");
+
+            let mut back = false;
+            for _ in 0..200 {
+                if m.r#move(40, 0).focus == Focus::Local {
+                    back = true;
+                    break;
+                }
+            }
+            assert!(back, "failed to return on trip {trip}");
+        }
+    }
+
+    #[test]
+    fn the_pointer_does_not_oscillate_at_the_boundary() {
+        // Coming back, small movements must not flip focus every event — the narrow band
+        // along the shared edge where the pointer appeared to be on both machines.
+        let mut m = Machine::new();
+        while m.graph.focus() == Focus::Local {
+            m.r#move(-40, 0);
+        }
+        while m.graph.focus() != Focus::Local {
+            m.r#move(40, 0);
+        }
+
+        let mut flips = 0;
+        for _ in 0..40 {
+            if m.r#move(2, 0).changed {
+                flips += 1;
+            }
+        }
+        assert_eq!(flips, 0, "focus flipped {flips} times while moving away from the edge");
+    }
+
+    #[test]
+    fn moving_within_this_machine_never_hands_over() {
+        let mut m = Machine::new();
+        for _ in 0..30 {
+            let update = m.r#move(10, 5);
+            assert_eq!(update.focus, Focus::Local);
+            assert!(!update.changed);
+        }
+    }
+
+    #[test]
+    fn the_returning_pointer_lands_on_this_machine() {
+        let mut m = Machine::new();
+        while m.graph.focus() == Focus::Local {
+            m.r#move(-40, 0);
+        }
+        let mut update = m.r#move(40, 0);
+        while update.focus != Focus::Local {
+            update = m.r#move(40, 0);
+        }
+        assert!(update.x >= 0 && update.x < 2560, "landed off-screen at x={}", update.x);
+        assert!(update.y >= 0 && update.y < 1080, "landed off-screen at y={}", update.y);
+    }
+}
