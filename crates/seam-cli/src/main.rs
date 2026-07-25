@@ -63,6 +63,11 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         timeout: u64,
     },
+    /// Give this machine its mouse and keyboard back.
+    ///
+    /// For when seam, or anything else, exited while input was handed to another machine
+    /// and left this one unable to respond.
+    Release,
     /// List the machines this one has paired with.
     Peers,
     /// Remove a pairing.
@@ -107,6 +112,11 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Pair { peer, at, timeout } => {
             pair(&dir, identity, peer, at, Duration::from_secs(timeout)).await
+        }
+        Command::Release => {
+            seam_input::release_input();
+            println!("This machine's mouse and keyboard are active again.");
+            Ok(())
         }
         Command::Peers => {
             peers(&dir);
@@ -470,6 +480,16 @@ async fn daemon(
     port: u16,
     connect: Vec<String>,
 ) -> Result<()> {
+    // Clear any input state a previous run left behind, before doing anything else.
+    //
+    // CGAssociateMouseAndMouseCursorPosition(false) **survives process death**: if seam
+    // ever exits while the pointer is on a peer — Ctrl+C at the wrong moment, a crash, a
+    // kill — this machine's cursor stays detached from its mouse, and every later run
+    // inherits a Mac whose mouse does not work. This is precisely how another KVM
+    // stranded the pointer on this machine, and starting from a known-good state is the
+    // only reliable defence, because the process that broke it is already gone.
+    seam_input::release_input();
+
     let store = Arc::new(store::load_peers(dir));
     let endpoint =
         Arc::new(Endpoint::bind(Arc::clone(&identity), format!("0.0.0.0:{port}").parse()?)?);
@@ -554,6 +574,7 @@ async fn daemon(
     tracing::info!("shutting down");
     // Never exit while this machine is still withholding its own input.
     seam_input::release_input();
+    tracing::info!("this machine's input restored");
     discovery.shutdown();
     endpoint.close();
     accepting.abort();
@@ -902,6 +923,22 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geom
                     && u.changed
                 {
                     detached = handover(u, detached);
+                }
+
+                // Log the captured event and the resulting focus *before* deciding
+                // whether to forward it. Logging only after the "focus is local" branch
+                // meant that when something went wrong — no crossing, no return — the log
+                // was completely silent, which is the opposite of what a diagnostic is
+                // for. `SEAM_LOG=seam=debug` now shows every event and where it went.
+                if let Some(u) = update {
+                    tracing::debug!(
+                        x = u.x,
+                        y = u.y,
+                        focus = ?u.focus,
+                        changed = u.changed,
+                        suppressing = seam_input::macos::is_suppressing_local(),
+                        "pointer"
+                    );
                 }
 
                 let Some(target) = (match graph.focus() {
