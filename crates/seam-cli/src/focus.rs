@@ -349,7 +349,22 @@ impl Graph {
 /// A margin makes the boundary hysteretic: having crossed, the pointer must be moved
 /// deliberately back through the margin to cross again. Every KVM needs some form of this;
 /// Barrier calls it a switch delay.
-const ENTRY_MARGIN: i32 = 12;
+const ENTRY_MARGIN: i32 = 80;
+
+// Why 80 and not 12.
+//
+// 12 px was chosen as "just off the boundary", which is the right idea measured against
+// the wrong thing. A mouse moving at speed reports 30-60 px in a single event, so a
+// pointer landing 12 px inside was carried straight back out by the very next one. The
+// crossing lockout then bounded how fast that could repeat, and the log showed exactly
+// that: a bounce every 180 ms - the lockout period - instead of every 20 ms. Rate-limiting
+// an oscillation is not stopping it.
+//
+// 80 px is more than one fast event's travel, so no single event can re-cross, while
+// staying well under one deliberate movement of the hand. Coming back is still one small
+// push, which matters: an earlier attempt to make the boundary sticky by direction meant
+// the pointer had to be walked away from the edge before it could leave, and that felt
+// like the machine refusing to give the pointer back.
 
 /// How many events to ignore the OS cursor for after a crossing.
 ///
@@ -363,6 +378,7 @@ const SETTLING_EVENTS: u8 = 5;
 /// than a deliberate move back. It bounds how fast focus can change no matter how fast the
 /// mouse moves, which a distance margin cannot do.
 const CROSSING_LOCKOUT: u8 = 8;
+
 
 /// Map a position along an edge onto a screen of a different size, so a 1080-tall screen
 /// and a 2160-tall one line up proportionally rather than by raw pixel row.
@@ -805,7 +821,11 @@ mod entry_position {
         g.sync_local_cursor(0, 540);
         let update = g.apply_motion(-1, 0);
         assert_eq!(update.focus, Focus::Remote(imac()));
-        assert_eq!(update.x, 1907, "arrives a margin inside the far edge, not on it");
+        assert_eq!(
+            update.x,
+            1919 - ENTRY_MARGIN,
+            "arrives a margin inside the far edge, not on it"
+        );
     }
 
     #[test]
@@ -816,7 +836,11 @@ mod entry_position {
         g.sync_local_cursor(0, 540);
         let update = g.apply_motion(-800, 0);
         assert_eq!(update.focus, Focus::Remote(imac()));
-        assert_eq!(update.x, 1907, "a margin inside the far edge, regardless of overshoot");
+        assert_eq!(
+            update.x,
+            1919 - ENTRY_MARGIN,
+            "a margin inside the far edge, regardless of overshoot"
+        );
     }
 
     #[test]
