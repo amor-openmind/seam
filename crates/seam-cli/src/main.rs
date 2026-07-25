@@ -84,6 +84,10 @@ enum Command {
         /// injection then dies whenever an elevated window has focus (UIPI).
         #[arg(long, default_value_t = false)]
         no_elevate: bool,
+        /// Do not open the fleet page in a browser after starting — for headless or
+        /// scripted runs. By default, launching seam shows you seam.
+        #[arg(long, default_value_t = false)]
+        no_ui: bool,
         /// Also dial these addresses. Needed where an inbound firewall blocks discovery:
         /// dialling out is not blocked, so the link still forms.
         #[arg(long = "connect", value_name = "HOST:PORT")]
@@ -182,8 +186,8 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Forget { peer } => forget(&dir, &peer),
         Command::Ui => open_ui(&dir),
-        Command::Run { port, connect, no_elevate } => {
-            run_daemon(&dir, identity, port, connect, no_elevate, false).await
+        Command::Run { port, connect, no_elevate, no_ui } => {
+            run_daemon(&dir, identity, port, connect, no_elevate, !no_ui).await
         }
     }
 }
@@ -996,10 +1000,12 @@ fn start_ui_server(
         }
         tracing::info!(port, "fleet page ready — 'seam ui' opens it");
 
+        let ui_port_note = dir.join("ui-port");
         loop {
             let Ok((mut socket, _)) = listener.accept().await else { continue };
             let links = Arc::clone(&links);
             let name = name.clone();
+            let ui_port_note = ui_port_note.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = [0u8; 1024];
@@ -1008,7 +1014,18 @@ fn start_ui_server(
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
 
                 let method = request.split_whitespace().next().unwrap_or("GET");
-                let (status, ctype, body) = if method == "POST" && path == "/action/release" {
+                let (status, ctype, body) = if method == "POST" && path == "/action/quit" {
+                    // Respond first, then die: the page needs the reply to close its tab.
+                    tracing::info!("quit requested from the fleet page");
+                    let note = ui_port_note.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        seam_input::release_input();
+                        let _ = std::fs::remove_file(note);
+                        std::process::exit(0);
+                    });
+                    ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+                } else if method == "POST" && path == "/action/release" {
                     UI_RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
                     ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
                 } else if path == "/state" {

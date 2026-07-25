@@ -30,8 +30,6 @@
     (s.peers || []).forEach(function (p) {
       var slot = slotFor(p.edge);
       if (!slot) return;
-      var name = slot.querySelector(".name");
-      if (name && name.childNodes.length && p.name) name.childNodes[0].nodeValue = p.name === short(p.id) ? name.childNodes[0].nodeValue : p.name;
       if (s.focus === short(p.id)) slot.classList.add("holding");
     });
 
@@ -60,10 +58,22 @@
     fetch("/state").then(function (r) { return r.json(); }).then(apply).catch(function () {});
   }
 
+  function closeTab() {
+    // Best effort: browsers allow close() for fresh tabs (history length 1), which is
+    // exactly what the daemon opens. When blocked, the stopped message below remains.
+    try { window.close(); } catch (ignored) {}
+  }
+
   document.addEventListener("click", function (event) {
-    var btn = event.target.closest && event.target.closest("[data-action=release]");
-    if (!btn) return;
-    fetch("/action/release", { method: "POST" }).then(tick).catch(function () {});
+    var closest = event.target.closest ? event.target.closest.bind(event.target) : function () { return null; };
+    if (closest("[data-action=release]")) {
+      fetch("/action/release", { method: "POST" }).then(tick).catch(function () {});
+    } else if (closest("[data-action=quit]")) {
+      fetch("/action/quit", { method: "POST" }).then(closeTab, closeTab);
+      var mach = document.querySelector("header.top .machine");
+      if (mach) mach.innerHTML = "seam stopped<br>launch the app to start again";
+      setTimeout(closeTab, 400);
+    }
   });
 
   tick();
