@@ -4,6 +4,7 @@
 //! and nothing here is ever hand-edited — see goal Z1.
 
 use std::fs;
+#[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 

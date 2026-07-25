@@ -16,12 +16,18 @@
 //! platform backends exist — reported honestly rather than guessed, because a *wrong*
 //! layout name is worse than no layout name.
 
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// The active keyboard layout, as the OS names it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Layout {
     /// The OS's identifier, e.g. `com.apple.keylayout.German-DIN-2137`.
+    ///
+    /// Unused on platforms whose detection is not written yet; it becomes live there the
+    /// moment their backend lands, so silencing the lint is preferable to pretending the
+    /// variant does not exist.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Known { id: String, display: String },
     /// Not detectable on this platform yet, with the reason.
     Unknown { why: String },

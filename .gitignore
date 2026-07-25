@@ -2,3 +2,6 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Cross-compiled binaries staged for copying to other machines.
+/dist

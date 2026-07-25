@@ -1,0 +1,12 @@
+# Cross-compilation linkers.
+#
+# Building the Windows binary from macOS keeps installation on the target machines to
+# "copy one file" (goal Z7) — no Rust toolchain, no Visual Studio, no cmake. This is
+# possible because seam uses `ring` rather than `aws-lc-rs`, which would need cmake and
+# NASM on the Windows side.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+
+[target.aarch64-pc-windows-gnullvm]
+linker = "aarch64-w64-mingw32-gcc"
