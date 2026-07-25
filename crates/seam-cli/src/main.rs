@@ -654,14 +654,25 @@ async fn receive_from(link: Arc<Link>, geometry: Geometry, clipboard: Clipboard)
 /// Detaching stops the cursor tracking the mouse, but it stays wherever it was — usually
 /// mid-screen, where it looks like a second pointer. Parking it in the bottom-right corner
 /// makes it unobtrusive without needing foreground status, which a daemon does not have.
+/// Called once per handover, never per event.
+///
+/// An earlier version re-parked on every motion event, which enumerated the displays
+/// (`CGGetActiveDisplayList`) 50-100 times a second on the input path and wedged the
+/// machine's mouse and keyboard. Nothing that walks the OS display list belongs on a path
+/// that runs per event.
 #[cfg(target_os = "macos")]
 fn park_cursor() {
-    let Ok(desktop) = seam_input::desktop() else { return };
-    let bb = desktop.bounding_box();
-    if bb.is_empty() {
-        return;
+    use std::sync::OnceLock;
+    // The corner is resolved once. A display reconfiguration would move it, which is worth
+    // far less than keeping this off the hot path.
+    static CORNER: OnceLock<Option<(i32, i32)>> = OnceLock::new();
+    let corner = *CORNER.get_or_init(|| {
+        let bb = seam_input::desktop().ok()?.bounding_box();
+        (!bb.is_empty()).then(|| (bb.right() - 1, bb.bottom() - 1))
+    });
+    if let Some((x, y)) = corner {
+        let _ = seam_input::warp_cursor(x, y);
     }
-    let _ = seam_input::warp_cursor(bb.right() - 1, bb.bottom() - 1);
 }
 
 /// Shared clipboard state.
@@ -1071,15 +1082,6 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geom
                         suppressing = seam_input::macos::is_suppressing_local(),
                         "pointer"
                     );
-                }
-
-                // Re-park on every event. If the detach failed — or the OS moved the
-                // cursor for some other reason — this keeps it pinned rather than letting
-                // it wander visibly while another machine has the pointer.
-                if matches!(graph.focus(), Focus::Remote(_))
-                    && matches!(event, Observed::Motion { .. })
-                {
-                    park_cursor();
                 }
 
                 let Some(target) = (match graph.focus() {
