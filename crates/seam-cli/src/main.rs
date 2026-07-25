@@ -726,7 +726,14 @@ fn handover(
             // silently switches this machine's input back on — which looks exactly like
             // every machine responding at once.
             drop(detached);
-            let guard = seam_input::macos::CursorGuard::detach(false).ok();
+            // Hide the cursor as well as freezing it. Left visible it sits at the edge
+            // while the real pointer is on another screen, so the user sees two cursors
+            // and cannot tell which one has input.
+            //
+            // The guard drains the hide refcount on every exit path, because an
+            // unbalanced hide leaves the machine with no cursor at all — much worse than
+            // a stray one.
+            let guard = seam_input::macos::CursorGuard::detach(true).ok();
             seam_input::macos::set_suppress_local(true);
             guard
         }
