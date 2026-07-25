@@ -22,7 +22,11 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-seam-input = { version = "0.4.5", path = "../seam-input" }
+# Ed25519 for licence verification. Already in the tree via rustls, and it builds on
+# every target with no system dependencies.
+ring = "0.17"
+hex = "0.4"
+seam-input = { version = "0.5.0", path = "../seam-input" }
 
 [lints]
 workspace = true

@@ -10,6 +10,7 @@
 /// layout to reason about: it acts on whatever the owner sends it.
 #[cfg(target_os = "macos")]
 mod focus;
+mod licence;
 mod layout;
 mod store;
 
@@ -75,6 +76,12 @@ enum Command {
     /// Run the daemon: advertise this machine and keep links to paired peers.
     /// Open the live fleet page served by the running daemon.
     Ui,
+
+    /// Enter the licence that lets this machine run seam.
+    Activate {
+        /// The licence issued to you, beginning `seam-`.
+        key: String,
+    },
 
     Run {
         /// Port to listen on. The default is stable on purpose: a machine that picks a
@@ -187,6 +194,15 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Forget { peer } => forget(&dir, &peer),
         Command::Ui => open_ui(&dir),
+        Command::Activate { key } => {
+            let licence = licence::activate(&dir, &key)?;
+            println!("  activated for {}", licence.name);
+            if licence.expires_day == 0 {
+                println!("  no expiry");
+            }
+            println!("\n  seam is ready. Run it with no arguments.");
+            Ok(())
+        }
         Command::Run { port, connect, no_elevate, no_ui } => {
             run_daemon(&dir, identity, port, connect, no_elevate, !no_ui).await
         }
@@ -204,6 +220,17 @@ async fn run_daemon(
     open_ui_when_ready: bool,
 ) -> Result<()> {
     {
+            // The licence gate. Checked before anything is bound or captured, so an
+            // unlicensed machine changes nothing about the system it runs on.
+            if licence::stored(dir).is_none() {
+                anyhow::bail!(
+                    "seam needs a licence on this machine.\n\n  \
+                     Run:  seam activate <your-licence>\n\n  \
+                     Licences are issued by the owner and work offline, on every machine \
+                     you were given one for."
+                );
+            }
+
             #[cfg(target_os = "windows")]
             if !no_elevate && !seam_input::windows::is_elevated() {
                 // UIPI is the reason: Windows silently discards injected input while an
@@ -346,6 +373,11 @@ fn doctor(dir: &std::path::Path, identity: &Identity) -> Result<()> {
             d.shutdown();
         }
         Err(e) => println!("FAILED — {e}"),
+    }
+
+    match licence::stored(dir) {
+        Some(l) => println!("  licence       {} ({})", l.name, if l.expires_day == 0 { "no expiry".to_owned() } else { format!("day {}", l.expires_day) }),
+        None => println!("  licence       MISSING — run 'seam activate <your-licence>'"),
     }
 
     report_input_forwarding();

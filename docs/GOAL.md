@@ -703,3 +703,36 @@ hand-touched; and chunked, resumable streaming for clipboard payloads over the 6
 5. Tests/E2E for the frontend: NOT STARTED.
 6. Streaming protocol: DESIGNED above, NOT IMPLEMENTED — v0.2.1 ships the 64 MB
    single-frame cap.
+
+---
+
+## 13. Licensing and distribution (v0.5.0)
+
+**Licensing.** A licence is a token signed with an Ed25519 private key that only the owner
+holds. Builds carry the matching **public** key, so a binary can verify a licence and can
+never mint one. There is no licence server and nothing is transmitted: a licence works on a
+machine that has never been online. `seam activate <licence>` verifies and stores it beside
+the identity; the daemon refuses to bind, capture or connect without one; `doctor` reports
+it.
+
+Issuing is `scripts/issue-licence.sh` — owner only, needs `licence-private.pem`, which must
+never be committed or copied to a machine that is not the owner's. Releases are built with
+`SEAM_LICENCE_KEY=$(cat licence-public.hex)`. A build without that variable refuses every
+licence, which is the safe direction to fail.
+
+**Stated honestly**: this does not make the software uncopyable. Anyone who can rebuild or
+patch the binary can remove the check — true of every client-side licence ever shipped.
+What it does is make running seam require something only the owner can issue.
+
+**Private source with public downloads needs two repositories.** A private repo's release
+assets require a GitHub token to download, so "private code, public releases" cannot be one
+repo:
+
+- `seam` (private) — all source, history and issues.
+- `seam-releases` (public) — no source. Releases only: binaries, `SHA256SUMS.txt`,
+  `join.sh`, release notes. Publishing becomes: build with the owner key, then
+  `gh release create --repo <owner>/seam-releases`.
+
+The join script and the update flow point at the public repo, so nothing else changes.
+Note the current repository is public and its history contains the full source; making it
+private later does not retract what has already been fetched or forked.
