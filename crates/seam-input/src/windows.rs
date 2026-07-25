@@ -331,6 +331,22 @@ const fn virtual_key_for(usage: u16) -> u16 {
         0x4E => 0x22, // Page Down
         // F1..F12 are contiguous in both encodings, so the offset maps them all.
         0x3A..=0x45 => 0x70 + (usage - 0x3A),
+        // Modifiers. Without these a shortcut can never be reproduced: the letter
+        // arrives but nothing is holding Ctrl, so it is just typed.
+        0xE0 => 0xA2, // VK_LCONTROL
+        0xE4 => 0xA3, // VK_RCONTROL
+        0xE1 => 0xA0, // VK_LSHIFT
+        0xE5 => 0xA1, // VK_RSHIFT
+        0xE2 => 0xA4, // VK_LMENU (Alt)
+        0xE6 => 0xA5, // VK_RMENU (AltGr)
+        // Command maps to Windows, which is what a Mac user reaches for.
+        0xE3 => 0x5B, // VK_LWIN
+        0xE7 => 0x5C, // VK_RWIN
+        // Letters and digits, needed for shortcuts addressed by key position.
+        0x04..=0x1D => 0x41 + (usage - 0x04), // A..Z
+        0x1E..=0x26 => 0x31 + (usage - 0x1E), // 1..9
+        0x27 => 0x30,                         // 0
+        0x2C => 0x20,                         // Space
         _ => 0,
     }
 }

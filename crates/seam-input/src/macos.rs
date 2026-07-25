@@ -391,6 +391,7 @@ const K_CG_EVENT_RIGHT_MOUSE_UP: CGEventType = 4;
 const K_CG_EVENT_MOUSE_MOVED: CGEventType = 5;
 const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
 const K_CG_EVENT_KEY_UP: CGEventType = 11;
+const K_CG_EVENT_FLAGS_CHANGED: CGEventType = 12;
 const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
 const K_CG_EVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
 const K_CG_EVENT_OTHER_MOUSE_UP: CGEventType = 26;
@@ -436,6 +437,7 @@ type CGEventTapCallBack = unsafe extern "C" fn(
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    fn CGEventGetFlags(event: CGEventRef) -> u64;
     fn CGEventKeyboardGetUnicodeString(
         event: CGEventRef,
         max_length: usize,
@@ -519,7 +521,12 @@ pub enum Observed {
     /// The text is what makes mismatched layouts work: a German Apple keyboard types `@`
     /// as `Option+L`, and sending the resulting glyph is the only way the receiver can
     /// reproduce it without knowing anything about the sender's layout.
-    Key { text: LogicalText, physical: seam_proto::PhysicalKey, down: bool },
+    Key {
+        text: LogicalText,
+        physical: seam_proto::PhysicalKey,
+        modifiers: seam_proto::Modifiers,
+        down: bool,
+    },
 }
 
 /// State shared with the tap callback. Boxed and leaked deliberately: the callback may
@@ -566,6 +573,35 @@ const fn hid_usage_for(keycode: u16) -> seam_proto::PhysicalKey {
         0x6D => 0x43,
         0x67 => 0x44,
         0x6F => 0x45, // F12
+        // Letters and digits, so a shortcut can be addressed by key position rather than
+        // by the glyph the sender's layout produced.
+        0x00 => 0x04, // A
+        0x0B => 0x05, // B
+        0x08 => 0x06, // C
+        0x02 => 0x07, // D
+        0x0E => 0x08, // E
+        0x03 => 0x09, // F
+        0x05 => 0x0A, // G
+        0x04 => 0x0B, // H
+        0x22 => 0x0C, // I
+        0x26 => 0x0D, // J
+        0x28 => 0x0E, // K
+        0x25 => 0x0F, // L
+        0x2E => 0x10, // M
+        0x2D => 0x11, // N
+        0x1F => 0x12, // O
+        0x23 => 0x13, // P
+        0x0C => 0x14, // Q
+        0x0F => 0x15, // R
+        0x01 => 0x16, // S
+        0x11 => 0x17, // T
+        0x20 => 0x18, // U
+        0x09 => 0x19, // V
+        0x0D => 0x1A, // W
+        0x07 => 0x1B, // X
+        0x10 => 0x1C, // Y
+        0x06 => 0x1D, // Z
+        0x31 => 0x2C, // Space
         _ => 0,
     };
     seam_proto::PhysicalKey(usage)
@@ -638,6 +674,8 @@ unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observe
             // SAFETY: valid event; by-value getter.
             let keycode = unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_KEYCODE) };
             let physical = hid_usage_for(u16::try_from(keycode).unwrap_or(0));
+            // SAFETY: valid event; by-value getter.
+            let modifiers = modifiers_from(unsafe { CGEventGetFlags(event) });
 
             let mut buffer = [0u16; 8];
             let mut length: usize = 0;
@@ -662,11 +700,84 @@ unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observe
             if logical.is_empty() && physical.is_unknown() {
                 return None;
             }
-            Some(Observed::Key { text: logical, physical, down: event_type == K_CG_EVENT_KEY_DOWN })
+            Some(Observed::Key {
+                text: logical,
+                physical,
+                modifiers,
+                down: event_type == K_CG_EVENT_KEY_DOWN,
+            })
+        }
+
+        // A modifier key changing state. macOS reports these as flag changes rather than
+        // key presses, and without them a receiver can never be told that Cmd is held —
+        // so no shortcut can ever be reproduced.
+        K_CG_EVENT_FLAGS_CHANGED => {
+            // SAFETY: valid event; both are by-value getters.
+            let (keycode, flags) = unsafe {
+                (CGEventGetIntegerValueField(event, K_CG_KEYBOARD_KEYCODE), CGEventGetFlags(event))
+            };
+            let physical = modifier_usage_for(u16::try_from(keycode).unwrap_or(0));
+            if physical.is_unknown() {
+                return None;
+            }
+            let modifiers = modifiers_from(flags);
+            // A flag change carries no direction, so it is derived: the key is down when
+            // its own bit is still set in the resulting flags.
+            let down = physical.modifier_bit().is_some_and(|bit| modifiers.contains(bit));
+            Some(Observed::Key { text: LogicalText::NONE, physical, modifiers, down })
         }
 
         _ => None,
     }
+}
+
+/// macOS keycode for a modifier key to its USB HID usage.
+const fn modifier_usage_for(keycode: u16) -> seam_proto::PhysicalKey {
+    let usage: u16 = match keycode {
+        0x37 => 0xE3, // Left Command
+        0x36 => 0xE7, // Right Command
+        0x38 => 0xE1, // Left Shift
+        0x3C => 0xE5, // Right Shift
+        0x3B => 0xE0, // Left Control
+        0x3E => 0xE4, // Right Control
+        0x3A => 0xE2, // Left Option
+        0x3D => 0xE6, // Right Option
+        _ => 0,
+    };
+    seam_proto::PhysicalKey(usage)
+}
+
+/// CoreGraphics event flags to the protocol's modifier mask.
+fn modifiers_from(flags: u64) -> seam_proto::Modifiers {
+    use seam_proto::Modifiers as M;
+    // Device-dependent bits distinguish left from right; the documented masks do not.
+    const NX_DEVICE_LSHIFT: u64 = 0x0000_0002;
+    const NX_DEVICE_RSHIFT: u64 = 0x0000_0004;
+    const NX_DEVICE_LCTRL: u64 = 0x0000_0001;
+    const NX_DEVICE_RCTRL: u64 = 0x0000_2000;
+    const NX_DEVICE_LALT: u64 = 0x0000_0020;
+    const NX_DEVICE_RALT: u64 = 0x0000_0040;
+    const NX_DEVICE_LCMD: u64 = 0x0000_0008;
+    const NX_DEVICE_RCMD: u64 = 0x0000_0010;
+    const MASK_ALPHA_SHIFT: u64 = 0x0001_0000;
+
+    let mut m = M::NONE;
+    for (bit, modifier) in [
+        (NX_DEVICE_LSHIFT, M::LEFT_SHIFT),
+        (NX_DEVICE_RSHIFT, M::RIGHT_SHIFT),
+        (NX_DEVICE_LCTRL, M::LEFT_CTRL),
+        (NX_DEVICE_RCTRL, M::RIGHT_CTRL),
+        (NX_DEVICE_LALT, M::LEFT_ALT),
+        (NX_DEVICE_RALT, M::RIGHT_ALT),
+        (NX_DEVICE_LCMD, M::LEFT_GUI),
+        (NX_DEVICE_RCMD, M::RIGHT_GUI),
+        (MASK_ALPHA_SHIFT, M::CAPS_LOCK),
+    ] {
+        if flags & bit != 0 {
+            m = m.union(modifier);
+        }
+    }
+    m
 }
 
 unsafe extern "C" fn on_event(
@@ -749,7 +860,8 @@ pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
                 | mask_for(K_CG_EVENT_OTHER_MOUSE_UP)
                 | mask_for(K_CG_EVENT_SCROLL_WHEEL)
                 | mask_for(K_CG_EVENT_KEY_DOWN)
-                | mask_for(K_CG_EVENT_KEY_UP);
+                | mask_for(K_CG_EVENT_KEY_UP)
+                | mask_for(K_CG_EVENT_FLAGS_CHANGED);
 
             let state = Box::into_raw(Box::new(TapState { sender, tap: core::ptr::null_mut() }));
 

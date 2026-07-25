@@ -765,13 +765,15 @@ fn to_frame(event: seam_input::macos::Observed, seq: u32) -> Option<seam_proto::
             unit: seam_proto::ScrollUnit::Detent,
             end_of_gesture: false,
         }),
-        Observed::Key { text, physical, down } => seam_proto::Frame::Key(seam_proto::KeyEvent {
-            seq,
-            physical,
-            logical: text,
-            press: press(down),
-            modifiers: seam_proto::Modifiers::NONE,
-        }),
+        Observed::Key { text, physical, modifiers, down } => {
+            seam_proto::Frame::Key(seam_proto::KeyEvent {
+                seq,
+                physical,
+                logical: text,
+                press: press(down),
+                modifiers,
+            })
+        }
     })
 }
 
@@ -797,7 +799,13 @@ fn log_event(frame: &seam_proto::Frame) {
         }
         seam_proto::Frame::Scroll(s) => tracing::info!(dx = s.dx, dy = s.dy, "scroll"),
         seam_proto::Frame::Key(k) => {
-            tracing::info!(text = k.logical.as_str(), down = k.press.is_down(), "key");
+            tracing::info!(
+                text = k.logical.as_str(),
+                physical = k.physical.0,
+                modifiers = ?k.modifiers,
+                down = k.press.is_down(),
+                "key"
+            );
         }
         _ => {}
     }
@@ -809,13 +817,22 @@ async fn receive_reliable(link: Arc<Link>, geometry: Geometry) {
     loop {
         match link.recv_reliable().await {
             Ok(seam_proto::Frame::Key(k)) => {
-                // A key with no text - Backspace, Escape, an arrow, a function key - can
-                // only be reproduced by its physical identity. A key that produced text
-                // is reproduced as that text, which is what survives a layout mismatch.
-                let outcome = if k.logical.is_empty() {
-                    seam_input::inject_key(k.physical.0, k.press.is_down())
-                } else {
-                    seam_input::inject_text(k.logical.as_str(), k.press.is_down())
+                // The policy that makes mismatched layouts work, finally in use. A command
+                // chord replays the physical key, so Cmd+C stays copy on any layout; plain
+                // text replays the glyph, so `@` typed as Option+L on a German Mac arrives
+                // as `@` rather than as `l`.
+                let outcome = match seam_proto::resolve_replay(
+                    seam_proto::LayoutPolicy::Auto,
+                    k.physical,
+                    k.logical,
+                    k.modifiers,
+                ) {
+                    seam_proto::Replay::Physical(key) => {
+                        seam_input::inject_key(key.0, k.press.is_down())
+                    }
+                    seam_proto::Replay::Text(text) => {
+                        seam_input::inject_text(text.as_str(), k.press.is_down())
+                    }
                 };
                 if let Err(e) = outcome {
                     tracing::warn!(%peer, physical = k.physical.0, "could not send key: {e}");
