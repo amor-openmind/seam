@@ -700,9 +700,11 @@ fn handover(
     match update.focus {
         Focus::Remote(peer) => {
             tracing::info!(%peer, "pointer and keyboard moved to this peer");
-            // Freeze the local cursor, then stop this machine acting on the input at all.
-            // Detach first, so that if suppression is somehow left on, the guard's Drop
-            // still clears it.
+            // Release any previous guard FIRST. Its `Drop` clears suppression, so holding
+            // it while enabling suppression means moving from one peer to another
+            // silently switches this machine's input back on — which looks exactly like
+            // every machine responding at once.
+            drop(detached);
             let guard = seam_input::macos::CursorGuard::detach(false).ok();
             seam_input::macos::set_suppress_local(true);
             guard
