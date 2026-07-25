@@ -84,13 +84,60 @@ enum Command {
     },
 }
 
+/// Where the daemon always writes its log.
+///
+/// Logging only to stdout means every lockup destroys its own evidence: the terminal is
+/// closed, or the process is killed, and there is nothing left to diagnose from. Three
+/// separate faults in this project were debugged by guesswork for exactly that reason.
+fn log_path() -> Option<std::path::PathBuf> {
+    let dir = store::state_dir().ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("seam.log"))
+}
+
+/// Writes to two sinks at once.
+struct Tee<A: std::io::Write, B: std::io::Write>(A, B);
+
+impl<A: std::io::Write, B: std::io::Write> std::io::Write for Tee<A, B> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // The file is best-effort: a full disk must never stop the daemon logging to the
+        // terminal, and must certainly never stop it forwarding input.
+        let _ = self.1.write_all(buf);
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = self.1.flush();
+        self.0.flush()
+    }
+}
+
 fn main() -> Result<()> {
+    // Truncate rather than append: a stale log from a previous run is worse than none,
+    // because it invites diagnosing the wrong session.
+    let log_file = log_path().and_then(|path| {
+        let file = std::fs::File::create(&path).ok()?;
+        eprintln!("logging to {}", path.display());
+        Some(file)
+    });
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("SEAM_LOG")
                 .unwrap_or_else(|_| "seam=info,warn".into()),
         )
         .with_target(false)
+        .with_writer(move || -> Box<dyn std::io::Write> {
+            match &log_file {
+                Some(file) => match file.try_clone() {
+                    // Everything goes to both, so the terminal stays useful and the
+                    // evidence survives the terminal.
+                    Ok(clone) => Box::new(Tee(std::io::stdout(), clone)),
+                    Err(_) => Box::new(std::io::stdout()),
+                },
+                None => Box::new(std::io::stdout()),
+            }
+        })
         .init();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -542,6 +589,7 @@ async fn daemon(
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry));
 
     start_clipboard_sync(Arc::clone(&links), Arc::clone(&clipboard));
+    start_input_watchdog();
 
     let accepting = {
         let endpoint = Arc::clone(&endpoint);
@@ -649,31 +697,61 @@ async fn receive_from(link: Arc<Link>, geometry: Geometry, clipboard: Clipboard)
     }
 }
 
-/// Move the local cursor out of the way while another machine has the pointer.
-///
-/// Detaching stops the cursor tracking the mouse, but it stays wherever it was — usually
-/// mid-screen, where it looks like a second pointer. Parking it in the bottom-right corner
-/// makes it unobtrusive without needing foreground status, which a daemon does not have.
-/// Called once per handover, never per event.
-///
-/// An earlier version re-parked on every motion event, which enumerated the displays
-/// (`CGGetActiveDisplayList`) 50-100 times a second on the input path and wedged the
-/// machine's mouse and keyboard. Nothing that walks the OS display list belongs on a path
-/// that runs per event.
+/// The moment input was last seen. Used by the watchdog.
 #[cfg(target_os = "macos")]
-fn park_cursor() {
-    use std::sync::OnceLock;
-    // The corner is resolved once. A display reconfiguration would move it, which is worth
-    // far less than keeping this off the hot path.
-    static CORNER: OnceLock<Option<(i32, i32)>> = OnceLock::new();
-    let corner = *CORNER.get_or_init(|| {
-        let bb = seam_input::desktop().ok()?.bounding_box();
-        (!bb.is_empty()).then(|| (bb.right() - 1, bb.bottom() - 1))
+static LAST_INPUT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Give this machine its input back if events stop arriving while it is withheld.
+///
+/// This is the safety net for the class of failure that has locked this machine twice: if
+/// anything stops the capture delivering events — macOS disabling a slow tap, a stall, a
+/// bug — then focus can never return, and suppression stays on with the cursor detached.
+/// From the user's chair the machine is simply dead, with no way back short of killing the
+/// process.
+///
+/// So it is made time-bounded rather than depending on the event path that just failed.
+/// Two seconds of silence while input is withheld is not a plausible state.
+#[cfg(target_os = "macos")]
+fn start_input_watchdog() {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            ticker.tick().await;
+            if !seam_input::macos::is_suppressing_local() {
+                continue;
+            }
+            let stale = LAST_INPUT
+                .lock()
+                .ok()
+                .and_then(|guard| *guard)
+                .is_none_or(|last| last.elapsed() > Duration::from_secs(2));
+            if stale {
+                tracing::error!(
+                    "no input seen for 2s while this machine's input was withheld — \
+                     releasing it. This should not happen; please report the log."
+                );
+                seam_input::release_input();
+            }
+        }
     });
-    if let Some((x, y)) = corner {
-        let _ = seam_input::warp_cursor(x, y);
-    }
 }
+
+#[cfg(not(target_os = "macos"))]
+fn start_input_watchdog() {}
+
+// `park_cursor` used to live here, moving the local cursor to a corner so it was not
+// visible while another machine had the pointer. It is deliberately gone.
+//
+// Warping the cursor perturbs the delta reported by the following event, which crossed a
+// screen edge, which parked again — a feedback loop running at event rate. The log showed
+// focus alternating between two machines every 20 ms, which from the user's chair is
+// indistinguishable from the mouse and keyboard being frozen. It locked the machine twice.
+//
+// The cursor sitting at the edge while another machine has the pointer is a cosmetic
+// problem. Anything that writes cursor position from inside the loop that *reads* cursor
+// movement is a correctness problem, and this one was not worth its cost. Hiding it
+// properly needs foreground status, which a daemon does not have; the real fix is a UI
+// agent, not another warp.
 
 /// Shared clipboard state.
 type Clipboard = Arc<tokio::sync::Mutex<ClipboardState>>;
@@ -835,7 +913,6 @@ fn handover(
                 }
             };
             seam_input::macos::set_suppress_local(true);
-            park_cursor();
             guard
         }
         Focus::Local => {
@@ -1036,6 +1113,9 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geom
             let mut detached: Option<seam_input::macos::CursorGuard> = None;
 
             while let Some(event) = rx.recv().await {
+                if let Ok(mut last) = LAST_INPUT.lock() {
+                    *last = Some(std::time::Instant::now());
+                }
                 seq = seq.wrapping_add(1);
 
                 sync_peers(&links, &mut graph, &mut known, &geometry).await;
