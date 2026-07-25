@@ -855,6 +855,28 @@ pub fn observe_pointer() -> Result<Receiver<Observed>, Error> {
             where_to: "System Settings > Privacy & Security > Input Monitoring".into(),
         });
     }
+    // Accessibility is required to CAPTURE, not just to inject, and this is the single
+    // most confusing failure in the whole project.
+    //
+    // With Input Monitoring alone, CGEventTapCreate SUCCEEDS. It does not return NULL and
+    // it does not report an error. macOS silently downgrades the tap to listen-only, and a
+    // listen-only tap cannot discard: returning NULL from the callback does nothing at all.
+    //
+    // The result is a program that looks like it works. Movement is observed, forwarded,
+    // and replayed on the other machine perfectly — while the local cursor and keyboard
+    // keep acting on the very same events. That is a mirror, not a KVM, and from a chair
+    // it is indistinguishable from suppression being broken.
+    //
+    // Refusing here converts a silent, near-unfindable misbehaviour into one sentence.
+    if !permissions.can_post {
+        return Err(Error::PermissionDenied {
+            what: "withhold input from this machine while another machine has the pointer. \
+                   Without this, seam can still see and forward input, but this machine \
+                   keeps acting on it too — the pointer appears on both screens at once"
+                .into(),
+            where_to: "System Settings > Privacy & Security > Accessibility".into(),
+        });
+    }
 
     let (sender, receiver) = channel();
     let (ready_tx, ready_rx) = channel::<Result<(), String>>();

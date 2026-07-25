@@ -265,14 +265,44 @@ fn doctor(dir: &std::path::Path, identity: &Identity) -> Result<()> {
         Err(e) => println!("FAILED — {e}"),
     }
 
-    // Honesty over polish: the thing most likely to stop seam working is a platform
-    // backend that does not exist yet, so say so rather than reporting a clean bill.
-    println!("\n  input forwarding");
-    println!("    NOT IMPLEMENTED — screen geometry and permissions are in place, but");
-    println!("    capture and injection are not written yet, so seam cannot move your");
-    println!("    pointer or forward keystrokes between machines.");
+    report_input_forwarding();
 
     Ok(())
+}
+
+
+/// Report whether input can actually be *withheld*, not merely seen.
+///
+/// Split out of `doctor` for length, but it earns its own name: this is the check for the
+/// failure that does not look like one. With Input Monitoring but not Accessibility, macOS
+/// downgrades the event tap to listen-only. Input is captured and forwarded correctly while
+/// this machine goes on acting on it, so the pointer appears to be on two screens at once.
+fn report_input_forwarding() {
+    println!("\n  input forwarding");
+    match seam_input::permission_report() {
+        Some(report) => {
+            let granted = |name| {
+                report.iter().find(|(what, _, _)| *what == name).is_some_and(|(_, ok, _)| *ok)
+            };
+            match (granted("capture input"), granted("inject input")) {
+                (true, true) => println!("    ready — input can be captured, withheld and forwarded"),
+                (true, false) => {
+                    println!("    MIRRORS INSTEAD OF SWITCHING — Accessibility is not granted.");
+                    println!("    seam can see and forward input, but cannot stop this machine");
+                    println!("    acting on it, so the pointer moves here AND on the other screen.");
+                    println!("    Grant System Settings > Privacy & Security > Accessibility,");
+                    println!("    then restart seam. macOS grants this per binary, so a newly");
+                    println!("    downloaded release needs it again.");
+                }
+                (false, _) => {
+                    println!("    NOT WORKING — Input Monitoring is not granted, so seam cannot");
+                    println!("    see input at all. Grant it, then restart seam.");
+                }
+            }
+        }
+        None => println!("    ready — this platform needs no input permissions"),
+    }
+
 }
 
 // ---------------------------------------------------------------- discover
