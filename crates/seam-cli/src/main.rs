@@ -849,7 +849,12 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geom
 
                 // Movement decides ownership; everything else follows whoever owns it.
                 let update = match event {
-                    Observed::Motion { dx, dy, .. } => Some(graph.apply_motion(dx, dy)),
+                    Observed::Motion { x, y, dx, dy } => {
+                        // While input is local the OS cursor is the truth; once it has
+                        // left, the cursor is frozen and only movement means anything.
+                        graph.sync_local_cursor(x, y);
+                        Some(graph.apply_motion(dx, dy))
+                    }
                     _ => None,
                 };
 

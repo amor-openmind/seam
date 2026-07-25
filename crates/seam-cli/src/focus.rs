@@ -190,6 +190,27 @@ impl Graph {
         self.index_of(peer).is_some()
     }
 
+    /// Adopt the operating system's own cursor position while input is local.
+    ///
+    /// This is the difference between a boundary at the screen edge and a boundary
+    /// somewhere in the middle of it. While the pointer is on this machine the OS cursor
+    /// is the truth: the user can move it with a trackpad, another app can warp it, and
+    /// it starts wherever it was left. Accumulating deltas from an assumed starting point
+    /// drifts away from the real cursor, and the screen edge is then reached — and
+    /// crossed — while the visible pointer is still mid-screen.
+    ///
+    /// Once focus is remote the OS cursor is detached and stops moving, so it stops being
+    /// a useful signal and movement is accumulated instead. This is the same split
+    /// Barrier and Synergy use.
+    pub(crate) fn sync_local_cursor(&mut self, x: i32, y: i32) {
+        if self.current != 0 {
+            return;
+        }
+        let node = &self.nodes[0];
+        self.x = x.clamp(0, node.width - 1);
+        self.y = y.clamp(0, node.height - 1);
+    }
+
     /// Apply movement, crossing edges as needed.
     pub(crate) fn apply_motion(&mut self, dx: i32, dy: i32) -> Update {
         let before = self.current;
@@ -295,6 +316,35 @@ mod tests {
         g.place(imac(), Edge::Left, None, 1920, 1080);
         g.place(laptop(), Edge::Bottom, Some(imac()), 1920, 1080);
         g
+    }
+
+    #[test]
+    fn the_local_cursor_position_is_adopted_while_input_is_here() {
+        // Otherwise the boundary drifts away from the real cursor and the pointer crosses
+        // while it is still visibly mid-screen.
+        let mut g = fleet();
+        g.sync_local_cursor(2559, 500);
+        // One step left from the far right edge must NOT cross.
+        let update = g.apply_motion(-1, 0);
+        assert_eq!(update.focus, Focus::Local);
+        assert_eq!(update.x, 2558);
+
+        // From the left edge, one step left must cross.
+        g.sync_local_cursor(0, 500);
+        assert_eq!(g.apply_motion(-1, 0).focus, Focus::Remote(imac()));
+    }
+
+    #[test]
+    fn the_local_cursor_is_ignored_once_the_pointer_has_left() {
+        // The OS cursor is detached and frozen while a peer owns the pointer, so adopting
+        // it would drag focus back to a stale position.
+        let mut g = fleet();
+        g.sync_local_cursor(0, 500);
+        g.apply_motion(-1, 0);
+        assert_eq!(g.focus(), Focus::Remote(imac()));
+
+        g.sync_local_cursor(1280, 540);
+        assert_eq!(g.focus(), Focus::Remote(imac()), "must stay on the peer");
     }
 
     #[test]
