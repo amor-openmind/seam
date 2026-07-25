@@ -477,6 +477,34 @@ than another cursor warp.
 
 ---
 
+## 12c. Settings, startup, and the role question — answered honestly
+
+**Settings now persist** (v0.3.7) in a `settings` file beside the identity, so a portable
+install carries them: which machines are switched off, and which clipboard kinds this
+machine shares. Nothing detectable is stored there — geometry, layout, speed and identity
+stay detected (goal Z2). Disabling a peer stops input to it immediately, mid-session,
+without unpairing.
+
+**Start at login** is per-user and needs no installer or admin rights: a `LaunchAgent`
+plist on macOS, an `HKCU\...\Run` value on Windows. `RunAtLoad` only — deliberately no
+`KeepAlive`, because a crash loop that relaunches itself forever is worse than seam being
+off, and the input watchdog already covers the failure that matters.
+
+**"Make this machine the server" cannot be built yet, and the reason is not a setting.**
+seam captures input only on macOS; the Windows backend replays and never captures
+(`this machine receives input only; capture is not built for it yet`). So a Windows
+machine cannot share its keyboard and mouse regardless of any toggle, and adding one
+would be a control that lies. What is missing is **Windows input capture** — a low-level
+keyboard/mouse hook plus its own suppression story, comparable in size to the whole macOS
+capture path. Until that exists, a machine's role is reported as observed capability
+(`shares input` / `receives input`), never as a choice.
+
+**Outstanding Claude Design surfaces** (not done, and the reason is that every round so
+far went to field bugs — the loopback vulnerability, the dead Windows exe, roles,
+highlighting — which was the right order, but leaves these unauthored):
+onboarding/permission walkthrough, doctor-as-a-page, the update flow, compact/mobile
+variants, and the settings page rebound to the real persisted values.
+
 ## 12b. Review discipline — added after a self-inflicted vulnerability
 
 A line-by-line review of the newest code found that the fleet-page server validated

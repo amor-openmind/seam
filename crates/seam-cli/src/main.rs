@@ -726,6 +726,8 @@ async fn daemon(
         );
     }
 
+    load_settings_into_ui(dir);
+
     start_auto_dial(&discovery, &store, &links, &geometry, &clipboard, &endpoint);
 
     // Crash recovery: a previous seam that died while the cursor was concealed leaves
@@ -932,18 +934,129 @@ async fn apply_clipboard_image(
 }
 
 /// Switch a peer on or off from the UI, matched by its short id (what the page shows).
+/// Answer one fleet-page request. Split out of the accept loop for length.
+async fn route(
+    request: &str,
+    path: &str,
+    port: u16,
+    name: &str,
+    id: seam_proto::PeerId,
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    ui_port_note: &std::path::Path,
+) -> (&'static str, &'static str, String) {
+    let method = request.split_whitespace().next().unwrap_or("GET");
+
+    // The origin gate lives HERE, ahead of every branch, so no future route can be added
+    // outside it. Extracting this router once already dropped this check silently — the
+    // only reason it was caught is that the compiler noticed the function had no callers.
+    if !request_is_local(request, port) {
+        tracing::warn!(path, "refused a fleet-page request from another origin");
+        return ("403 Forbidden", "text/plain", "refused".to_owned());
+    }
+
+    if method == "POST" && path == "/action/quit" {
+        // Respond first, then die: the page needs the reply to close its tab.
+        tracing::info!("quit requested from the fleet page");
+        let note = ui_port_note.to_path_buf();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            seam_input::release_input();
+            let _ = std::fs::remove_file(note);
+            std::process::exit(0);
+        });
+        ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+    } else if method == "POST" && path.starts_with("/action/startup/") {
+        let on = path.ends_with("/on");
+        let now = set_start_at_login(on);
+        tracing::info!(requested = on, actual = now, "start at login changed");
+        ("200 OK", "application/json", format!(r#"{{"ok":true,"on":{now}}}"#))
+    } else if method == "POST" && path.starts_with("/action/share/") {
+        let mut parts = path.trim_start_matches("/action/share/").split('/');
+        let kind = parts.next().unwrap_or("");
+        let on = parts.next() == Some("on");
+        if let Ok(mut shares) = UI_SHARES.lock() {
+            match kind {
+                "text" => shares.0 = on,
+                "images" => shares.1 = on,
+                "files" => shares.2 = on,
+                _ => {}
+            }
+        }
+        persist_settings();
+        tracing::info!(kind, on, "clipboard sharing changed from the page");
+        ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+    } else if method == "POST" && path.starts_with("/action/peer/") {
+        let mut parts = path.trim_start_matches("/action/peer/").split('/');
+        let target = parts.next().unwrap_or("").to_owned();
+        let enable = parts.next() == Some("enable");
+        set_peer_enabled(&target, enable);
+        ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+    } else if method == "POST" && path == "/action/release" {
+        UI_RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
+        ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+    } else if path == "/state" {
+        ("200 OK", "application/json", ui_state_json(name, id, port, links).await)
+    } else if let Some((_, page, ctype)) =
+        UI_PAGES.iter().find(|(route, _, _)| *route == path)
+    {
+        ("200 OK", *ctype, (*page).to_owned())
+    } else {
+        ("404 Not Found", "text/plain", "not found".to_owned())
+    }
+}
+
+/// Load the saved settings into the state the UI and the input path read.
+///
+/// Without this, switching a machine off in the fleet page was forgotten the moment seam
+/// stopped — indistinguishable, from a chair, from the switch not working at all.
+fn load_settings_into_ui(dir: &std::path::Path) {
+    let settings = store::load_settings(dir);
+    if let Ok(mut off) = UI_DISABLED.lock() {
+        (*off).clone_from(&settings.disabled_peers);
+    }
+    if let Ok(mut shares) = UI_SHARES.lock() {
+        *shares = (settings.share_text, settings.share_images, settings.share_files);
+    }
+    if let Ok(mut home) = UI_HOME.lock() {
+        *home = Some(dir.to_path_buf());
+    }
+    tracing::info!(
+        text = settings.share_text,
+        images = settings.share_images,
+        files = settings.share_files,
+        disabled = settings.disabled_peers.len(),
+        "settings loaded"
+    );
+}
+
+fn persist_settings() {
+    let Ok(home) = UI_HOME.lock() else { return };
+    let Some(dir) = home.as_ref() else { return };
+    let (share_text, share_images, share_files) =
+        UI_SHARES.lock().map_or((true, true, true), |shares| *shares);
+    let disabled_peers = UI_DISABLED.lock().map(|off| off.clone()).unwrap_or_default();
+    store::save_settings(
+        dir,
+        &store::Settings { disabled_peers, share_text, share_images, share_files },
+    );
+}
+
 fn set_peer_enabled(short_id: &str, enable: bool) {
     let Ok(mut off) = UI_DISABLED.lock() else { return };
     let matches_short = |peer: &seam_proto::PeerId| peer.to_string().starts_with(short_id);
     if enable {
         off.retain(|peer| !matches_short(peer));
         tracing::info!(peer = short_id, "peer enabled from the fleet page");
+        drop(off);
+        persist_settings();
     } else if let Ok(places) = UI_PLACES.lock()
         && let Some((peer, _)) = places.iter().find(|(peer, _)| matches_short(peer))
         && !off.contains(peer)
     {
         off.push(*peer);
         tracing::info!(peer = short_id, "peer disabled from the fleet page");
+        drop(off);
+        persist_settings();
     }
 }
 
@@ -1003,6 +1116,13 @@ async fn apply_clipboard_files(
 /// once can never find this machine again, and discovery becomes the only way in — so any
 /// hiccup there looks like seam being broken. Fixed by default, overridable.
 const DEFAULT_PORT: u16 = 24810;
+
+/// Which clipboard kinds this machine shares: (text, images, files).
+static UI_SHARES: std::sync::Mutex<(bool, bool, bool)> = std::sync::Mutex::new((true, true, true));
+
+/// Where settings are written, so an action handler can persist without threading a path
+/// through every layer.
+static UI_HOME: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 /// The most recent clipboard movement, for the fleet page. Text is cheap and instant;
 /// an image or a folder is not, and a page that shows nothing while megabytes move is
@@ -1116,56 +1236,8 @@ fn start_ui_server(
                 }
                 let request = String::from_utf8_lossy(&buf);
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
-                let method = request.split_whitespace().next().unwrap_or("GET");
-
-                // A browser on any website can POST to a loopback port — a simple POST
-                // needs no preflight, so `fetch('http://127.0.0.1:PORT/action/quit')`
-                // from a random page would have killed this daemon, disabled peers or
-                // released input. Two checks close that:
-                //
-                //   Origin: browsers always send it on a cross-origin POST. Anything
-                //           other than our own origin is refused.
-                //   Host:   defeats DNS rebinding, where an attacker's name resolves to
-                //           127.0.0.1 and the request looks local but is not.
-                //
-                // curl and other non-browser callers send no Origin and are allowed;
-                // they are already running as the user, so they gain nothing.
-                if !request_is_local(&request, port) {
-                    let refusal = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\
-                                   Connection: close\r\n\r\n";
-                    let _ = socket.write_all(refusal.as_bytes()).await;
-                    return;
-                }
-
-                let (status, ctype, body) = if method == "POST" && path == "/action/quit" {
-                    // Respond first, then die: the page needs the reply to close its tab.
-                    tracing::info!("quit requested from the fleet page");
-                    let note = ui_port_note.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        seam_input::release_input();
-                        let _ = std::fs::remove_file(note);
-                        std::process::exit(0);
-                    });
-                    ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
-                } else if method == "POST" && path.starts_with("/action/peer/") {
-                    let mut parts = path.trim_start_matches("/action/peer/").split('/');
-                    let target = parts.next().unwrap_or("").to_owned();
-                    let enable = parts.next() == Some("enable");
-                    set_peer_enabled(&target, enable);
-                    ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
-                } else if method == "POST" && path == "/action/release" {
-                    UI_RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
-                    ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
-                } else if path == "/state" {
-                    ("200 OK", "application/json", ui_state_json(&name, id, port, &links).await)
-                } else if let Some((_, page, ctype)) =
-                    UI_PAGES.iter().find(|(route, _, _)| *route == path)
-                {
-                    ("200 OK", *ctype, (*page).to_owned())
-                } else {
-                    ("404 Not Found", "text/plain", "not found".to_owned())
-                };
+                let (status, ctype, body) =
+                    route(&request, path, port, &name, id, &links, &ui_port_note).await;
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
                      Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
@@ -1299,6 +1371,8 @@ async fn ui_state_json(
     // than by any negotiation. Capture exists on macOS today; Windows replays only.
     let self_role = if cfg!(target_os = "macos") { "shares input" } else { "receives input" };
 
+    let shares = UI_SHARES.lock().map_or((true, true, true), |s| *s);
+
     let mut health = String::new();
     let mut push_health = |ok: bool, text: &str| {
         if !health.is_empty() {
@@ -1326,7 +1400,7 @@ async fn ui_state_json(
     }
 
     format!(
-        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"focus":"{focus}","transfer":{},"peers":[{peers}],"health":[{health}]}}"#,
+        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"peers":[{peers}],"health":[{health}]}}"#,
         env!("CARGO_PKG_VERSION"),
         name.replace('"', "'"),
         std::env::consts::OS,
@@ -1343,6 +1417,10 @@ async fn ui_state_json(
             || "null".to_owned(),
             |(what, detail)| format!(r#"{{"what":"{what}","detail":"{detail}"}}"#),
         ),
+        shares.0,
+        shares.1,
+        shares.2,
+        starts_at_login(),
     )
 }
 
@@ -1371,6 +1449,112 @@ fn bind_or_show_running(
             Ok(std::ops::ControlFlow::Break(()))
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+// ---------------------------------------------------------------- start at login
+
+/// Does seam start itself when this user signs in?
+///
+/// Each OS answers this its own way and neither needs a daemon or an installer:
+/// macOS reads a `LaunchAgent` plist in `~/Library/LaunchAgents`, Windows a value under
+/// `HKCU\...\Run`. Both are per-user, both are removable by hand, and neither requires
+/// administrator rights — which matters, because asking for admin to arrange a
+/// convenience would be a worse trade than not having it.
+#[must_use]
+fn starts_at_login() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        launch_agent_path().is_some_and(|path| path.exists())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("reg")
+            .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "seam"])
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join("Library/LaunchAgents/dev.seam.seam.plist"))
+}
+
+/// Turn start-at-login on or off. Returns what the state actually is afterwards, so the
+/// UI reports the truth rather than what was asked for.
+fn set_start_at_login(enable: bool) -> bool {
+    let Ok(exe) = std::env::current_exe() else { return starts_at_login() };
+
+    #[cfg(target_os = "macos")]
+    {
+        let Some(path) = launch_agent_path() else { return false };
+        if !enable {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &path.to_string_lossy()])
+                .output();
+            let _ = std::fs::remove_file(&path);
+            return starts_at_login();
+        }
+        // RunAtLoad only; no KeepAlive. A crash loop that relaunches itself forever is
+        // worse than seam being off, and the watchdog already covers the case that
+        // matters (input left withheld).
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.seam.seam</string>
+  <key>ProgramArguments</key><array><string>{}</string><string>run</string><string>--no-ui</string></array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+"#,
+            exe.to_string_lossy()
+        );
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&path, plist).is_err() {
+            return false;
+        }
+        let _ = std::process::Command::new("launchctl")
+            .args(["load", &path.to_string_lossy()])
+            .output();
+        starts_at_login()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        let ok = if enable {
+            std::process::Command::new("reg")
+                .args([
+                    "add",
+                    RUN_KEY,
+                    "/v",
+                    "seam",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    &format!("\"{}\" run --no-ui", exe.to_string_lossy()),
+                    "/f",
+                ])
+                .output()
+        } else {
+            std::process::Command::new("reg")
+                .args(["delete", RUN_KEY, "/v", "seam", "/f"])
+                .output()
+        };
+        let _ = ok;
+        starts_at_login()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (enable, exe);
+        false
     }
 }
 
@@ -1663,7 +1847,12 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
             // Files before text, deliberately: Finder puts a copied file's NAME on the
             // pasteboard as text as well, so a text-first check would share the
             // filename and mask the files themselves.
-            if let Ok(Some(paths)) = seam_input::clipboard::read_file_list() {
+            let (share_text, share_images, share_files) =
+                UI_SHARES.lock().map_or((true, true, true), |shares| *shares);
+
+            if share_files
+                && let Ok(Some(paths)) = seam_input::clipboard::read_file_list()
+            {
                 let sig = files_signature(&paths);
                 if clipboard.lock().await.files_sig == Some(sig) {
                     continue;
@@ -1698,7 +1887,9 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
             }
 
             // Text next: cheapest to read, and by far the most common.
-            if let Ok(Some(text)) = seam_input::clipboard::read_text() {
+            if share_text
+                && let Ok(Some(text)) = seam_input::clipboard::read_text()
+            {
                 let frame = {
                     let mut state = clipboard.lock().await;
                     if state.last_seen.as_deref() == Some(text.as_str()) {
@@ -1715,6 +1906,9 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
             // No text — perhaps an image; a screenshot replaces text on the clipboard.
             // Reading an image copies the pixels out, which is why it is only tried
             // when text is absent, and why identity is a hash rather than the bytes.
+            if !share_images {
+                continue;
+            }
             let Ok(Some((width, height, rgba))) = seam_input::clipboard::read_image() else {
                 continue;
             };
@@ -2456,6 +2650,18 @@ fn start_pointer_forwarding(
                         suppressing = seam_input::macos::is_suppressing_local(),
                         "pointer"
                     );
+                }
+
+                // A machine switched off in the UI is skipped without unpairing: the link
+                // and its clipboard stay, only input stops. Checked here rather than at
+                // placement so toggling takes effect immediately, mid-session.
+                if let Focus::Remote(peer) = graph.focus()
+                    && UI_DISABLED.lock().is_ok_and(|off| off.contains(&peer))
+                {
+                    let u = graph.force_home();
+                    detached = handover(u, detached);
+                    holder = None;
+                    continue;
                 }
 
                 let Some(target) = (match graph.focus() {

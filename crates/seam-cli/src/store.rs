@@ -137,6 +137,103 @@ pub(crate) fn load_peers(dir: &Path) -> TrustStore {
     store
 }
 
+/// Settings a person chose, kept beside the identity so they travel with it.
+///
+/// Deliberately small. seam detects geometry, layout, speed and identity; the only things
+/// stored here are decisions no amount of detection can make — which machines to skip,
+/// and what kinds of clipboard content to share. Anything that could be detected must
+/// not appear in this file (goal Z2).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Settings {
+    /// Peers switched off in the UI. Stored by full id, so a rename or a new address
+    /// cannot silently re-enable a machine the user turned off.
+    pub disabled_peers: Vec<seam_proto::PeerId>,
+    /// Clipboard kinds this machine sends. Receiving is always allowed from a trusted peer.
+    pub share_text: bool,
+    pub share_images: bool,
+    pub share_files: bool,
+}
+
+impl Settings {
+    /// What a fresh install does: share everything, skip nobody.
+    pub(crate) fn defaults() -> Self {
+        Self {
+            disabled_peers: Vec::new(),
+            share_text: true,
+            share_images: true,
+            share_files: true,
+        }
+    }
+}
+
+const SETTINGS: &str = "settings";
+
+/// Read the settings, falling back to defaults for anything missing or unreadable.
+///
+/// A corrupt or partial file must never stop seam starting: the worst outcome of a bad
+/// line here is a setting reverting to its default, which is visible and recoverable,
+/// where refusing to start is neither.
+pub(crate) fn load_settings(dir: &Path) -> Settings {
+    let mut settings = Settings::defaults();
+    let Ok(text) = fs::read_to_string(dir.join(SETTINGS)) else {
+        return settings;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let (key, value) = (key.trim(), value.trim());
+        match key {
+            "share_text" => settings.share_text = value == "true",
+            "share_images" => settings.share_images = value == "true",
+            "share_files" => settings.share_files = value == "true",
+            "disabled" => {
+                settings.disabled_peers =
+                    value.split(',').filter_map(|id| parse_peer_id(id.trim())).collect();
+            }
+            _ => tracing::warn!(key, "ignoring an unknown setting"),
+        }
+    }
+    settings
+}
+
+/// Write the settings. Best effort: a failure here loses a preference, not data.
+pub(crate) fn save_settings(dir: &Path, settings: &Settings) {
+    let disabled: Vec<String> =
+        settings.disabled_peers.iter().map(std::string::ToString::to_string).collect();
+    let text = format!(
+        "# seam settings. Written by the app; safe to edit while seam is stopped.\n\
+         share_text = {}\nshare_images = {}\nshare_files = {}\ndisabled = {}\n",
+        settings.share_text,
+        settings.share_images,
+        settings.share_files,
+        disabled.join(","),
+    );
+    if let Err(e) = fs::write(dir.join(SETTINGS), text) {
+        tracing::warn!("could not save settings: {e}");
+    }
+}
+
+/// Parse a peer id written as hex.
+fn parse_peer_id(text: &str) -> Option<seam_proto::PeerId> {
+    let bytes = parse_fingerprint(text).map(|f| f.peer_id());
+    if bytes.is_some() {
+        return bytes;
+    }
+    // Peer ids are 16 bytes; accept the short form the UI shows too.
+    let cleaned: String = text.chars().filter(char::is_ascii_hexdigit).collect();
+    if cleaned.len() < 32 {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    for (slot, pair) in id.iter_mut().zip(cleaned.as_bytes().chunks_exact(2)) {
+        *slot = u8::from_str_radix(core::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(seam_proto::PeerId(id))
+}
+
 /// The order peers were paired in, which is the order they get placed in the layout.
 ///
 /// Connection order is a race: whichever daemon happens to start first took the Left edge,
