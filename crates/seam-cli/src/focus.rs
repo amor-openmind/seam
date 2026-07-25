@@ -370,7 +370,16 @@ const ENTRY_MARGIN: i32 = 80;
 ///
 /// Events arrive roughly every 20 ms, so this is a settling window of about 100 ms — long
 /// enough for a warp to be reflected in what we receive, short enough to be invisible.
-const SETTLING_EVENTS: u8 = 5;
+const SETTLING_EVENTS: u8 = 12;
+
+// SETTLING_EVENTS must stay LARGER than CROSSING_LOCKOUT.
+//
+// If adoption of the OS cursor resumes while the lockout is still running, the pointer
+// adopts a position that is stale by construction: the local cursor has not moved since
+// the pointer left, so it is still sitting on the boundary. That drags the pointer back
+// onto the edge, and it re-crosses the instant the lockout expires - a bounce at exactly
+// the lockout period. The live log showed 180 ms gaps against an 8-event lockout, which
+// is that arithmetic.
 
 /// Motion events that must pass after a crossing before another is allowed.
 ///
@@ -378,6 +387,13 @@ const SETTLING_EVENTS: u8 = 5;
 /// than a deliberate move back. It bounds how fast focus can change no matter how fast the
 /// mouse moves, which a distance margin cannot do.
 const CROSSING_LOCKOUT: u8 = 8;
+
+// Enforced at compile time, because getting this ordering wrong is silent: everything
+// still works, focus just bounces at the lockout period and input lands on two machines.
+const _: () = assert!(
+    SETTLING_EVENTS > CROSSING_LOCKOUT,
+    "settling must outlast the lockout, or a stale cursor position is adopted mid-lockout"
+);
 
 
 /// Map a position along an edge onto a screen of a different size, so a 1080-tall screen
@@ -972,3 +988,4 @@ mod oscillation {
         assert_eq!(g.lockout, 0, "the lockout must drain, never latch");
     }
 }
+
