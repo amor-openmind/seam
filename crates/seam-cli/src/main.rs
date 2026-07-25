@@ -690,6 +690,39 @@ async fn sync_peers(
     });
 }
 
+/// Apply a change of ownership: freeze or release this machine's input.
+#[cfg(target_os = "macos")]
+fn handover(
+    update: focus::Update,
+    detached: Option<seam_input::macos::CursorGuard>,
+) -> Option<seam_input::macos::CursorGuard> {
+    use focus::Focus;
+    match update.focus {
+        Focus::Remote(peer) => {
+            tracing::info!(%peer, "pointer and keyboard moved to this peer");
+            // Freeze the local cursor, then stop this machine acting on the input at all.
+            // Detach first, so that if suppression is somehow left on, the guard's Drop
+            // still clears it.
+            let guard = seam_input::macos::CursorGuard::detach(false).ok();
+            seam_input::macos::set_suppress_local(true);
+            guard
+        }
+        Focus::Local => {
+            tracing::info!("pointer and keyboard back on this machine");
+            seam_input::macos::set_suppress_local(false);
+            drop(detached);
+            // Put the real cursor where the layout says the pointer is. It has been frozen
+            // at the edge since focus left, and the next event adopts the OS position as
+            // truth — so without this the stale position immediately drags focus back
+            // across, and the pointer oscillates in a narrow band along the shared edge.
+            if let Err(e) = seam_input::warp_cursor(update.x, update.y) {
+                tracing::warn!("could not place the returning pointer: {e}");
+            }
+            None
+        }
+    }
+}
+
 /// Turn a captured non-motion event into a protocol frame.
 #[cfg(target_os = "macos")]
 fn to_frame(event: seam_input::macos::Observed, seq: u32) -> Option<seam_proto::Frame> {
@@ -866,21 +899,7 @@ fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geom
                 if let Some(u) = update
                     && u.changed
                 {
-                    match u.focus {
-                        Focus::Remote(peer) => {
-                            tracing::info!(%peer, "pointer and keyboard moved to this peer");
-                            // Freeze the local cursor, then stop this machine acting on
-                            // the input at all. Order matters: detach first so that if
-                            // suppression is somehow left on, the guard's Drop clears it.
-                            detached = seam_input::macos::CursorGuard::detach(false).ok();
-                            seam_input::macos::set_suppress_local(true);
-                        }
-                        Focus::Local => {
-                            tracing::info!("pointer and keyboard back on this machine");
-                            seam_input::macos::set_suppress_local(false);
-                            detached = None;
-                        }
-                    }
+                    detached = handover(u, detached);
                 }
 
                 let Some(target) = (match graph.focus() {
