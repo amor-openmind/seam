@@ -576,7 +576,14 @@ async fn daemon(
     let mut discovery = Discovery::new()?;
     discovery.advertise(&name, identity.peer_id(), identity.fingerprint(), bound.port())?;
 
-    tracing::info!(%name, id = %identity.peer_id(), %bound, peers = store.len(), "seam is running");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        %name,
+        id = %identity.peer_id(),
+        %bound,
+        peers = store.len(),
+        "seam is running"
+    );
     if store.is_empty() {
         tracing::warn!("no paired machines yet — run `seam pair` on this and another machine");
     }
@@ -1289,6 +1296,9 @@ fn start_pointer_forwarding(
             let mut detached: Option<seam_input::macos::CursorGuard> = None;
             // Where the local cursor is held while a peer owns the pointer.
             let mut parked: Option<(i32, i32)> = None;
+            // Rate limit for the drift warning below, so a moving cursor does not turn
+            // the log into noise at event rate.
+            let mut last_drift_warn: Option<std::time::Instant> = None;
 
             while let Some(event) = rx.recv().await {
                 if let Ok(mut last) = LAST_INPUT.lock() {
@@ -1351,9 +1361,34 @@ fn start_pointer_forwarding(
                 if graph.focus() != Focus::Local
                     && let (Some((px, py)), true) =
                         (parked, matches!(event, Observed::Motion { .. }))
-                    && let Err(e) = seam_input::warp_cursor(px, py)
                 {
-                    tracing::debug!("could not hold the local cursor still: {e}");
+                    // Measure before correcting. If the OS cursor is found away from
+                    // where it was parked, the detach is NOT holding in this process,
+                    // whatever its return value claimed - and that one line separates
+                    // the two remaining theories: real movement (detach broken, fix by
+                    // re-asserting it) versus movement the user can see but the OS
+                    // denies (a visibility problem, needing a different fix entirely).
+                    // Every bug fixed in this project was fixed by a line like this.
+                    if let Ok((cx, cy)) = seam_input::cursor_position()
+                        && (cx - px).abs().max((cy - py).abs()) > 4
+                        && last_drift_warn.is_none_or(|t| t.elapsed() > Duration::from_secs(1))
+                    {
+                        tracing::warn!(
+                            parked = ?(px, py),
+                            cursor = ?(cx, cy),
+                            "local cursor moved while detached - re-asserting the detach"
+                        );
+                        last_drift_warn = Some(std::time::Instant::now());
+                    }
+                    if let Err(e) = seam_input::warp_cursor(px, py) {
+                        tracing::debug!("could not hold the local cursor still: {e}");
+                    }
+                    // Warping is suspected of re-associating the cursor with the mouse,
+                    // which would make the pin itself the thing that unfreezes the
+                    // cursor: each event moves it, the next pin yanks it back, and the
+                    // user sees flicker. One extra call per event makes that impossible
+                    // rather than arguable.
+                    seam_input::macos::reassert_detach();
                 }
 
                 // Log the captured event and the resulting focus *before* deciding

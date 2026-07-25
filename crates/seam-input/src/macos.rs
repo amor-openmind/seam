@@ -227,6 +227,7 @@ impl CursorGuard {
             // SAFETY: the display argument is documented as ignored.
             unsafe { CGDisplayHideCursor(CGMainDisplayID()) };
         }
+        tracing::info!(hide, "cursor detached from the mouse");
         Ok(Self { hidden: hide })
     }
 
@@ -238,6 +239,10 @@ impl CursorGuard {
 
 impl Drop for CursorGuard {
     fn drop(&mut self) {
+        // Said out loud on purpose. A guard dying mid-session is invisible from the
+        // user's chair - the cursor just starts tracking again - and finding the
+        // watchdog bug took hours precisely because the release was silent.
+        tracing::info!("cursor reattached to the mouse");
         // Releasing the cursor and withholding input must end together: leaving
         // suppression on with the cursor reattached would be a Mac that ignores its own
         // keyboard.
@@ -873,6 +878,20 @@ pub fn capture_is_alive() -> Option<bool> {
     }
     // SAFETY: `tap` is the leaked, still-live tap stored when it was created.
     Some(unsafe { CGEventTapIsEnabled(tap.cast()) } != 0)
+}
+
+/// Re-assert the cursor/mouse disassociation, without constructing a new guard.
+///
+/// The association is global window-server state, and nothing guarantees it stays
+/// where seam put it: any process may restore it, and `CGWarpMouseCursorPosition` is
+/// suspected of quietly doing so. If it comes back mid-session the cursor starts
+/// tracking the mouse again with the guard still alive - which is indistinguishable,
+/// from the chair, from suppression being broken. Re-asserting is one cheap call and
+/// idempotent, so the daemon does it whenever it finds the cursor away from where it
+/// was parked, and after every pin.
+pub fn reassert_detach() {
+    // SAFETY: documented CoreGraphics call taking a plain boolean-as-integer.
+    let _ = unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
 }
 
 /// Start observing local input, with the ability to withhold it.
