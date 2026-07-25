@@ -88,8 +88,10 @@ Three properties are the product. Everything else is table stakes:
       exchanged in a scale-independent form, never in raw device pixels
 - [ ] F13 Multi-monitor peers expose their **true non-rectangular** desktop shape, so the
       pointer cannot be sent to a coordinate that exists on no physical display
-- [ ] F14 The layout is a real 2-D edge graph (this fleet is L-shaped: iMac above amor,
-      Mac-mini right of both) — not a left/right chain, and corners behave
+- [ ] F14 The layout is a real 2-D edge graph — not a left/right chain. This fleet is
+      L-shaped (iMac and Mac-mini side by side, amor below the iMac), so Mac-mini's left
+      edge borders the iMac along part of its length and **nothing** along the rest.
+      Partial edge adjacency, diagonal corners and dead zones must all behave.
 
 ### Onboarding (first-connection, elevated to a hard requirement)
 - [ ] O1 **Two fresh machines connect on the first attempt**, with no config file edited,
