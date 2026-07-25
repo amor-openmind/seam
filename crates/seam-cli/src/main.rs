@@ -220,15 +220,19 @@ async fn run_daemon(
     open_ui_when_ready: bool,
 ) -> Result<()> {
     {
-            // The licence gate. Checked before anything is bound or captured, so an
-            // unlicensed machine changes nothing about the system it runs on.
+            // The licence gate — but it must not be a dead end.
+            //
+            // This used to exit before anything started, which meant the activation
+            // screen had no server to be served from: seam refused to run, and the only
+            // way in was a command line. Now an unlicensed seam starts its page and
+            // nothing else. No input is captured, no port is opened to the network, no
+            // peer is contacted — the machine is untouched — but activation happens where
+            // a person can see it.
             if licence::stored(dir).is_none() {
-                anyhow::bail!(
-                    "seam needs a licence on this machine.\n\n  \
-                     Run:  seam activate <your-licence>\n\n  \
-                     Licences are issued by the owner and work offline, on every machine \
-                     you were given one for."
-                );
+                tracing::info!("no licence on this machine; opening the activation page");
+                // Returns once a licence is accepted, and the normal start continues
+                // below — activating should start seam, not tell you to start it again.
+                serve_activation_only(dir, open_ui_when_ready).await?;
             }
 
             #[cfg(target_os = "windows")]
@@ -1872,6 +1876,99 @@ fn set_start_at_login(enable: bool) -> bool {
     {
         let _ = (enable, exe);
         false
+    }
+}
+
+/// Serve the activation page, and nothing else, until this machine has a licence.
+///
+/// Deliberately minimal: a loopback page and the activate endpoint. No input tap, no QUIC
+/// socket, no discovery. An unlicensed seam is a form to fill in, not a running KVM — and
+/// it polls its own licence file so the moment activation succeeds it hands over to a real
+/// start without anyone typing a command.
+async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+    std::fs::write(dir.join("ui-port"), port.to_string()).ok();
+    println!("\n  seam needs a licence on this machine.");
+    println!("  Activate it at http://127.0.0.1:{port}/licence.html\n");
+
+    if open_page {
+        let url = format!("http://127.0.0.1:{port}/licence.html");
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("open").arg(&url).spawn();
+        #[cfg(target_os = "windows")]
+        let _ = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
+    }
+
+    let home = dir.to_path_buf();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((mut socket, _)) = accepted else { continue };
+                let home = home.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let path = request.split_whitespace().nth(1).unwrap_or("/");
+                    let method = request.split_whitespace().next().unwrap_or("GET");
+
+                    let (status, ctype, body) = if !request_is_local(&request, port) {
+                        ("403 Forbidden", "text/plain", "refused".to_owned())
+                    } else if method == "POST" && path == "/action/activate" {
+                        let key = request.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+                        match licence::activate(&home, key) {
+                            Ok(l) => (
+                                "200 OK",
+                                "application/json",
+                                format!(r#"{{"ok":true,"name":"{}"}}"#, l.name.replace('"', "'")),
+                            ),
+                            Err(e) => (
+                                "200 OK",
+                                "application/json",
+                                format!(
+                                    r#"{{"ok":false,"error":"{}"}}"#,
+                                    e.to_string().replace('"', "'")
+                                ),
+                            ),
+                        }
+                    } else if path == "/state" {
+                        // Enough for the page to render itself and show the result.
+                        (
+                            "200 OK",
+                            "application/json",
+                            format!(
+                                r#"{{"version":"{}","name":"this machine","id":"","platform":"{}/{}","role":"not activated","port":{port},"seamPort":0,"licence":{},"update":null,"activity":[],"peers":[],"health":[]}}"#,
+                                env!("CARGO_PKG_VERSION"),
+                                std::env::consts::OS,
+                                std::env::consts::ARCH,
+                                licence_json(&home),
+                            ),
+                        )
+                    } else if let Some((_, page, ctype)) =
+                        UI_PAGES.iter().find(|(route, _, _)| *route == path)
+                    {
+                        ("200 OK", *ctype, (*page).to_owned())
+                    } else {
+                        ("404 Not Found", "text/plain", "not found".to_owned())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+                         Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                if licence::stored(dir).is_some() {
+                    println!("  activated — starting seam");
+                    let _ = std::fs::remove_file(dir.join("ui-port"));
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
