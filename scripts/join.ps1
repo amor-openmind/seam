@@ -18,15 +18,14 @@ $repo   = "amor-openmind/seam-releases"
 $server = $env:SEAM_SERVER
 $home_  = if ($env:SEAM_HOME) { $env:SEAM_HOME } else { Join-Path $env:USERPROFILE ".seam" }
 
-# The server is trusted for one thing: a version number.
-try {
-  $info = Invoke-RestMethod -UseBasicParsing -TimeoutSec 5 "http://$server/join"
-} catch {
-  Write-Error "No answer from $server - is seam running there, and is the port right?"
+# The version is baked into the command by the page that generated it. Asking the server
+# was the original design and could never work: seam's HTTP page listens on loopback, and
+# the port peers use is QUIC over UDP - there is nothing on the network to ask.
+$version = $env:SEAM_VERSION
+if (-not $version) {
+  Write-Error "No version given. Copy the command from the Add a machine page."
   return
 }
-$version = $info.version
-if (-not $version) { Write-Error "That machine did not report a version."; return }
 
 New-Item -ItemType Directory -Force -Path $home_ | Out-Null
 $bin = Join-Path $home_ "seam-$version.exe"

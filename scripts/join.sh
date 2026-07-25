@@ -21,8 +21,11 @@ case "$(uname -s)" in
   *) echo "seam: this script covers macOS; on Windows use join.ps1" >&2; exit 1 ;;
 esac
 
-VERSION="$(curl -fsS --max-time 5 "http://$SERVER/join" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
-[ -n "$VERSION" ] || { echo "seam: no answer from $SERVER — is seam running there?" >&2; exit 1; }
+# The version is baked into the command by the page that generated it. Asking the server
+# was the original design and could never work: seam's HTTP page listens on loopback, and
+# the port peers use is QUIC over UDP — there is nothing on the network to ask.
+VERSION="${SEAM_VERSION:-}"
+[ -n "$VERSION" ] || { echo "seam: no version given. Copy the command from the Add a machine page." >&2; exit 1; }
 
 HOME_DIR="${SEAM_HOME:-$HOME/.seam}"
 BIN="$HOME_DIR/seam-$VERSION"
