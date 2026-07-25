@@ -249,22 +249,28 @@ impl Graph {
             // The position along the edge is scaled, so screens of different sizes line
             // up proportionally instead of by raw pixel row.
             let target = &self.nodes[next];
+            let (tw, th) = (target.width, target.height);
             match edge {
                 Edge::Left => {
-                    self.y = scale(self.y, h, target.height);
-                    self.x += target.width;
+                    self.y = scale(self.y, h, th);
+                    self.x += tw;
+                    // Arrive a margin inside the far edge, not on it.
+                    self.x = self.x.min(tw - 1 - ENTRY_MARGIN.min(tw / 4));
                 }
                 Edge::Right => {
-                    self.y = scale(self.y, h, target.height);
+                    self.y = scale(self.y, h, th);
                     self.x -= w;
+                    self.x = self.x.max(ENTRY_MARGIN.min(tw / 4));
                 }
                 Edge::Top => {
-                    self.x = scale(self.x, w, target.width);
-                    self.y += target.height;
+                    self.x = scale(self.x, w, tw);
+                    self.y += th;
+                    self.y = self.y.min(th - 1 - ENTRY_MARGIN.min(th / 4));
                 }
                 Edge::Bottom => {
-                    self.x = scale(self.x, w, target.width);
+                    self.x = scale(self.x, w, tw);
                     self.y -= h;
+                    self.y = self.y.max(ENTRY_MARGIN.min(th / 4));
                 }
             }
             self.current = next;
@@ -277,6 +283,18 @@ impl Graph {
         Update { focus: self.focus(), changed: self.current != before, x: self.x, y: self.y }
     }
 }
+
+/// How far inside a screen the pointer is placed on arrival.
+///
+/// Landing exactly on the boundary means a single pixel of movement the other way crosses
+/// straight back, and the pointer ping-pongs between machines on consecutive events —
+/// observed in a real session as a return immediately followed by another crossing 20 ms
+/// later, which reads as "it never came back".
+///
+/// A margin makes the boundary hysteretic: having crossed, the pointer must be moved
+/// deliberately back through the margin to cross again. Every KVM needs some form of this;
+/// Barrier calls it a switch delay.
+const ENTRY_MARGIN: i32 = 12;
 
 /// Map a position along an edge onto a screen of a different size, so a 1080-tall screen
 /// and a 2160-tall one line up proportionally rather than by raw pixel row.
@@ -402,8 +420,9 @@ mod tests {
         g.apply_motion(0, 541);
         assert_eq!(g.focus(), Focus::Remote(laptop()));
 
-        // The pointer entered the laptop at y=1, so -2 puts it just past the top.
-        let update = g.apply_motion(0, -2);
+        // The pointer enters the laptop a margin below its top edge, so it must be moved
+        // deliberately back through that margin to leave again.
+        let update = g.apply_motion(0, -(ENTRY_MARGIN + 2));
         assert_eq!(update.focus, Focus::Remote(imac()));
         assert!(update.y > 900, "should enter near the bottom, got {}", update.y);
     }
@@ -671,7 +690,7 @@ mod entry_position {
         g.sync_local_cursor(0, 540);
         let update = g.apply_motion(-1, 0);
         assert_eq!(update.focus, Focus::Remote(imac()));
-        assert_eq!(update.x, 1919, "should arrive at the neighbour's far edge");
+        assert_eq!(update.x, 1907, "arrives a margin inside the far edge, not on it");
     }
 
     #[test]
@@ -699,13 +718,42 @@ mod entry_position {
     }
 
     #[test]
-    fn arriving_at_the_far_edge_can_leave_again_immediately() {
-        // Entering at x = width-1 means one step right is enough to go back, which is what
-        // makes a brief overshoot feel like a bounce rather than a trap.
+    fn a_crossing_cannot_immediately_bounce_back() {
+        // This is the bug seen in a real session: every return was followed by another
+        // crossing 20 ms later, so the pointer never appeared to come back at all.
         let mut g = pair();
         g.sync_local_cursor(0, 540);
         g.apply_motion(-1, 0);
+        assert_eq!(g.focus(), Focus::Remote(imac()));
+
+        for step in 0..ENTRY_MARGIN {
+            assert_eq!(
+                g.apply_motion(1, 0).focus,
+                Focus::Remote(imac()),
+                "bounced back after only {step} px"
+            );
+        }
+        // Deliberate movement through the margin still crosses.
         assert_eq!(g.apply_motion(1, 0).focus, Focus::Local);
+    }
+
+    #[test]
+    fn the_margin_protects_both_directions() {
+        // Returning must be as stable as leaving, or the pointer ping-pongs on the way
+        // home instead of on the way out.
+        let mut g = pair();
+        g.sync_local_cursor(0, 540);
+        g.apply_motion(-1, 0);
+        while g.focus() != Focus::Local {
+            g.apply_motion(1, 0);
+        }
+        for step in 0..ENTRY_MARGIN {
+            assert_eq!(
+                g.apply_motion(-1, 0).focus,
+                Focus::Local,
+                "bounced away again after only {step} px"
+            );
+        }
     }
 
     #[test]
@@ -717,6 +765,12 @@ mod entry_position {
         g.sync_local_cursor(0, 540);
         g.apply_motion(-1, 0);
         assert_eq!(g.focus(), Focus::Remote(imac()));
-        assert_eq!(g.apply_motion(1, 0).focus, Focus::Local, "one step must still return it");
+        // Past the entry margin, it is still escapable — wrong or stale geometry must
+        // never trap the pointer behind a boundary thousands of pixels away.
+        assert_eq!(
+            g.apply_motion(ENTRY_MARGIN + 1, 0).focus,
+            Focus::Local,
+            "a short deliberate movement must still return it"
+        );
     }
 }

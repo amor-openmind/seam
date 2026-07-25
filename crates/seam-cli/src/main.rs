@@ -855,6 +855,7 @@ async fn receive_reliable(link: Arc<Link>, geometry: Geometry) {
 /// **Mirror mode.** The capture is listen-only, so the local pointer keeps moving too:
 /// this proves the whole path end to end without any code being able to suppress input,
 /// which is the failure that can freeze a Mac until it is rebooted.
+#[expect(clippy::too_many_lines, reason = "one event loop; splitting it hides the ordering")]
 fn start_pointer_forwarding(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, geometry: Geometry) {
     #[cfg(target_os = "macos")]
     {
