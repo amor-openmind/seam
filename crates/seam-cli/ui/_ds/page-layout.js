@@ -1,93 +1,152 @@
-// Arrange your desk — machines placed where they sit, not listed.
+// Arrange your desk — each machine placed against ANOTHER machine, not against this one.
 //
-// The first version appended every machine to one container, so a page for arranging
-// things showed a column. The design provides a three-by-three desk with a named cell per
-// side; this puts each machine in the cell matching its edge, which is the whole point.
+// The first model was a star: every machine on a side of this one. Real desks are chains.
+// A laptop below the iMac, which is itself left of the Mac mini, cannot be described as
+// "below the Mac mini" — and saying so put the pointer through the wrong edge.
 //
-// Both surfaces write the same thing: dropping a machine on a side, and choosing that side
-// by name. The named control is not a lesser fallback — it is the only one that works with
-// a keyboard, and it is what the drag is shorthand for.
+// So a placement is a relation: <machine> is <side> of <neighbour>. The desk lays those
+// relations out by walking from this machine outwards, which is why a chain draws as a
+// chain and not as a ring around the middle.
 (function () {
   "use strict";
 
   var EDGES = ["left", "right", "top", "bottom"];
+  var OPPOSITE = { left: "right", right: "left", top: "bottom", bottom: "top" };
+  var STEP = { left: [-1, 0], right: [1, 0], top: [0, -1], bottom: [0, 1] };
+
+  var stage = document.querySelector("[data-stage]") || document.querySelector(".stage");
   var desk = document.querySelector("[data-desk]");
   var tpl = document.querySelector("[data-machine-template]");
   var rows = document.querySelector(".rows");
   var rowTpl = window.seam.template(rows, "[data-edge-row]");
 
-  function cell(side) { return document.querySelector('[data-cell="' + side + '"]'); }
-
-  function place(peer, edge) {
-    fetch("/action/layout/" + peer + "/" + edge, { method: "POST" })
+  function save(peer, edge, anchor) {
+    fetch("/action/layout/" + peer + "/" + edge + "/" + anchor, { method: "POST" })
       .then(function (r) { return r.json(); })
       .then(function (res) {
         if (!res.ok) return;
         var saved = document.querySelector("[data-saved]");
-        if (saved) {
-          saved.hidden = false;
-          setTimeout(function () { saved.hidden = true; }, 1800);
-        }
+        if (saved) { saved.hidden = false; setTimeout(function () { saved.hidden = true; }, 1800); }
       })
       .catch(function () {});
   }
 
+  // Walk the relations outward from this machine, giving every machine a grid coordinate.
+  // A machine whose neighbour is not placed yet waits for a later pass; one that never
+  // resolves is dropped rather than drawn somewhere arbitrary.
+  function coordinates(s) {
+    var self = window.seam.short(s.id);
+    var at = {};
+    at[self] = [0, 0];
+    var pending = (s.peers || []).slice();
+    for (var pass = 0; pass < 8 && pending.length; pass++) {
+      pending = pending.filter(function (p) {
+        var id = window.seam.short(p.id);
+        var anchor = p.anchor || self;
+        var edge = EDGES.indexOf(p.edge) === -1 ? "left" : p.edge;
+        if (!at[anchor]) return true;
+        var base = at[anchor];
+        var d = STEP[edge];
+        var x = base[0] + d[0], y = base[1] + d[1];
+        // Never stack two machines on one square: shift along until the square is free.
+        var guard = 0;
+        while (Object.keys(at).some(function (k) { return at[k][0] === x && at[k][1] === y; })) {
+          x += d[0] || 1; y += d[1];
+          if (++guard > 8) return false;
+        }
+        at[id] = [x, y];
+        return false;
+      });
+    }
+    return at;
+  }
+
   function render(s) {
     var peers = s.peers || [];
-
-    var self = document.querySelector("[data-self]");
-    if (self) {
-      window.seam.text(self, ".name", s.name);
-      window.seam.text(self, ".size", window.seam.short(s.id));
-      self.classList.toggle("holding", s.focus === "local");
-    }
+    var self = window.seam.short(s.id);
+    var at = coordinates(s);
 
     if (desk && tpl) {
-      // A machine can only occupy one side, so the first claim on a side wins and any
-      // other lands on the first free one. Two machines drawn on top of each other would
-      // be worse than one of them being somewhere it was not put.
-      var taken = {};
-      EDGES.forEach(function (side) {
-        var c = cell(side);
-        if (!c) return;
-        c.textContent = "";
-        c.className = "cell " + side + " empty";
-        c.textContent = side === "top" ? "above" : side === "bottom" ? "below" : side;
-      });
+      var xs = Object.keys(at).map(function (k) { return at[k][0]; });
+      var ys = Object.keys(at).map(function (k) { return at[k][1]; });
+      var minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
+      var minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
+      // One spare ring all round, so every machine has a free square to be dropped onto.
+      minX -= 1; maxX += 1; minY -= 1; maxY += 1;
 
-      peers.forEach(function (p) {
-        var side = EDGES.indexOf(p.edge) === -1 ? null : p.edge;
-        if (!side || taken[side]) side = EDGES.find(function (e) { return !taken[e]; });
-        if (!side) return;
-        taken[side] = true;
+      desk.textContent = "";
+      desk.style.gridTemplateColumns = "repeat(" + (maxX - minX + 1) + ",minmax(96px,150px))";
+      desk.style.gridTemplateRows = "repeat(" + (maxY - minY + 1) + ",84px)";
 
-        var c = cell(side);
-        if (!c) return;
-        c.textContent = "";
-        c.className = "cell " + side + " touching";
+      var byCoord = {};
+      Object.keys(at).forEach(function (k) { byCoord[at[k][0] + "," + at[k][1]] = k; });
 
-        var el = tpl.content.firstElementChild.cloneNode(true);
-        var short = window.seam.short(p.id);
-        window.seam.text(el, ".tag", side === "top" ? "above" : side === "bottom" ? "below" : side);
-        window.seam.text(el, ".name", p.name || short);
-        window.seam.text(el, ".size", short);
-        el.setAttribute("data-peer", short);
-        el.classList.toggle("holding", s.focus === short);
-        c.appendChild(el);
-      });
+      for (var y = minY; y <= maxY; y++) {
+        for (var x = minX; x <= maxX; x++) {
+          var who = byCoord[x + "," + y];
+          var cell = document.createElement("div");
+          cell.className = "cell";
+          cell.setAttribute("data-x", x);
+          cell.setAttribute("data-y", y);
+
+          if (!who) {
+            cell.classList.add("empty");
+            desk.appendChild(cell);
+            continue;
+          }
+
+          var p = who === self ? null : peers.find(function (q) { return window.seam.short(q.id) === who; });
+          var el = tpl.content.firstElementChild.cloneNode(true);
+          if (!p) {
+            el.classList.add("self");
+            el.removeAttribute("draggable");
+            window.seam.text(el, ".tag", "this machine");
+            window.seam.text(el, ".name", s.name);
+            window.seam.text(el, ".size", self);
+            el.classList.toggle("holding", s.focus === "local");
+          } else {
+            window.seam.text(el, ".tag", (p.edge || "") + " of " + (p.anchor || self));
+            window.seam.text(el, ".name", p.name || who);
+            window.seam.text(el, ".size", who);
+            el.setAttribute("data-peer", who);
+            el.classList.toggle("holding", s.focus === who);
+          }
+          cell.appendChild(el);
+          desk.appendChild(cell);
+        }
+      }
     }
 
+    // The written form of the same relation, and the only one usable with a keyboard.
     if (rows && rowTpl) {
       window.seam.clear(rows, "[data-edge-row]");
       peers.forEach(function (p) {
+        var id = window.seam.short(p.id);
         var row = rowTpl.cloneNode(true);
-        var short = window.seam.short(p.id);
-        window.seam.text(row, ".who .n", p.name || short);
-        window.seam.text(row, ".who .d", short);
-        var sel = row.querySelector("[data-edge]");
-        if (sel) {
-          if (EDGES.indexOf(p.edge) !== -1) sel.value = p.edge;
-          sel.setAttribute("data-peer", short);
+        window.seam.text(row, ".who .n", p.name || id);
+        window.seam.text(row, ".who .d", id);
+
+        var edgeSel = row.querySelector("[data-edge]");
+        if (edgeSel) {
+          if (EDGES.indexOf(p.edge) !== -1) edgeSel.value = p.edge;
+          edgeSel.setAttribute("data-peer", id);
+        }
+        var anchorSel = row.querySelector("[data-anchor]");
+        if (anchorSel) {
+          anchorSel.textContent = "";
+          var options = [[self, s.name + " (this machine)"]];
+          peers.forEach(function (q) {
+            var qid = window.seam.short(q.id);
+            if (qid !== id) options.push([qid, q.name || qid]);
+          });
+          options.forEach(function (o) {
+            var opt = document.createElement("option");
+            opt.value = o[0];
+            opt.textContent = o[1];
+            anchorSel.appendChild(opt);
+          });
+          anchorSel.value = p.anchor || self;
+          anchorSel.setAttribute("data-peer", id);
         }
         rows.appendChild(row);
       });
@@ -97,8 +156,8 @@
 
   window.seam.onState(render);
 
-  // Dragging: the cell dropped on IS the answer, so there is nothing to infer from
-  // coordinates and no corner case at the corners.
+  // Dropping on an empty square means "next to whatever is beside that square", which is
+  // how a chain gets built by hand without ever naming an anchor.
   var dragged = null;
   document.addEventListener("dragstart", function (e) {
     var el = e.target.closest && e.target.closest("[data-peer]");
@@ -107,17 +166,17 @@
     el.classList.add("dragging");
     if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
   });
-  document.addEventListener("dragend", function (e) {
-    var el = e.target.closest && e.target.closest("[data-peer]");
-    if (el) el.classList.remove("dragging");
-    var over = document.querySelector(".cell.over");
-    if (over) over.classList.remove("over");
+  document.addEventListener("dragend", function () {
+    var d = document.querySelector(".dragging");
+    if (d) d.classList.remove("dragging");
+    var o = document.querySelector(".cell.over");
+    if (o) o.classList.remove("over");
     dragged = null;
   });
   document.addEventListener("dragover", function (e) {
     if (!dragged) return;
-    var c = e.target.closest && e.target.closest("[data-cell]");
-    if (!c || c.getAttribute("data-cell") === "self") return;
+    var c = e.target.closest && e.target.closest("[data-x]");
+    if (!c || !c.classList.contains("empty")) return;
     e.preventDefault();
     var prev = document.querySelector(".cell.over");
     if (prev && prev !== c) prev.classList.remove("over");
@@ -125,30 +184,37 @@
   });
   document.addEventListener("drop", function (e) {
     if (!dragged) return;
-    var c = e.target.closest && e.target.closest("[data-cell]");
-    if (!c) return;
-    var side = c.getAttribute("data-cell");
-    if (side === "self" || EDGES.indexOf(side) === -1) return;
+    var c = e.target.closest && e.target.closest("[data-x]");
+    if (!c || !c.classList.contains("empty")) return;
     e.preventDefault();
-    c.classList.remove("over");
-    place(dragged, side);
+    var x = Number(c.getAttribute("data-x")), y = Number(c.getAttribute("data-y"));
+
+    // Which machine is this square touching? That machine becomes the anchor, and the
+    // side it was dropped on becomes the edge.
+    var found = null;
+    EDGES.forEach(function (edge) {
+      if (found) return;
+      var d = STEP[edge];
+      var n = document.querySelector('[data-x="' + (x + d[0]) + '"][data-y="' + (y + d[1]) + '"]');
+      var occupant = n && n.querySelector(".screen");
+      if (!occupant) return;
+      var anchor = occupant.classList.contains("self")
+        ? occupant.querySelector(".size").textContent
+        : occupant.getAttribute("data-peer");
+      if (anchor && anchor !== dragged) found = { edge: OPPOSITE[edge], anchor: anchor };
+    });
+
+    if (found) save(dragged, found.edge, found.anchor);
     dragged = null;
   });
 
   document.addEventListener("change", function (e) {
-    var sel = e.target.closest && e.target.closest("[data-edge]");
-    if (!sel) return;
-    var peer = sel.getAttribute("data-peer");
-    if (peer && EDGES.indexOf(sel.value) !== -1) place(peer, sel.value);
-  });
-
-  // The keyboard route: arrow keys on a focused machine put it on that side.
-  document.addEventListener("keydown", function (e) {
-    var el = e.target.closest && e.target.closest("[data-peer]");
+    var el = e.target.closest && e.target.closest("[data-edge], [data-anchor]");
     if (!el) return;
-    var map = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "top", ArrowDown: "bottom" };
-    if (!map[e.key]) return;
-    e.preventDefault();
-    place(el.getAttribute("data-peer"), map[e.key]);
+    var row = el.closest("[data-edge-row]");
+    var peer = el.getAttribute("data-peer");
+    var edge = row.querySelector("[data-edge]");
+    var anchor = row.querySelector("[data-anchor]");
+    if (peer && edge && anchor) save(peer, edge.value, anchor.value);
   });
 })();

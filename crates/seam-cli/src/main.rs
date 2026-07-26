@@ -1096,8 +1096,9 @@ async fn route(
         let mut parts = path.trim_start_matches("/action/layout/").split('/');
         let peer = parts.next().unwrap_or("");
         let edge = parts.next().unwrap_or("");
+        let anchor = parts.next().unwrap_or("self");
         let dir = ui_port_note.parent().unwrap_or(ui_port_note);
-        let ok = set_layout(dir, peer, edge);
+        let ok = set_layout(dir, peer, edge, anchor);
         ("200 OK", "application/json", format!(r#"{{"ok":{ok}}}"#))
     } else if method == "POST" && path.starts_with("/action/peer/") {
         let mut parts = path.trim_start_matches("/action/peer/").split('/');
@@ -1885,34 +1886,46 @@ fn lan_address() -> Option<String> {
 /// enough to be useful and wrong in a way nothing could detect — a screen's physical
 /// position is the one fact about a desk that is not visible from software. When someone
 /// says where a machine actually is, that answer outranks the guess and survives restarts.
-fn stored_layout(dir: &std::path::Path) -> Vec<(String, String)> {
+fn stored_layout(dir: &std::path::Path) -> Vec<(String, String, String)> {
     let Ok(text) = std::fs::read_to_string(dir.join("layout")) else { return Vec::new() };
     text.lines()
         .filter_map(|line| {
-            let (peer, edge) = line.trim().split_once(' ')?;
-            matches!(edge, "left" | "right" | "top" | "bottom")
-                .then(|| (peer.to_owned(), edge.to_owned()))
+            let mut parts = line.trim().split(' ');
+            let peer = parts.next()?;
+            let edge = parts.next()?;
+            // A missing anchor means "next to this machine", which is what every
+            // arrangement written before relations existed meant.
+            let anchor = parts.next().unwrap_or("self");
+            matches!(edge, "left" | "right" | "top" | "bottom").then(|| {
+                (peer.to_owned(), edge.to_owned(), anchor.to_owned())
+            })
         })
         .collect()
 }
 
-/// Record where a machine sits, replacing any earlier answer for it.
-fn set_layout(dir: &std::path::Path, short_id: &str, edge: &str) -> bool {
-    if !matches!(edge, "left" | "right" | "top" | "bottom") {
+/// Record that a machine sits on one side of another, replacing any earlier answer.
+///
+/// A relation, not a side of this machine. A desk is a chain: a laptop below the iMac,
+/// which is itself left of this machine. Describing that as "below this machine" is simply
+/// false, and it sent the pointer through an edge nothing was on.
+fn set_layout(dir: &std::path::Path, short_id: &str, edge: &str, anchor: &str) -> bool {
+    if !matches!(edge, "left" | "right" | "top" | "bottom") || short_id.is_empty() {
+        return false;
+    }
+    // A machine cannot sit beside itself, and a pair cannot each be beside the other:
+    // either would be a layout with no fixed point to draw from.
+    if anchor == short_id {
         return false;
     }
     let mut lines: Vec<String> = stored_layout(dir)
         .into_iter()
-        .filter(|(peer, _)| peer != short_id)
-        .map(|(peer, e)| format!("{peer} {e}"))
+        .filter(|(peer, _, _)| peer != short_id)
+        .map(|(peer, e, a)| format!("{peer} {e} {a}"))
         .collect();
-    lines.push(format!("{short_id} {edge}"));
+    lines.push(format!("{short_id} {edge} {anchor}"));
     let written = std::fs::write(dir.join("layout"), lines.join("\n")).is_ok();
     if written {
-        tracing::info!(peer = short_id, edge, "arrangement set from the desk page");
-        // Re-place on the next sync rather than mutating the graph from here: the
-        // forwarding loop owns it, and two writers to a live layout is how the pointer
-        // ends up somewhere nobody chose.
+        tracing::info!(peer = short_id, edge, anchor, "arrangement set from the desk page");
         UI_RELAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     written
@@ -2010,9 +2023,13 @@ async fn ui_state_json(
             .unwrap_or("receives input");
         let _ = we_dialled;
         let enabled = UI_DISABLED.lock().is_ok_and(|off| !off.contains(&peer));
+        let anchor = stored_layout(dir)
+            .into_iter()
+            .find(|(p, _, _)| peer.to_string().starts_with(p.as_str()))
+            .map_or_else(|| "self".to_owned(), |(_, _, a)| a);
         let _ = write!(
             peers,
-            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}","role":"{role}","enabled":{enabled},"version":"{}"}}"#,
+            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}","anchor":"{anchor}","role":"{role}","enabled":{enabled},"version":"{}"}}"#,
             link.remote_address(),
             UI_VERSIONS
                 .lock()
@@ -3037,19 +3054,30 @@ async fn sync_peers(
         // layout: the first machine sits to the LEFT, the next one BELOW that. A layout
         // editor belongs in the UI; this makes handover work without asking anyone to
         // draw anything (goal Z3).
-        // A person's answer outranks the guess.
-        if let Some(chosen) = stored_layout(dir)
+        // A person's answer outranks the guess — and it is a relation, so the machine it
+        // is placed against has to be on the desk first. If it is not yet, this one waits
+        // for a later pass rather than being anchored to something arbitrary.
+        if let Some((_, edge, anchor)) = stored_layout(dir)
             .into_iter()
-            .find(|(peer, _)| id.to_string().starts_with(peer.as_str()))
-            .and_then(|(_, edge)| match edge.as_str() {
-                "left" => Some(focus::Edge::Left),
-                "right" => Some(focus::Edge::Right),
-                "top" => Some(focus::Edge::Top),
-                "bottom" => Some(focus::Edge::Bottom),
-                _ => None,
-            })
+            .find(|(peer, _, _)| id.to_string().starts_with(peer.as_str()))
         {
-            graph.place(*id, chosen, None, w, h);
+            let chosen = match edge.as_str() {
+                "left" => focus::Edge::Left,
+                "right" => focus::Edge::Right,
+                "top" => focus::Edge::Top,
+                _ => focus::Edge::Bottom,
+            };
+            let against = if anchor == "self" {
+                None
+            } else {
+                let found = known.iter().find(|k| k.to_string().starts_with(anchor.as_str()));
+                match found {
+                    Some(peer) => Some(*peer),
+                    // Its neighbour is not placed yet. Come back to it.
+                    None => continue,
+                }
+            };
+            graph.place(*id, chosen, against, w, h);
             if let Ok(mut places) = UI_PLACES.lock() {
                 places.retain(|(p, _)| p != id);
                 places.push((
@@ -3063,7 +3091,7 @@ async fn sync_peers(
                 ));
             }
             known.push(*id);
-            tracing::info!(peer = %id, ?chosen, "placed where you said it sits");
+            tracing::info!(peer = %id, %edge, %anchor, "placed where you said it sits");
             continue;
         }
 
