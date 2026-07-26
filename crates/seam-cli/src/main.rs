@@ -981,14 +981,14 @@ async fn apply_clipboard_image(
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
 ) {
     let mut state = clipboard.lock().await;
-    if generation <= state.applied_generation {
+    if state.already_applied(peer, generation) {
         return;
     }
     match seam_input::clipboard::write_image(width, height, &rgba) {
         Ok(()) => {
             tracing::info!(%peer, width, height, bytes = rgba.len(), "clipboard image received");
             note_transfer("image received", format!("{width} x {height}"));
-            state.applied_generation = generation;
+            state.record(peer, generation);
             state.image_sig = Some(image_signature(width, height, &rgba));
             state.last_seen = None;
             drop(state);
@@ -1190,7 +1190,7 @@ async fn apply_clipboard_files(
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
 ) {
     let mut state = clipboard.lock().await;
-    if generation <= state.applied_generation {
+    if state.already_applied(peer, generation) {
         return;
     }
     let spooled = match spool_clipboard_files(generation, &entries) {
@@ -1205,7 +1205,7 @@ async fn apply_clipboard_files(
             let bytes: usize = entries.iter().map(|(_, b)| b.len()).sum();
             tracing::info!(%peer, files = entries.len(), bytes, "clipboard files received");
             note_transfer("files received", format!("{} files, {} KB", entries.len(), bytes / 1024));
-            state.applied_generation = generation;
+            state.record(peer, generation);
             state.files_sig = Some(files_signature(&spooled));
             state.last_seen = None;
             state.image_sig = None;
@@ -2421,8 +2421,14 @@ type Clipboard = Arc<tokio::sync::Mutex<ClipboardState>>;
 struct ClipboardState {
     /// The last text seen on this machine, whether typed here or received from a peer.
     last_seen: Option<String>,
-    /// Highest generation applied from a peer, so an echo is recognised and dropped.
-    applied_generation: u64,
+    /// Highest generation applied, PER PEER.
+    ///
+    /// Generations are each machine's own counter, so comparing them across machines is
+    /// meaningless: a peer that restarts begins at 1, and a machine that has been running
+    /// for hours is at 40 — every frame from the fresh peer then looks older than what is
+    /// already applied and is silently dropped. Keyed by peer, the counter does what it
+    /// was for: recognising that machine's own echo.
+    applied: Vec<(seam_proto::PeerId, u64)>,
     /// This machine's own change counter.
     generation: u64,
     /// Signature of the last image seen or applied, so an echo is recognised without
@@ -2541,6 +2547,19 @@ fn spool_clipboard_files(
         }
     }
     Ok(tops)
+}
+
+impl ClipboardState {
+    /// Has this peer already sent us this generation, or a newer one?
+    fn already_applied(&self, peer: seam_proto::PeerId, generation: u64) -> bool {
+        self.applied.iter().any(|(p, g)| *p == peer && *g >= generation)
+    }
+
+    /// Record what was applied from a peer.
+    fn record(&mut self, peer: seam_proto::PeerId, generation: u64) {
+        self.applied.retain(|(p, _)| *p != peer);
+        self.applied.push((peer, generation));
+    }
 }
 
 /// Cheap identity for clipboard images: dimensions plus a streaming hash of the pixels.
@@ -3130,14 +3149,14 @@ async fn receive_reliable(
             }
             Ok(seam_proto::Frame::ClipboardText { generation, text, .. }) => {
                 let mut state = clipboard.lock().await;
-                if generation <= state.applied_generation {
+                if state.already_applied(peer, generation) {
                     // An echo, or something older than what we already have.
                     continue;
                 }
                 match seam_input::clipboard::write_text(&text) {
                     Ok(()) => {
                         tracing::info!(%peer, chars = text.chars().count(), "clipboard received");
-                        state.applied_generation = generation;
+                        state.record(peer, generation);
                         // Remember what we just wrote, so the poller does not see it as a
                         // local change and send it straight back.
                         state.last_seen = Some(text.clone());
