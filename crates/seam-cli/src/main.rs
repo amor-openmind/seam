@@ -841,7 +841,7 @@ async fn daemon(
 
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("shutting down");
-    let _ = std::fs::remove_file(dir.join("ui-port"));
+    remove_ui_port_note_if_ours(dir);
     // Never exit while this machine is still withholding its own input.
     seam_input::release_input();
     tracing::info!("this machine's input restored");
@@ -1080,7 +1080,16 @@ async fn route(
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
             seam_input::release_input();
-            let _ = std::fs::remove_file(note);
+            // Only take the note down if it still names this process. A takeover
+            // quits the old seam politely, and by the time this timer fires the
+            // replacement has often already written its own port here — deleting it
+            // unconditionally left the survivor healthy but unfindable.
+            let noted = std::fs::read_to_string(&note)
+                .ok()
+                .and_then(|text| text.trim().parse::<u16>().ok());
+            if noted == Some(port) {
+                let _ = std::fs::remove_file(note);
+            }
             std::process::exit(0);
         });
         ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
@@ -1292,6 +1301,26 @@ static UI_HOME: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex:
 /// indistinguishable from one that is broken.
 static UI_TRANSFER: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
+/// The loopback port THIS process's page is on — zero until the page is up.
+///
+/// Exists so shutdown can tell whether the `ui-port` note on disk is still its own.
+/// During a takeover the dying seam and the one replacing it share that file, and
+/// deleting it unconditionally erased the survivor's note: the running seam kept
+/// serving, but every page and script that looks the port up found nothing. Observed
+/// live — the fleet was healthy and unreachable at the same time.
+static UI_PORT_SELF: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Remove the `ui-port` note only if it still names this process's own page.
+fn remove_ui_port_note_if_ours(dir: &std::path::Path) {
+    let own = UI_PORT_SELF.load(std::sync::atomic::Ordering::Relaxed);
+    let note = dir.join("ui-port");
+    let noted =
+        std::fs::read_to_string(&note).ok().and_then(|text| text.trim().parse::<u16>().ok());
+    if own != 0 && noted == Some(own) {
+        let _ = std::fs::remove_file(note);
+    }
+}
+
 /// Note what the clipboard is doing, for the UI.
 fn note_transfer(what: &str, detail: String) {
     if let Ok(mut slot) = UI_TRANSFER.lock() {
@@ -1450,6 +1479,7 @@ fn start_ui_server(
         if let Err(e) = std::fs::write(dir.join("ui-port"), port.to_string()) {
             tracing::warn!("ui is up but 'seam ui' will not find it: {e}");
         }
+        UI_PORT_SELF.store(port, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(port, "fleet page ready — 'seam ui' opens it");
 
         let ui_port_note = dir.join("ui-port");
@@ -2350,6 +2380,7 @@ async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     std::fs::write(dir.join("ui-port"), port.to_string()).ok();
+    UI_PORT_SELF.store(port, std::sync::atomic::Ordering::Relaxed);
     println!("\n  seam needs a licence on this machine.");
     println!("  Activate it at http://127.0.0.1:{port}/licence.html\n");
 
@@ -2445,7 +2476,7 @@ async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result
             () = tokio::time::sleep(Duration::from_secs(1)) => {
                 if licence::stored(dir).is_some() {
                     println!("  activated — starting seam");
-                    let _ = std::fs::remove_file(dir.join("ui-port"));
+                    remove_ui_port_note_if_ours(dir);
                     return Ok(());
                 }
             }
