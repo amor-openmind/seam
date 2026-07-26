@@ -142,7 +142,11 @@ impl Endpoint {
         let addr = incoming.remote_address();
         Some(match incoming.await {
             Ok(connection) => Link::from_connection(connection),
-            Err(e) => Err(Error::Connect { addr, reason: e.to_string() }),
+            // Not `Error::Connect`: that one says "could not reach the peer at …", which
+            // reads as an outbound failure. An afternoon was spent chasing a log that
+            // said a machine could not *reach* an address it was in fact being dialled
+            // from.
+            Err(e) => Err(Error::Handshake { addr, reason: e.to_string() }),
         })
     }
 

@@ -2900,21 +2900,36 @@ fn start_auto_dial(
                     }
                     tracing::info!(peer = %peer.name, "found a paired machine; connecting");
                     for address in &peer.addresses {
-                        if let Ok(link) = endpoint.connect(*address).await
-                            && link.authorize(&store).is_ok()
-                        {
-                            tracing::info!(peer = %link.peer_id(), %address, "found and connected");
-                            let link = Arc::new(link);
-                            register_link(&links, &link).await;
-                            announce_geometry(&link).await;
-                            tokio::spawn(receive_from(
-                                link,
-                                Arc::clone(&geometry),
-                                Arc::clone(&clipboard),
-                                Arc::clone(&links),
-                            ));
-                            break;
+                        // Every failed address is named. This loop used to swallow its
+                        // failures whole, and that exact silence meant an afternoon of a
+                        // client logging "authentication failed" every few seconds left
+                        // no trace at all on the machine doing the dialling.
+                        let link = match endpoint.connect(*address).await {
+                            Ok(link) => link,
+                            Err(e) => {
+                                tracing::info!(peer = %peer.name, %address, "no luck at this address: {e}");
+                                continue;
+                            }
+                        };
+                        // `presented` is the whole diagnosis when an address is answered
+                        // by the wrong machine: a stale entry after standby points at a
+                        // box that completes the handshake happily — as someone else.
+                        if let Err(e) = link.authorize(&store) {
+                            tracing::warn!(peer = %peer.name, %address, presented = %link.peer_id(), "answered by a machine we are not paired with: {e}");
+                            link.close("not paired");
+                            continue;
                         }
+                        tracing::info!(peer = %link.peer_id(), %address, "found and connected");
+                        let link = Arc::new(link);
+                        register_link(&links, &link).await;
+                        announce_geometry(&link).await;
+                        tokio::spawn(receive_from(
+                            link,
+                            Arc::clone(&geometry),
+                            Arc::clone(&clipboard),
+                            Arc::clone(&links),
+                        ));
+                        break;
                     }
                 }
             });
@@ -3009,11 +3024,23 @@ fn spawn_reconnector(
             let mut failures = 0u32;
             loop {
                 match endpoint.connect(target).await {
-                    Ok(link) => {
-                        if let Err(e) = link.authorize(&store) {
-                            tracing::warn!(%target, "refused: {e}");
-                            return;
+                    // Keep the lane alive on a refusal. Returning turned one refusal
+                    // into a permanent disconnection: a peer answering mid-restart
+                    // before its trust store loads, or an address answered by the wrong
+                    // machine after standby, killed this loop for good and nothing ever
+                    // dialled again. `presented` names who actually answered, which is
+                    // the whole diagnosis when it is not who the address used to be.
+                    Ok(link) if link.authorize(&store).is_err() => {
+                        let refusal =
+                            link.authorize(&store).expect_err("checked in the guard");
+                        if failures == 0 {
+                            tracing::warn!(%target, presented = %link.peer_id(), "refused: {refusal}; keeping this lane alive");
+                        } else {
+                            tracing::debug!(%target, presented = %link.peer_id(), "still refused: {refusal}");
                         }
+                        link.close("not paired");
+                    }
+                    Ok(link) => {
                         tracing::info!(peer = %link.peer_id(), %target, "connected to peer");
                         if let Ok(mut dialled) = UI_DIALLED.lock() {
                             let id = link.peer_id();
@@ -3037,7 +3064,15 @@ fn spawn_reconnector(
                         tracing::info!(%target, "peer went away; reconnecting");
                     }
                     Err(e) => {
-                        tracing::debug!(%target, "not reachable yet ({e}); retrying");
+                        // The first failure of a streak is worth a visible line — it is
+                        // the moment something changed. The rest stay quiet: this loop
+                        // runs every few seconds against a machine that may simply be
+                        // switched off.
+                        if failures == 0 {
+                            tracing::warn!(%target, "could not connect: {e}; retrying quietly");
+                        } else {
+                            tracing::debug!(%target, "not reachable yet ({e}); retrying");
+                        }
                     }
                 }
                 tokio::time::sleep(delay).await;

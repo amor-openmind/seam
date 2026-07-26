@@ -87,6 +87,9 @@ pub enum Error {
     #[error("could not reach the peer at {addr}: {reason}")]
     Connect { addr: std::net::SocketAddr, reason: String },
 
+    #[error("a machine at {addr} started connecting but the handshake failed: {reason}")]
+    Handshake { addr: std::net::SocketAddr, reason: String },
+
     #[error("the peer presented no certificate, so its identity could not be established")]
     NoPeerCertificate,
 
