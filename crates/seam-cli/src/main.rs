@@ -1886,8 +1886,31 @@ fn lan_address() -> Option<String> {
 /// enough to be useful and wrong in a way nothing could detect — a screen's physical
 /// position is the one fact about a desk that is not visible from software. When someone
 /// says where a machine actually is, that answer outranks the guess and survives restarts.
+/// Where machine-wide state lives, whatever folder seam was started from.
+///
+/// The same reasoning as the licence: things that describe the MACHINE — its licence, the
+/// shape of its desk — belong somewhere a reinstall cannot move. `SEAM_HOME` still
+/// overrides everything, for testing.
+fn layout_home() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("SEAM_HOME")
+        && !home.is_empty()
+    {
+        return Some(std::path::PathBuf::from(home));
+    }
+    let dir = directories::ProjectDirs::from("dev", "seam", "seam")?.data_dir().to_path_buf();
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 fn stored_layout(dir: &std::path::Path) -> Vec<(String, String, String)> {
-    let Ok(text) = std::fs::read_to_string(dir.join("layout")) else { return Vec::new() };
+    // Machine-wide first, then beside the install. How your screens are arranged is a fact
+    // about the desk, not about which folder the binary happens to sit in — storing it
+    // beside the install meant a reinstall to a new folder silently lost the arrangement,
+    // exactly as it once lost the licence.
+    let text = layout_home()
+        .and_then(|home| std::fs::read_to_string(home.join("layout")).ok())
+        .or_else(|| std::fs::read_to_string(dir.join("layout")).ok());
+    let Some(text) = text else { return Vec::new() };
     text.lines()
         .filter_map(|line| {
             let mut parts = line.trim().split(' ');
@@ -1923,7 +1946,13 @@ fn set_layout(dir: &std::path::Path, short_id: &str, edge: &str, anchor: &str) -
         .map(|(peer, e, a)| format!("{peer} {e} {a}"))
         .collect();
     lines.push(format!("{short_id} {edge} {anchor}"));
-    let written = std::fs::write(dir.join("layout"), lines.join("\n")).is_ok();
+    let body = lines.join("\n");
+    // Written machine-wide so it survives a reinstall anywhere, and beside the install too
+    // so a portable copy carried to another machine takes the desk with it.
+    if let Some(home) = layout_home() {
+        let _ = std::fs::write(home.join("layout"), &body);
+    }
+    let written = std::fs::write(dir.join("layout"), &body).is_ok();
     if written {
         tracing::info!(peer = short_id, edge, anchor, "arrangement set from the desk page");
         UI_RELAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
