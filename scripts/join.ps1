@@ -45,6 +45,27 @@ if ($true) {
     }
   } catch { }
 
+  # A running seam holds a lock on its own exe, and Move-Item cannot replace a
+  # locked file - re-running this script then died on the move. Ask the running
+  # one to quit over loopback (works whatever it is elevated to), give it a
+  # moment, and rename the old file aside as the last resort: Windows allows
+  # renaming a running exe even while it refuses to overwrite it.
+  $note = Join-Path $env:APPDATA "seam\seam\data\ui-port"
+  if (Test-Path $note) {
+    $uiport = (Get-Content $note -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($uiport) {
+      try {
+        Invoke-WebRequest -UseBasicParsing -Method POST "http://127.0.0.1:$uiport/action/quit" -TimeoutSec 3 | Out-Null
+      } catch { }
+      Start-Sleep -Milliseconds 800
+    }
+  }
+  if (Test-Path $bin) {
+    try { Remove-Item -Force $bin -ErrorAction Stop } catch {
+      try { Remove-Item -Force "$bin.old" -ErrorAction SilentlyContinue } catch { }
+      Rename-Item -Force $bin "$bin.old"
+    }
+  }
   Move-Item -Force $tmp $bin
 }
 

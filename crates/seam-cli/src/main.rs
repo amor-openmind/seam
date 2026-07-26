@@ -819,7 +819,7 @@ async fn daemon(
                             Ok(()) => {
                                 tracing::info!(%peer, remote = %link.remote_address(), "peer connected");
                                 let link = Arc::new(link);
-                                register_link(&links, &link).await;
+                                register_link(&links, &link, &clipboard).await;
                                 announce_geometry(&link).await;
                                 tokio::spawn(receive_from(
                                     link,
@@ -999,6 +999,7 @@ async fn apply_clipboard_image(
 ) {
     let mut state = clipboard.lock().await;
     if state.already_applied(peer, generation) {
+        tracing::debug!(%peer, generation, "clipboard image ignored as an echo or older");
         return;
     }
     match seam_input::clipboard::write_image(width, height, &rgba) {
@@ -1008,10 +1009,16 @@ async fn apply_clipboard_image(
             state.record(peer, generation);
             state.image_sig = Some(image_signature(width, height, &rgba));
             state.last_seen = None;
+            // Reissued under this machine's counter — same reasoning as the text relay.
+            state.generation += 1;
+            let relay = seam_proto::Frame::ClipboardImage {
+                seq: 0,
+                generation: state.generation,
+                width,
+                height,
+                rgba,
+            };
             drop(state);
-
-            let relay =
-                seam_proto::Frame::ClipboardImage { seq: 0, generation, width, height, rgba };
             for other in links.lock().await.iter() {
                 if other.peer_id() == peer {
                     continue;
@@ -1216,6 +1223,7 @@ async fn apply_clipboard_files(
 ) {
     let mut state = clipboard.lock().await;
     if state.already_applied(peer, generation) {
+        tracing::debug!(%peer, generation, "clipboard files ignored as an echo or older");
         return;
     }
     let spooled = match spool_clipboard_files(generation, &entries) {
@@ -1234,9 +1242,14 @@ async fn apply_clipboard_files(
             state.files_sig = Some(files_signature(&spooled));
             state.last_seen = None;
             state.image_sig = None;
+            // Reissued under this machine's counter — same reasoning as the text relay.
+            state.generation += 1;
+            let relay = seam_proto::Frame::ClipboardFiles {
+                seq: 0,
+                generation: state.generation,
+                entries,
+            };
             drop(state);
-
-            let relay = seam_proto::Frame::ClipboardFiles { seq: 0, generation, entries };
             for other in links.lock().await.iter() {
                 if other.peer_id() == peer {
                     continue;
@@ -2714,6 +2727,17 @@ impl ClipboardState {
         self.applied.retain(|(p, _)| *p != peer);
         self.applied.push((peer, generation));
     }
+
+    /// A peer's link was just (re)registered — its counter may have been reborn.
+    ///
+    /// Generations are a process's own counter, so a watermark outlives the process it
+    /// described: a laptop that restarts begins again at 1, and every copy it makes is
+    /// then "older" than the 40 remembered from its previous life and silently dropped.
+    /// Observed live: after a laptop restart, its copies reached this machine and
+    /// vanished at the gate — no receipt logged, nothing applied, nothing relayed.
+    fn forget_peer(&mut self, peer: seam_proto::PeerId) {
+        self.applied.retain(|(p, _)| *p != peer);
+    }
 }
 
 /// Cheap identity for clipboard images: dimensions plus a streaming hash of the pixels.
@@ -2921,7 +2945,7 @@ fn start_auto_dial(
                         }
                         tracing::info!(peer = %link.peer_id(), %address, "found and connected");
                         let link = Arc::new(link);
-                        register_link(&links, &link).await;
+                        register_link(&links, &link, &clipboard).await;
                         announce_geometry(&link).await;
                         tokio::spawn(receive_from(
                             link,
@@ -2980,15 +3004,24 @@ async fn announce_geometry(link: &Link) {
 ///
 /// Replacing by identity is correct rather than merely tidy: `PeerId` is derived from the
 /// peer's certificate, so two links with the same id are the same machine by construction.
-async fn register_link(links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, link: &Arc<Link>) {
-    let mut peers = links.lock().await;
+async fn register_link(
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    link: &Arc<Link>,
+    clipboard: &Clipboard,
+) {
     let id = link.peer_id();
-    let replaced = peers.iter().any(|l| l.peer_id() == id);
-    peers.retain(|l| l.peer_id() != id);
-    peers.push(Arc::clone(link));
+    let replaced = {
+        let mut peers = links.lock().await;
+        let replaced = peers.iter().any(|l| l.peer_id() == id);
+        peers.retain(|l| l.peer_id() != id);
+        peers.push(Arc::clone(link));
+        replaced
+    };
     if replaced {
         tracing::info!(peer = %id, "peer reconnected; dropped the stale link");
     }
+    // A fresh link may be a fresh process, and a fresh process counts from one again.
+    clipboard.lock().await.forget_peer(id);
 
     // A machine arriving is as much a change to the desk as someone moving one.
     //
@@ -3051,7 +3084,7 @@ fn spawn_reconnector(
                         delay = Duration::from_millis(500);
                         failures = 0;
                         let link = Arc::new(link);
-                        register_link(&links, &link).await;
+                        register_link(&links, &link, &clipboard).await;
                         announce_geometry(&link).await;
                         // Returns when the peer goes away, and then we try again.
                         receive_from(
@@ -3443,6 +3476,7 @@ async fn receive_reliable(
                 let mut state = clipboard.lock().await;
                 if state.already_applied(peer, generation) {
                     // An echo, or something older than what we already have.
+                    tracing::debug!(%peer, generation, "clipboard text ignored as an echo or older");
                     continue;
                 }
                 match seam_input::clipboard::write_text(&text) {
@@ -3452,17 +3486,24 @@ async fn receive_reliable(
                         // Remember what we just wrote, so the poller does not see it as a
                         // local change and send it straight back.
                         state.last_seen = Some(text.clone());
-                        drop(state);
 
                         // Relay to every *other* peer. Machines connect in a star through
                         // whichever one they dialled, so without this a copy on one leaf
-                        // reaches the centre and stops there — which is exactly what was
-                        // reported: only the machine in the middle ever shared anything.
+                        // reaches the centre and stops there.
                         //
-                        // The generation is passed through unchanged rather than reissued,
-                        // so the update keeps its original identity and cannot echo back
-                        // around the star.
-                        let relay = seam_proto::Frame::ClipboardText { seq: 0, generation, text };
+                        // Reissued under THIS machine's counter, not passed through. A
+                        // leaf tracks generations per link, so a passed-through value
+                        // interleaved the origin's counter with this machine's own under
+                        // one key — and whichever counter happened to be ahead silently
+                        // blocked the other's next copy at the far end. Echo is already
+                        // impossible structurally: the origin is skipped below.
+                        state.generation += 1;
+                        let relay = seam_proto::Frame::ClipboardText {
+                            seq: 0,
+                            generation: state.generation,
+                            text,
+                        };
+                        drop(state);
                         for other in links.lock().await.iter() {
                             if other.peer_id() == peer {
                                 continue;
@@ -3818,6 +3859,31 @@ mod tests {
     #[test]
     fn the_cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_restarted_peer_is_heard_again() {
+        // A watermark outlives the process it described: the laptop restarted, began
+        // counting from one again, and every copy it made was then "older" than the
+        // generation remembered from its previous life — dropped at the gate with no
+        // receipt logged, nothing applied, nothing relayed. Forgetting the peer when
+        // its link re-registers is what lets the reborn machine speak.
+        let mut state = ClipboardState::default();
+        let peer = seam_proto::PeerId([7; 16]);
+        state.record(peer, 40);
+        assert!(state.already_applied(peer, 1), "the old life's watermark blocks the reborn counter");
+        state.forget_peer(peer);
+        assert!(!state.already_applied(peer, 1), "after the link re-registers, generation 1 is heard");
+    }
+
+    #[test]
+    fn an_echo_is_recognised_and_newer_generations_pass() {
+        let mut state = ClipboardState::default();
+        let peer = seam_proto::PeerId([7; 16]);
+        state.record(peer, 5);
+        assert!(state.already_applied(peer, 5), "the same generation is an echo");
+        assert!(state.already_applied(peer, 4), "an older one is stale");
+        assert!(!state.already_applied(peer, 6), "the next copy must pass");
     }
 
     #[test]
