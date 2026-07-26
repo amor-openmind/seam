@@ -68,6 +68,22 @@ impl core::fmt::Debug for Endpoint {
 }
 
 impl Endpoint {
+
+    /// Replace the UDP socket underneath this endpoint, keeping its identity and config.
+    ///
+    /// A laptop that sleeps wakes with a different network underneath it: the socket bound
+    /// before standby still exists, still accepts writes, and reaches nothing. Every
+    /// reconnect attempt then fails forever while looking like an unreachable peer, which
+    /// is why sharing only came back after restarting seam.
+    ///
+    /// Rebinding is cheap and safe to do when nothing is wrong — the endpoint keeps its
+    /// certificate, so peers still recognise this machine.
+    pub fn rebind(&self, port: u16) -> Result<(), Error> {
+        let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+        let socket = std::net::UdpSocket::bind(addr)
+            .map_err(|e| Error::Bind { addr, reason: e.to_string() })?;
+        self.inner.rebind(socket).map_err(|e| Error::Bind { addr, reason: e.to_string() })
+    }
     /// Bind to `addr`. Use port 0 to let the OS choose (tests, and any peer that does not
     /// need a stable port because it is found by discovery rather than by address).
     pub fn bind(identity: Arc<Identity>, addr: SocketAddr) -> Result<Self, Error> {

@@ -754,6 +754,7 @@ async fn daemon(
         // strands every client either.
         spawn_reconnector(
             target,
+            port,
             Arc::clone(&endpoint),
             Arc::clone(&store),
             Arc::clone(&links),
@@ -1288,6 +1289,13 @@ static UI_FOCUS: std::sync::Mutex<Option<seam_proto::PeerId>> = std::sync::Mutex
 /// truth for everything visible. They are pulled from there, never edited here; see
 /// docs/GOAL.md §12a. The daemon serves them so the UI always matches the daemon it
 /// talks to, with no separate install.
+/// Binary assets — the logo. Kept apart from `UI_PAGES` because those are text and these
+/// are not; one table of `&str` cannot hold a PNG.
+const UI_ASSETS: &[(&str, &[u8], &str)] = &[
+    ("/_ds/logo/seam-logo-32.png", include_bytes!("../ui/_ds/logo/seam-logo-32.png"), "image/png"),
+    ("/_ds/logo/seam-logo-128.png", include_bytes!("../ui/_ds/logo/seam-logo-128.png"), "image/png"),
+];
+
 const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/", include_str!("../ui/index.html"), "text/html; charset=utf-8"),
     ("/index.html", include_str!("../ui/index.html"), "text/html; charset=utf-8"),
@@ -1326,6 +1334,7 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/_ds/shared.js", include_str!("../ui/_ds/shared.js"), "text/javascript; charset=utf-8"),
     ("/_ds/nav.js", include_str!("../ui/_ds/nav.js"), "text/javascript; charset=utf-8"),
     ("/_ds/activity.js", include_str!("../ui/_ds/activity.js"), "text/javascript; charset=utf-8"),
+    ("/_ds/brand.js", include_str!("../ui/_ds/brand.js"), "text/javascript; charset=utf-8"),
     ("/_ds/quit.js", include_str!("../ui/_ds/quit.js"), "text/javascript; charset=utf-8"),
     ("/join.sh", include_str!("../../../scripts/join.sh"), "text/x-shellscript; charset=utf-8"),
     ("/join.ps1", include_str!("../../../scripts/join.ps1"), "text/plain; charset=utf-8"),
@@ -1343,23 +1352,6 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
         "/_ds/page-transfers.js",
         include_str!("../ui/_ds/page-transfers.js"),
         "text/javascript; charset=utf-8",
-    ),
-];
-
-/// Binary design assets referenced by the mirrored pages.
-///
-/// Kept separate from `UI_PAGES` so text remains embedded with `include_str!` (and is
-/// therefore UTF-8 checked at compile time) while images retain their exact bytes.
-const UI_ASSETS: &[(&str, &[u8], &str)] = &[
-    (
-        "/_ds/assets/logo/seam-logo-32.png",
-        include_bytes!("../ui/_ds/assets/logo/seam-logo-32.png"),
-        "image/png",
-    ),
-    (
-        "/_ds/assets/logo/seam-logo-128.png",
-        include_bytes!("../ui/_ds/assets/logo/seam-logo-128.png"),
-        "image/png",
     ),
 ];
 
@@ -2262,6 +2254,22 @@ async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result
                     } else {
                         ("404 Not Found", "text/plain", "not found".to_owned())
                     };
+                    // Images are bytes and must not go through a String. Served with a
+                    // long cache lifetime because the logo changes with the binary, and
+                    // the binary is what gets replaced on an update.
+                    if let Some((_, bytes, ctype)) =
+                        UI_ASSETS.iter().find(|(route, _, _)| *route == path)
+                    {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+                             Cache-Control: max-age=86400\r\nConnection: close\r\n\r\n",
+                            bytes.len(),
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(bytes).await;
+                        return;
+                    }
+
                     let response = format!(
                         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
                          Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
@@ -2804,6 +2812,7 @@ async fn register_link(links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, link: &A
 #[allow(clippy::too_many_arguments)]
 fn spawn_reconnector(
     target: SocketAddr,
+    port: u16,
     endpoint: Arc<seam_transport::Endpoint>,
     store: Arc<seam_transport::TrustStore>,
     links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
@@ -2814,6 +2823,7 @@ fn spawn_reconnector(
             // Back off up to 5 s: fast enough that starting the server feels immediate,
             // slow enough not to spin when nothing is there.
             let mut delay = Duration::from_millis(500);
+            let mut failures = 0u32;
             loop {
                 match endpoint.connect(target).await {
                     Ok(link) => {
@@ -2829,6 +2839,7 @@ fn spawn_reconnector(
                             }
                         }
                         delay = Duration::from_millis(500);
+                        failures = 0;
                         let link = Arc::new(link);
                         register_link(&links, &link).await;
                         announce_geometry(&link).await;
@@ -2848,6 +2859,22 @@ fn spawn_reconnector(
                 }
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(5));
+
+                // A run of failures usually means this machine slept: the socket bound
+                // before standby survives, accepts writes and reaches nothing, so every
+                // attempt fails while looking like an unreachable peer. Rebinding gets a
+                // socket on the network that exists now, keeping this machine's identity
+                // so peers still recognise it.
+                failures += 1;
+                if failures.is_multiple_of(5) {
+                    match endpoint.rebind(port) {
+                        Ok(()) => tracing::info!(
+                            "rebound the network socket after repeated failures (a sleep \
+                             or a network change looks exactly like this)"
+                        ),
+                        Err(e) => tracing::debug!("could not rebind: {e}"),
+                    }
+                }
             }
     });
 }
