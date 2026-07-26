@@ -724,6 +724,24 @@ licence, which is the safe direction to fail.
 patch the binary can remove the check — true of every client-side licence ever shipped.
 What it does is make running seam require something only the owner can issue.
 
+**macOS signing (v0.8.8).** Release binaries for macOS are signed with the persistent
+self-signed identity **"seam updates"** (identifier `dev.seam.seam`), which lives in
+`~/Library/Keychains/seam-sign.keychain-db` on the owner's machine — never ad-hoc.
+macOS keys Input Monitoring on the signing identity: with a stable one the grant survives
+every update, with ad-hoc each release is a stranger and the fleet goes captureless until
+someone toggles System Settings again. That happened twice in one afternoon before this
+existed. Sign with:
+
+```
+security unlock-keychain -p seam-sign-local ~/Library/Keychains/seam-sign.keychain-db
+codesign --force --sign "seam updates" --keychain ~/Library/Keychains/seam-sign.keychain-db \
+  -i dev.seam.seam dist/seam-macos-arm64
+```
+
+The identity is machine-local and self-signed; it exists for TCC continuity, not
+notarisation. If it is ever lost, recreate it, sign the next release with the new one, and
+expect exactly one more Input Monitoring toggle on each Mac.
+
 **Private source with public downloads needs two repositories.** A private repo's release
 assets require a GitHub token to download, so "private code, public releases" cannot be one
 repo:
