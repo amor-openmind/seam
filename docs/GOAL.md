@@ -832,3 +832,29 @@ answer given to a person adding their laptop.
   `ShellExecute` means a running daemon, without confirming the child came up. It is the
   best explanation for the laptop's repeated slow or failed starts, and it should wait for
   the child before exiting.
+
+### Waking a sleeping machine needs Wake-on-LAN, and may not be possible
+
+Reported: the laptop sleeps and moving the pointer at its edge does not wake it.
+
+This is not a defect. A sleeping machine has its CPU halted and its network stack down, so
+injected input arrives as packets nobody is listening for. Real USB input wakes a machine
+because the USB controller stays powered; a network packet has no such privilege.
+
+**The only mechanism is Wake-on-LAN** — a magic packet to the peer's MAC address, which the
+network adapter watches for while the machine sleeps. Implementable as: when the pointer
+crosses to a machine whose link is dead, send the magic packet, wait briefly, then dial.
+
+Three preconditions, none of which seam controls:
+
+1. **The peer's MAC.** seam knows only its IP. The MAC would be announced on connect and
+   remembered alongside the pairing, so it is known while the machine is unreachable.
+2. **WoL enabled** in the peer's firmware *and* adapter properties. Off by default on most
+   Windows laptops, and commonly disabled on battery power.
+3. **Wi-Fi.** WoWLAN needs specific adapter support and is often unavailable. The laptop on
+   this project's own fleet is on Wi-Fi, so it may be impossible there regardless of code.
+
+**Do not promise this in the UI as though it always works.** If built, the honest surface
+is: attempt the wake, and if the machine does not answer within a few seconds, say plainly
+that it is asleep and could not be woken — rather than a pointer that silently vanishes
+into a machine that is not there.
