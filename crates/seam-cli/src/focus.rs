@@ -292,11 +292,16 @@ impl Graph {
             let node = &self.nodes[self.current];
             let (w, h) = (node.width, node.height);
 
-            let crossing = if self.x < 0 {
+            // Which edges did this movement exceed? At a corner there can be two at
+            // once — one per axis — and they need not both lead anywhere.
+            let x_edge = if self.x < 0 {
                 Some(Edge::Left)
             } else if self.x >= w {
                 Some(Edge::Right)
-            } else if self.y < 0 {
+            } else {
+                None
+            };
+            let y_edge = if self.y < 0 {
                 Some(Edge::Top)
             } else if self.y >= h {
                 Some(Edge::Bottom)
@@ -304,10 +309,27 @@ impl Graph {
                 None
             };
 
-            let Some(edge) = crossing else { break };
+            // Prefer the horizontal edge only while it leads somewhere. Checking the
+            // axes in a fixed order let a dead edge end the search: pushed down-left
+            // at a corner whose left edge leads nowhere, every event re-tripped the
+            // dead left edge and the living edge below was never considered. From a
+            // chair that is a mouse trap in the corner — the pointer pinned there for
+            // as long as the hand kept any leftward drift, which at a corner it
+            // always has.
+            let edge = match (x_edge, y_edge) {
+                (None, None) => break,
+                (Some(edge), None) | (None, Some(edge)) => edge,
+                (Some(horizontal), Some(vertical)) => {
+                    if node.links[horizontal.index()].is_some() {
+                        horizontal
+                    } else {
+                        vertical
+                    }
+                }
+            };
             let Some(next) = node.links[edge.index()] else {
-                // No neighbour that way: stop at the edge rather than letting the pointer
-                // wander somewhere no screen exists.
+                // Nothing lives on any exceeded edge: stop at the boundary rather than
+                // letting the pointer wander somewhere no screen exists.
                 self.x = self.x.clamp(0, w - 1);
                 self.y = self.y.clamp(0, h - 1);
                 break;
@@ -550,6 +572,78 @@ mod tests {
         assert!(update.changed);
         assert_eq!(update.focus, Focus::Remote(laptop()));
         assert!(update.y < 100, "should enter near the top, got {}", update.y);
+    }
+
+    #[test]
+    fn a_diagonal_into_a_dead_corner_still_crosses_the_living_edge() {
+        // Reported as "there is a mouse trap angle in left bottom of the laptop
+        // screen", and the server log agreed: focus pinned on the iMac while every
+        // scroll and keypress kept forwarding, with no crossing ever firing again.
+        //
+        // At the iMac's bottom-left corner a down-left push exceeds two edges at
+        // once: the left edge, which leads nowhere, and the bottom edge, which
+        // leads to the laptop. The axes were checked in a fixed order and a dead
+        // edge ended the search — so as long as the hand drifted left, and at a
+        // corner aiming down-left it always does, the living edge below was never
+        // even considered.
+        let mut g = fleet();
+        g.apply_motion(-1281, 0);
+        assert_eq!(g.focus(), Focus::Remote(imac()));
+        drain_lockout(&mut g);
+
+        let update = g.apply_motion(-5000, 5000);
+        assert_eq!(update.focus, Focus::Remote(laptop()), "the trap: a dead left edge must not hide the living bottom one");
+        assert_eq!(update.x, 0, "the hand was pushing left; land on the left edge");
+    }
+
+    #[test]
+    fn the_laptops_dead_corner_up_and_left_still_reaches_the_imac() {
+        // The same trap mirrored: from the laptop's bottom-left corner the natural
+        // escape is up-left toward the iMac, and up-left has a leftward component
+        // on every event.
+        let mut g = fleet();
+        g.apply_motion(-1281, 0);
+        drain_lockout(&mut g);
+        g.apply_motion(0, 2000);
+        assert_eq!(g.focus(), Focus::Remote(laptop()));
+        drain_lockout(&mut g);
+
+        // Walk into the bottom-left corner, where both edges are dead ends.
+        g.apply_motion(-5000, 3000);
+        assert_eq!(g.focus(), Focus::Remote(laptop()));
+
+        let update = g.apply_motion(-40, -2000);
+        assert_eq!(update.focus, Focus::Remote(imac()), "up-left from the corner must still cross the living top edge");
+    }
+
+    #[test]
+    fn a_corner_between_two_living_edges_prefers_the_horizontal_one() {
+        // Not a preference anyone chose for its own sake: it is what the fixed
+        // check order always did when both edges lead somewhere, kept so the fix
+        // changes behaviour only where one of them was dead.
+        let mut g = fleet();
+        g.apply_motion(-1281, 0);
+        drain_lockout(&mut g);
+
+        // Down-right at the iMac's bottom-right corner: right leads home, down
+        // leads to the laptop.
+        let update = g.apply_motion(5000, 5000);
+        assert_eq!(update.focus, Focus::Local);
+    }
+
+    #[test]
+    fn a_corner_where_nothing_lives_just_holds_the_pointer() {
+        let mut g = fleet();
+        g.apply_motion(-1281, 0);
+        drain_lockout(&mut g);
+        g.apply_motion(0, 2000);
+        assert_eq!(g.focus(), Focus::Remote(laptop()));
+        drain_lockout(&mut g);
+
+        // The laptop's bottom-right: nothing to the right, nothing below.
+        let update = g.apply_motion(5000, 5000);
+        assert_eq!(update.focus, Focus::Remote(laptop()));
+        assert_eq!((update.x, update.y), (1919, 1079), "clamped into the corner, not lost");
     }
 
     #[test]
