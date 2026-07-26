@@ -3007,6 +3007,26 @@ fn spawn_reconnector(
     });
 }
 
+/// Is a machine sitting somewhere it does not belong?
+///
+/// A machine whose neighbour was away is attached to this one so it stays reachable. Once
+/// that neighbour is back, the stored relation must be restored — otherwise the fallback
+/// quietly becomes the arrangement, which is a layout that changes itself after a laptop
+/// sleeps.
+fn layout_needs_rebuild(
+    dir: &std::path::Path,
+    live: &[seam_proto::PeerId],
+    known: &[seam_proto::PeerId],
+) -> bool {
+    let here = |id: &str| live.iter().any(|p| p.to_string().starts_with(id));
+    let placed = |id: &str| known.iter().any(|p| p.to_string().starts_with(id));
+    stored_layout(dir)
+        .into_iter()
+        .any(|(peer, _, anchor)| {
+            anchor != "self" && here(&peer) && here(&anchor) && placed(&peer) && !placed(&anchor)
+        })
+}
+
 /// Keep the layout in step with which peers are actually connected.
 ///
 /// Peers are placed to the right in the order they connect. A layout editor belongs in
@@ -3023,7 +3043,11 @@ async fn sync_peers(
 ) {
     // An arrangement change means every placement is stale, so start again rather than
     // patching one screen and leaving the rest describing the old desk.
-    if UI_RELAYOUT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+    let live: Vec<seam_proto::PeerId> = links.lock().await.iter().map(|l| l.peer_id()).collect();
+
+    let waiting_for = layout_needs_rebuild(dir, &live, known);
+
+    if waiting_for || UI_RELAYOUT.swap(false, std::sync::atomic::Ordering::Relaxed) {
         known.clear();
         graph.forget_all();
         if let Ok(mut places) = UI_PLACES.lock() {
@@ -3031,7 +3055,6 @@ async fn sync_peers(
         }
     }
 
-    let live: Vec<seam_proto::PeerId> = links.lock().await.iter().map(|l| l.peer_id()).collect();
     let sizes = geometry.lock().await.clone();
 
     // Place in PAIRING order, never connection order. Connection order is a race, and
@@ -3069,13 +3092,29 @@ async fn sync_peers(
             };
             let against = if anchor == "self" {
                 None
+            } else if let Some(peer) =
+                known.iter().find(|k| k.to_string().starts_with(anchor.as_str()))
+            {
+                Some(*peer)
+            } else if live.iter().any(|k| k.to_string().starts_with(anchor.as_str())) {
+                // Its neighbour is connected but not placed yet — it is earlier in this
+                // same pass. Come back to this one; the order settles within a tick.
+                continue;
             } else {
-                let found = known.iter().find(|k| k.to_string().starts_with(anchor.as_str()));
-                match found {
-                    Some(peer) => Some(*peer),
-                    // Its neighbour is not placed yet. Come back to it.
-                    None => continue,
-                }
+                // Its neighbour is not here at all: asleep, or switched off. Attaching to
+                // this machine instead keeps the machine reachable, and the stored
+                // arrangement is untouched, so the moment its neighbour returns the
+                // relation is restored exactly as it was.
+                //
+                // Skipping it instead - which is what happened - left the machine with no
+                // place on the desk, so the pointer could not reach it and the layout
+                // looked like it had changed itself after a laptop slept.
+                tracing::info!(
+                    peer = %id,
+                    %anchor,
+                    "its neighbour is away; attaching to this machine until it returns"
+                );
+                None
             };
             graph.place(*id, chosen, against, w, h);
             if let Ok(mut places) = UI_PLACES.lock() {
