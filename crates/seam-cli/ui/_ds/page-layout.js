@@ -14,7 +14,6 @@
   var OPPOSITE = { left: "right", right: "left", top: "bottom", bottom: "top" };
   var STEP = { left: [-1, 0], right: [1, 0], top: [0, -1], bottom: [0, 1] };
 
-  var stage = document.querySelector("[data-stage]") || document.querySelector(".stage");
   var desk = document.querySelector("[data-desk]");
   var tpl = document.querySelector("[data-machine-template]");
   var rows = document.querySelector(".rows");
@@ -42,7 +41,7 @@
     for (var pass = 0; pass < 8 && pending.length; pass++) {
       pending = pending.filter(function (p) {
         var id = window.seam.short(p.id);
-        var anchor = p.anchor || self;
+        var anchor = p.anchor && p.anchor !== "self" ? p.anchor : self;
         var edge = EDGES.indexOf(p.edge) === -1 ? "left" : p.edge;
         if (!at[anchor]) return true;
         var base = at[anchor];
@@ -69,10 +68,8 @@
     if (desk && tpl) {
       var xs = Object.keys(at).map(function (k) { return at[k][0]; });
       var ys = Object.keys(at).map(function (k) { return at[k][1]; });
-      var minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
-      var minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
-      // One spare ring all round, so every machine has a free square to be dropped onto.
-      minX -= 1; maxX += 1; minY -= 1; maxY += 1;
+      var minX = Math.min.apply(null, xs) - 1, maxX = Math.max.apply(null, xs) + 1;
+      var minY = Math.min.apply(null, ys) - 1, maxY = Math.max.apply(null, ys) + 1;
 
       desk.textContent = "";
       desk.style.gridTemplateColumns = "repeat(" + (maxX - minX + 1) + ",minmax(96px,150px))";
@@ -105,10 +102,12 @@
             window.seam.text(el, ".size", self);
             el.classList.toggle("holding", s.focus === "local");
           } else {
-            window.seam.text(el, ".tag", (p.edge || "") + " of " + (p.anchor || self));
+            var anchorName = p.anchor && p.anchor !== "self" ? p.anchor : self;
+            window.seam.text(el, ".tag", (p.edge || "") + " of " + anchorName);
             window.seam.text(el, ".name", p.name || who);
             window.seam.text(el, ".size", who);
             el.setAttribute("data-peer", who);
+            el.setAttribute("data-anchor-of", anchorName);
             el.classList.toggle("holding", s.focus === who);
           }
           cell.appendChild(el);
@@ -117,7 +116,8 @@
       }
     }
 
-    // The written form of the same relation, and the only one usable with a keyboard.
+    // The written form of the same relation — folded away, and the only route usable
+    // with a screen reader.
     if (rows && rowTpl) {
       window.seam.clear(rows, "[data-edge-row]");
       peers.forEach(function (p) {
@@ -134,7 +134,7 @@
         var anchorSel = row.querySelector("[data-anchor]");
         if (anchorSel) {
           anchorSel.textContent = "";
-          var options = [[self, s.name + " (this machine)"]];
+          var options = [[self, (s.name || "this machine") + " (this machine)"]];
           peers.forEach(function (q) {
             var qid = window.seam.short(q.id);
             if (qid !== id) options.push([qid, q.name || qid]);
@@ -145,7 +145,7 @@
             opt.textContent = o[1];
             anchorSel.appendChild(opt);
           });
-          anchorSel.value = p.anchor || self;
+          anchorSel.value = p.anchor && p.anchor !== "self" ? p.anchor : self;
           anchorSel.setAttribute("data-peer", id);
         }
         rows.appendChild(row);
@@ -156,17 +156,21 @@
 
   window.seam.onState(render);
 
-  // Dropping on an empty square means "next to whatever is beside that square", which is
-  // how a chain gets built by hand without ever naming an anchor.
+  // Dropping on an empty square means "next to whatever that square touches", so a chain
+  // gets built by hand without anyone naming an anchor.
   var dragged = null;
   document.addEventListener("dragstart", function (e) {
     var el = e.target.closest && e.target.closest("[data-peer]");
     if (!el) return;
     dragged = el.getAttribute("data-peer");
     el.classList.add("dragging");
+    // Empty squares are invisible until something is being carried: a desk full of dashed
+    // boxes reads as a form, which is what this page is trying not to be.
+    document.body.classList.add("dragging-now");
     if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
   });
   document.addEventListener("dragend", function () {
+    document.body.classList.remove("dragging-now");
     var d = document.querySelector(".dragging");
     if (d) d.classList.remove("dragging");
     var o = document.querySelector(".cell.over");
@@ -189,8 +193,6 @@
     e.preventDefault();
     var x = Number(c.getAttribute("data-x")), y = Number(c.getAttribute("data-y"));
 
-    // Which machine is this square touching? That machine becomes the anchor, and the
-    // side it was dropped on becomes the edge.
     var found = null;
     EDGES.forEach(function (edge) {
       if (found) return;
@@ -206,6 +208,17 @@
 
     if (found) save(dragged, found.edge, found.anchor);
     dragged = null;
+  });
+
+  // Arrow keys move a focused machine around the machine it is already beside, so the
+  // keyboard reaches every arrangement the mouse can.
+  document.addEventListener("keydown", function (e) {
+    var el = e.target.closest && e.target.closest("[data-peer]");
+    if (!el) return;
+    var map = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "top", ArrowDown: "bottom" };
+    if (!map[e.key]) return;
+    e.preventDefault();
+    save(el.getAttribute("data-peer"), map[e.key], el.getAttribute("data-anchor-of") || "self");
   });
 
   document.addEventListener("change", function (e) {
