@@ -269,7 +269,59 @@ pub fn inject_button(button: u8, down: bool) -> Result<(), Error> {
         (3, false) => MOUSEEVENTF_MIDDLEUP,
         _ => return Err(Error::Unsupported("that mouse button")),
     };
-    send_one(mouse_input(flags, 0))
+    send_one(mouse_input(flags, 0))?;
+    note_pressed(&PRESSED_BUTTONS, u16::from(button), down);
+    Ok(())
+}
+
+/// Everything this machine has been told to press and not yet told to release.
+///
+/// Injected state outlives the link that caused it: a connection that dies between a
+/// key's DOWN and its UP leaves the key held at the OS level. From the chair that is
+/// "some keys stopped working" — a phantom Ctrl turns every letter into a shortcut —
+/// and a phantom mouse button turns every touchpad tap into a drag.
+static PRESSED_KEYS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+static PRESSED_BUTTONS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+fn note_pressed(set: &std::sync::Mutex<Vec<u16>>, value: u16, down: bool) {
+    if let Ok(mut held) = set.lock() {
+        held.retain(|&v| v != value);
+        if down {
+            held.push(value);
+        }
+    }
+}
+
+/// Release every key and button still held from injection.
+///
+/// Wired to the same moments as cursor reveal — the pointer leaving, the link dying —
+/// because both are the same promise: when this machine stops being driven, it is left
+/// exactly as a machine nobody touched.
+pub fn release_everything() {
+    let keys = PRESSED_KEYS.lock().map(|mut held| std::mem::take(&mut *held)).unwrap_or_default();
+    for usage in keys {
+        let _ = inject_key(usage, false);
+    }
+    let buttons =
+        PRESSED_BUTTONS.lock().map(|mut held| std::mem::take(&mut *held)).unwrap_or_default();
+    for button in buttons {
+        let _ = inject_button(u8::try_from(button).unwrap_or(1), false);
+    }
+}
+
+/// Release the modifiers and buttons a *previous* seam may have left held.
+///
+/// A fresh process has an empty pressed set, so `release_everything` cannot undo what a
+/// crashed predecessor did — but injecting an UP for a key that is not down is a no-op,
+/// so at startup every modifier is released unconditionally. Fail open, like the cursor.
+pub fn release_stuck_modifiers() {
+    // HID usages: LeftControl..RightGUI, then the three buttons.
+    for usage in 224u16..=231 {
+        let _ = inject_key(usage, false);
+    }
+    for button in 1u8..=3 {
+        let _ = inject_button(button, false);
+    }
 }
 
 /// Scroll. Positive `dy` is away from the user, matching the protocol.
@@ -386,7 +438,43 @@ pub fn inject_key(usage: u16, down: bool) -> Result<(), Error> {
         time: 0,
         dwExtraInfo: 0,
     };
-    send_one(input)
+    send_one(input)?;
+    note_pressed(&PRESSED_KEYS, usage, down);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- console self-defence
+
+// SAFETY CONTRACT: reading and setting our own console's input mode. QuickEdit is the
+// default, and it means one stray click in the console window enters selection mode and
+// blocks every write to stdout — which freezes the whole daemon at the next log line.
+// Observed live: a console titled "Auswählen" (mark mode), the process wedged holding its
+// own exe lock, the link timing out, and injected keys left held. Logging must never be
+// able to stop the machine.
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(which: u32) -> *mut core::ffi::c_void;
+    fn GetConsoleMode(handle: *mut core::ffi::c_void, mode: *mut u32) -> i32;
+    fn SetConsoleMode(handle: *mut core::ffi::c_void, mode: u32) -> i32;
+}
+
+/// Turn off `QuickEdit` on our own console, so a click can never freeze the daemon.
+///
+/// Harmless when there is no console (launched at login, output redirected): the handle
+/// is invalid and the calls fail quietly, which is the right amount of noise.
+pub fn disable_console_quick_edit() {
+    const STD_INPUT_HANDLE: u32 = (-10i32).cast_unsigned();
+    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    // SAFETY: documented calls on our own process's console handles; an invalid or
+    // absent handle makes GetConsoleMode return 0 and nothing is changed.
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0u32;
+        if !handle.is_null() && GetConsoleMode(handle, &raw mut mode) != 0 {
+            let _ = SetConsoleMode(handle, (mode & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- file clipboard

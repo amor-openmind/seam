@@ -793,10 +793,8 @@ async fn daemon(
     start_update_watch();
     start_auto_dial(&discovery, &store, &links, &geometry, &clipboard, &endpoint);
 
-    // Crash recovery: a previous seam that died while the cursor was concealed leaves
-    // this machine with an invisible cursor. Restoring is free when nothing was hidden.
     #[cfg(target_os = "windows")]
-    seam_input::windows::reveal_cursor();
+    recover_this_machine();
 
     start_ui_server(dir.to_path_buf(), name.clone(), identity.peer_id(), port, Arc::clone(&links));
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry), dir.to_path_buf());
@@ -918,7 +916,9 @@ async fn receive_from_inner(
                 #[cfg(target_os = "windows")]
                 {
                     seam_input::windows::conceal_cursor();
-                    tracing::info!("pointer left this machine; cursor hidden");
+                    // Anything still held belongs to the session that just ended.
+                    seam_input::windows::release_everything();
+                    tracing::info!("pointer left this machine; cursor hidden, held keys released");
                 }
             }
             Ok(seam_proto::Frame::Motion(motion)) => {
@@ -976,7 +976,12 @@ async fn receive_from_inner(
             Err(e) => {
                 tracing::info!(%peer, "link closed: {e}");
                 #[cfg(target_os = "windows")]
-                seam_input::windows::reveal_cursor();
+                {
+                    // The link may have died between a DOWN and its UP. Leaving the key
+                    // held is how "some keys stopped working" happens.
+                    seam_input::windows::release_everything();
+                    seam_input::windows::reveal_cursor();
+                }
                 return;
             }
         }
@@ -2171,6 +2176,19 @@ async fn ui_state_json(
         update_json(),
         recent_activity(dir),
     )
+}
+
+/// Undo whatever a previous seam left behind, and armour the console.
+///
+/// Crash recovery: a seam that died while the cursor was concealed leaves this machine
+/// with an invisible cursor, and one that died mid-keystroke leaves phantom held keys —
+/// both restores are free when nothing was left behind. `QuickEdit` goes off so a stray
+/// click in our own console can never freeze the daemon at a log line again.
+#[cfg(target_os = "windows")]
+fn recover_this_machine() {
+    seam_input::windows::disable_console_quick_edit();
+    seam_input::windows::reveal_cursor();
+    seam_input::windows::release_stuck_modifiers();
 }
 
 /// Bind the endpoint, or — if seam is already running here — show that one instead.
