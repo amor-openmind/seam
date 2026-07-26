@@ -2974,6 +2974,16 @@ async fn register_link(links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, link: &A
     if replaced {
         tracing::info!(peer = %id, "peer reconnected; dropped the stale link");
     }
+
+    // A machine arriving is as much a change to the desk as someone moving one.
+    //
+    // Without this the layout was only ever rebuilt when a position was edited, so a
+    // laptop that slept came back holding the placement it had before — stale geometry,
+    // and often a placement made while its neighbour was away. Sharing stayed broken until
+    // the arrangement was changed to something wrong and back again, which was the only
+    // thing that forced a rebuild. That is a precise description of this bug, and it was
+    // how the user found it.
+    UI_RELAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 
@@ -3093,6 +3103,9 @@ async fn sync_peers(
     let waiting_for = layout_needs_rebuild(dir, &live, known);
 
     if waiting_for || UI_RELAYOUT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        // Clearing `known` alone was not enough: the graph kept its old node, so
+        // `is_placed` still answered yes and the peer was skipped rather than re-placed
+        // with the geometry and neighbour it has now.
         known.clear();
         graph.forget_all();
         if let Ok(mut places) = UI_PLACES.lock() {
