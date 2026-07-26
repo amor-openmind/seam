@@ -790,3 +790,45 @@ assets from the real application.
 **Remaining release step:** merge the reviewed branch and publish a newly tagged signed
 macOS/Windows release. No tag is chosen here: overwriting an existing public release is
 not an implementation detail and requires an explicit version decision.
+
+---
+
+## 14. The join flow is wrong, and how it must work
+
+A person downloads an app and opens it. They do not paste shell commands into a terminal
+they have never used. "Add a machine" currently hands out a `curl | sh` one-liner, which is
+a developer's install flow wearing a product's clothes — and the user said so plainly.
+
+**What it must be:**
+
+1. Download `seam.exe` (or the macOS binary) on the new machine. One link, one file.
+2. Double-click it. It already opens its own page and asks for a licence.
+3. **The page then lists seam machines it can see on this network** — discovery already
+   finds them (`Discovery::browse`, `_seam._udp`), and `advertised_fingerprint` already
+   tells us which are strangers rather than known peers.
+4. Click one. Both screens show the same six digits, confirm, done.
+
+No address to type, no port, no version, no command. Everything needed exists:
+
+- Discovery finds unpaired machines already; auto-dial deliberately ignores them because
+  they are not trusted yet. That check stays — this adds a way for a person to *grant* that
+  trust, which is exactly what pairing is.
+- `Command::Pair` performs the SAS exchange today, from the command line. The page needs
+  `POST /action/pair/<peer>` over the same code path, and `/state` needs a `discovered`
+  list of seen-but-unpaired machines.
+- `pairing.html` is already designed for precisely this: discovering, machines found, the
+  six-digit verify dialog, paired, and the mismatch refusal. It has never been bound.
+
+**The shell scripts stay** as a fallback for headless machines, but they must not be the
+answer given to a person adding their laptop.
+
+**Also still open** (unchanged, and both real):
+
+- **Machine positions cannot be changed.** Layout comes from pairing order alone: first
+  paired sits left, second below it. If the physical arrangement differs, seam is wrong and
+  there is no way to tell it. Needs a layout surface in Claude Design, persistence, and
+  agreement between both ends.
+- **The Windows UAC handoff is unverified.** The parent exits assuming a successful
+  `ShellExecute` means a running daemon, without confirming the child came up. It is the
+  best explanation for the laptop's repeated slow or failed starts, and it should wait for
+  the child before exiting.
