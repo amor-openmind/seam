@@ -1292,8 +1292,8 @@ static UI_FOCUS: std::sync::Mutex<Option<seam_proto::PeerId>> = std::sync::Mutex
 /// Binary assets — the logo. Kept apart from `UI_PAGES` because those are text and these
 /// are not; one table of `&str` cannot hold a PNG.
 const UI_ASSETS: &[(&str, &[u8], &str)] = &[
-    ("/_ds/logo/seam-logo-32.png", include_bytes!("../ui/_ds/logo/seam-logo-32.png"), "image/png"),
-    ("/_ds/logo/seam-logo-128.png", include_bytes!("../ui/_ds/logo/seam-logo-128.png"), "image/png"),
+    ("/_ds/assets/logo/seam-logo-32.png", include_bytes!("../ui/_ds/assets/logo/seam-logo-32.png"), "image/png"),
+    ("/_ds/assets/logo/seam-logo-128.png", include_bytes!("../ui/_ds/assets/logo/seam-logo-128.png"), "image/png"),
 ];
 
 const UI_PAGES: &[(&str, &str, &str)] = &[
@@ -1334,7 +1334,6 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/_ds/shared.js", include_str!("../ui/_ds/shared.js"), "text/javascript; charset=utf-8"),
     ("/_ds/nav.js", include_str!("../ui/_ds/nav.js"), "text/javascript; charset=utf-8"),
     ("/_ds/activity.js", include_str!("../ui/_ds/activity.js"), "text/javascript; charset=utf-8"),
-    ("/_ds/brand.js", include_str!("../ui/_ds/brand.js"), "text/javascript; charset=utf-8"),
     ("/_ds/quit.js", include_str!("../ui/_ds/quit.js"), "text/javascript; charset=utf-8"),
     ("/join.sh", include_str!("../../../scripts/join.sh"), "text/x-shellscript; charset=utf-8"),
     ("/join.ps1", include_str!("../../../scripts/join.ps1"), "text/plain; charset=utf-8"),
