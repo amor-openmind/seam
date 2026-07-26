@@ -265,7 +265,24 @@ async fn run_daemon(
                     args.push("--no-ui".into());
                 }
                 match seam_input::windows::relaunch_elevated(&args) {
-                    Ok(true) => return Ok(()),
+                    // Do NOT exit on the strength of a successful launch call. A
+                    // successful ShellExecute means Windows accepted the request, not
+                    // that a daemon is running: the child can die on a bad argument, a
+                    // missing licence or a refused prompt, and the parent leaving anyway
+                    // means the machine keeps whatever was running before. That is
+                    // exactly how an updated binary reported the OLD version - the new
+                    // one asked for elevation, vanished, and the previous daemon carried
+                    // on serving its page.
+                    Ok(true) => {
+                        if elevated_child_started(dir) {
+                            return Ok(());
+                        }
+                        tracing::warn!(
+                            "the elevated copy did not start; carrying on without \
+                             administrator rights. Input will freeze whenever an elevated \
+                             window has focus."
+                        );
+                    }
                     Ok(false) => tracing::warn!(
                         "running without administrator rights: the pointer and keyboard \
                          will freeze whenever an elevated window has focus"
@@ -1868,19 +1885,13 @@ fn lan_address() -> Option<String> {
 /// enough to be useful and wrong in a way nothing could detect — a screen's physical
 /// position is the one fact about a desk that is not visible from software. When someone
 /// says where a machine actually is, that answer outranks the guess and survives restarts.
-fn stored_layout(dir: &std::path::Path) -> Vec<(String, focus::Edge)> {
+fn stored_layout(dir: &std::path::Path) -> Vec<(String, String)> {
     let Ok(text) = std::fs::read_to_string(dir.join("layout")) else { return Vec::new() };
     text.lines()
         .filter_map(|line| {
             let (peer, edge) = line.trim().split_once(' ')?;
-            let edge = match edge {
-                "left" => focus::Edge::Left,
-                "right" => focus::Edge::Right,
-                "top" => focus::Edge::Top,
-                "bottom" => focus::Edge::Bottom,
-                _ => return None,
-            };
-            Some((peer.to_owned(), edge))
+            matches!(edge, "left" | "right" | "top" | "bottom")
+                .then(|| (peer.to_owned(), edge.to_owned()))
         })
         .collect()
 }
@@ -1893,17 +1904,7 @@ fn set_layout(dir: &std::path::Path, short_id: &str, edge: &str) -> bool {
     let mut lines: Vec<String> = stored_layout(dir)
         .into_iter()
         .filter(|(peer, _)| peer != short_id)
-        .map(|(peer, e)| {
-            format!(
-                "{peer} {}",
-                match e {
-                    focus::Edge::Left => "left",
-                    focus::Edge::Right => "right",
-                    focus::Edge::Top => "top",
-                    focus::Edge::Bottom => "bottom",
-                }
-            )
-        })
+        .map(|(peer, e)| format!("{peer} {e}"))
         .collect();
     lines.push(format!("{short_id} {edge}"));
     let written = std::fs::write(dir.join("layout"), lines.join("\n")).is_ok();
@@ -2357,6 +2358,27 @@ async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result
             }
         }
     }
+}
+
+/// Wait for the elevated copy to actually be running, rather than assuming it is.
+///
+/// It proves itself by writing its own `ui-port` note, which happens once its page is up —
+/// so this waits for that file to change from whatever was there before. Ten seconds is
+/// generous for a local process and short enough that a refused UAC prompt does not leave
+/// someone staring at a terminal.
+#[cfg(target_os = "windows")]
+fn elevated_child_started(dir: &std::path::Path) -> bool {
+    let note = dir.join("ui-port");
+    let before = std::fs::read_to_string(&note).unwrap_or_default();
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(250));
+        let now = std::fs::read_to_string(&note).unwrap_or_default();
+        if !now.is_empty() && now != before {
+            tracing::info!("the elevated copy is running; this one is done");
+            return true;
+        }
+    }
+    false
 }
 
 /// Ask the seam already running here to stop, so a newly launched one can take over.
@@ -3016,9 +3038,16 @@ async fn sync_peers(
         // editor belongs in the UI; this makes handover work without asking anyone to
         // draw anything (goal Z3).
         // A person's answer outranks the guess.
-        if let Some((_, chosen)) = stored_layout(dir)
+        if let Some(chosen) = stored_layout(dir)
             .into_iter()
             .find(|(peer, _)| id.to_string().starts_with(peer.as_str()))
+            .and_then(|(_, edge)| match edge.as_str() {
+                "left" => Some(focus::Edge::Left),
+                "right" => Some(focus::Edge::Right),
+                "top" => Some(focus::Edge::Top),
+                "bottom" => Some(focus::Edge::Bottom),
+                _ => None,
+            })
         {
             graph.place(*id, chosen, None, w, h);
             if let Ok(mut places) = UI_PLACES.lock() {
