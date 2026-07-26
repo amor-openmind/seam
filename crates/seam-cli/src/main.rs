@@ -1075,6 +1075,13 @@ async fn route(
         persist_settings();
         tracing::info!(kind, on, "clipboard sharing changed from the page");
         ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+    } else if method == "POST" && path.starts_with("/action/layout/") {
+        let mut parts = path.trim_start_matches("/action/layout/").split('/');
+        let peer = parts.next().unwrap_or("");
+        let edge = parts.next().unwrap_or("");
+        let dir = ui_port_note.parent().unwrap_or(ui_port_note);
+        let ok = set_layout(dir, peer, edge);
+        ("200 OK", "application/json", format!(r#"{{"ok":{ok}}}"#))
     } else if method == "POST" && path.starts_with("/action/peer/") {
         let mut parts = path.trim_start_matches("/action/peer/").split('/');
         let target = parts.next().unwrap_or("").to_owned();
@@ -1308,6 +1315,12 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/update.html", include_str!("../ui/update.html"), "text/html; charset=utf-8"),
     ("/ideas.html", include_str!("../ui/ideas.html"), "text/html; charset=utf-8"),
     ("/join.html", include_str!("../ui/join.html"), "text/html; charset=utf-8"),
+    ("/layout.html", include_str!("../ui/layout.html"), "text/html; charset=utf-8"),
+    (
+        "/_ds/page-layout.js",
+        include_str!("../ui/_ds/page-layout.js"),
+        "text/javascript; charset=utf-8",
+    ),
     ("/licence.html", include_str!("../ui/licence.html"), "text/html; charset=utf-8"),
     (
         "/_ds/page-licence.js",
@@ -1848,6 +1861,64 @@ fn lan_address() -> Option<String> {
     let ip = socket.local_addr().ok()?.ip();
     (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
 }
+
+/// The arrangement a person set, if they set one.
+///
+/// Pairing order is a guess: first paired sits left, second below. It is right often
+/// enough to be useful and wrong in a way nothing could detect — a screen's physical
+/// position is the one fact about a desk that is not visible from software. When someone
+/// says where a machine actually is, that answer outranks the guess and survives restarts.
+fn stored_layout(dir: &std::path::Path) -> Vec<(String, focus::Edge)> {
+    let Ok(text) = std::fs::read_to_string(dir.join("layout")) else { return Vec::new() };
+    text.lines()
+        .filter_map(|line| {
+            let (peer, edge) = line.trim().split_once(' ')?;
+            let edge = match edge {
+                "left" => focus::Edge::Left,
+                "right" => focus::Edge::Right,
+                "top" => focus::Edge::Top,
+                "bottom" => focus::Edge::Bottom,
+                _ => return None,
+            };
+            Some((peer.to_owned(), edge))
+        })
+        .collect()
+}
+
+/// Record where a machine sits, replacing any earlier answer for it.
+fn set_layout(dir: &std::path::Path, short_id: &str, edge: &str) -> bool {
+    if !matches!(edge, "left" | "right" | "top" | "bottom") {
+        return false;
+    }
+    let mut lines: Vec<String> = stored_layout(dir)
+        .into_iter()
+        .filter(|(peer, _)| peer != short_id)
+        .map(|(peer, e)| {
+            format!(
+                "{peer} {}",
+                match e {
+                    focus::Edge::Left => "left",
+                    focus::Edge::Right => "right",
+                    focus::Edge::Top => "top",
+                    focus::Edge::Bottom => "bottom",
+                }
+            )
+        })
+        .collect();
+    lines.push(format!("{short_id} {edge}"));
+    let written = std::fs::write(dir.join("layout"), lines.join("\n")).is_ok();
+    if written {
+        tracing::info!(peer = short_id, edge, "arrangement set from the desk page");
+        // Re-place on the next sync rather than mutating the graph from here: the
+        // forwarding loop owns it, and two writers to a live layout is how the pointer
+        // ends up somewhere nobody chose.
+        UI_RELAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    written
+}
+
+/// Set when the arrangement changed and the layout must be rebuilt.
+static UI_RELAYOUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Was this the first machine seam was installed on?
 ///
@@ -2911,6 +2982,16 @@ async fn sync_peers(
     geometry: &Geometry,
     dir: &std::path::Path,
 ) {
+    // An arrangement change means every placement is stale, so start again rather than
+    // patching one screen and leaving the rest describing the old desk.
+    if UI_RELAYOUT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        known.clear();
+        graph.forget_all();
+        if let Ok(mut places) = UI_PLACES.lock() {
+            places.clear();
+        }
+    }
+
     let live: Vec<seam_proto::PeerId> = links.lock().await.iter().map(|l| l.peer_id()).collect();
     let sizes = geometry.lock().await.clone();
 
@@ -2934,6 +3015,29 @@ async fn sync_peers(
         // layout: the first machine sits to the LEFT, the next one BELOW that. A layout
         // editor belongs in the UI; this makes handover work without asking anyone to
         // draw anything (goal Z3).
+        // A person's answer outranks the guess.
+        if let Some((_, chosen)) = stored_layout(dir)
+            .into_iter()
+            .find(|(peer, _)| id.to_string().starts_with(peer.as_str()))
+        {
+            graph.place(*id, chosen, None, w, h);
+            if let Ok(mut places) = UI_PLACES.lock() {
+                places.retain(|(p, _)| p != id);
+                places.push((
+                    *id,
+                    match chosen {
+                        focus::Edge::Left => "left",
+                        focus::Edge::Right => "right",
+                        focus::Edge::Top => "top",
+                        focus::Edge::Bottom => "bottom",
+                    },
+                ));
+            }
+            known.push(*id);
+            tracing::info!(peer = %id, ?chosen, "placed where you said it sits");
+            continue;
+        }
+
         let (edge, anchor) = match known.first() {
             None => (focus::Edge::Left, None),
             Some(first) => (focus::Edge::Bottom, Some(*first)),

@@ -245,6 +245,16 @@ impl Graph {
         Update { focus: self.focus(), changed: self.current != before, x: self.x, y: self.y }
     }
 
+    /// Drop every peer, keeping this machine. Used when the arrangement changes: every
+    /// placement describes the old desk, so they are rebuilt rather than patched.
+    pub(crate) fn forget_all(&mut self) {
+        self.nodes.truncate(1);
+        self.nodes[0].links = [None; 4];
+        self.current = 0;
+        self.settling = SETTLING_EVENTS;
+        self.lockout = CROSSING_LOCKOUT;
+    }
+
     /// Apply movement, crossing edges as needed.
     pub(crate) fn apply_motion(&mut self, dx: i32, dy: i32) -> Update {
         let before = self.current;
