@@ -2006,6 +2006,48 @@ fn update_json() -> String {
     )
 }
 
+/// Everything the page needs to say about one peer.
+///
+/// Split out of `ui_state_json` for length, but the grouping is real: each of these is
+/// derived, none configured, and the arrangement ones come from what a person SET rather
+/// than from what the graph currently managed to place.
+fn peer_facts(
+    dir: &std::path::Path,
+    peer: seam_proto::PeerId,
+) -> (String, String, &'static str, bool) {
+    let chosen = stored_layout(dir)
+        .into_iter()
+        .find(|(p, _, _)| peer.to_string().starts_with(p.as_str()));
+
+    // A machine that could not be placed yet — because its neighbour was still asleep —
+    // reported no edge at all, and the page drew it somewhere default. From a chair that
+    // is the desk rearranging itself after a laptop sleeps, when the arrangement on disk
+    // was right the whole time. Placement is a consequence; what was set is the fact.
+    let edge = chosen.as_ref().map_or_else(
+        || {
+            UI_PLACES
+                .lock()
+                .ok()
+                .and_then(|places| {
+                    places.iter().find(|(p, _)| *p == peer).map(|(_, e)| (*e).to_owned())
+                })
+                .unwrap_or_default()
+        },
+        |(_, e, _)| e.clone(),
+    );
+    let anchor = chosen.map_or_else(|| "self".to_owned(), |(_, _, a)| a);
+
+    // Capability, learned by observation: a peer that has sent motion captures input.
+    let role = UI_ROLES
+        .lock()
+        .ok()
+        .and_then(|roles| roles.iter().find(|(p, _)| *p == peer).map(|(_, r)| *r))
+        .unwrap_or("receives input");
+    let enabled = UI_DISABLED.lock().is_ok_and(|off| !off.contains(&peer));
+
+    (edge, anchor, role, enabled)
+}
+
 /// The live state the UI binds to. Assembled by hand — ten fields do not justify serde.
 async fn ui_state_json(
     name: &str,
@@ -2029,33 +2071,7 @@ async fn ui_state_json(
             peers.push(',');
         }
         let peer = link.peer_id();
-        let edge = UI_PLACES
-            .lock()
-            .ok()
-            .and_then(|places| {
-                places.iter().find(|(p, _)| *p == peer).map(|(_, edge)| *edge)
-            })
-            .unwrap_or("");
-        // Role is a fact about who dialled whom, not a setting: the machine that
-        // accepted the connection is the server for that pair.
-        let we_dialled =
-            UI_DIALLED.lock().is_ok_and(|dialled| dialled.contains(&peer));
-        // Not server/client. Both machines dial each other now that discovery
-        // auto-connects, so who-accepted is a race and every machine could call itself
-        // the server — which is exactly what three screens showed. The distinction that
-        // is real and stable is CAPABILITY: this build captures input on macOS and only
-        // replays it on Windows, and that is what a person actually wants to know.
-        let role = UI_ROLES
-            .lock()
-            .ok()
-            .and_then(|roles| roles.iter().find(|(p, _)| *p == peer).map(|(_, r)| *r))
-            .unwrap_or("receives input");
-        let _ = we_dialled;
-        let enabled = UI_DISABLED.lock().is_ok_and(|off| !off.contains(&peer));
-        let anchor = stored_layout(dir)
-            .into_iter()
-            .find(|(p, _, _)| peer.to_string().starts_with(p.as_str()))
-            .map_or_else(|| "self".to_owned(), |(_, _, a)| a);
+        let (edge, anchor, role, enabled) = peer_facts(dir, peer);
         let _ = write!(
             peers,
             r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}","anchor":"{anchor}","role":"{role}","enabled":{enabled},"version":"{}"}}"#,
