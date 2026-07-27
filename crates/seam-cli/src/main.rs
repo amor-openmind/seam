@@ -4040,11 +4040,28 @@ fn start_pointer_forwarding(
             // the log into noise at event rate.
             let mut last_drift_warn: Option<std::time::Instant> = None;
 
-            while let Some(event) = rx.recv().await {
-                if let Ok(mut last) = LAST_INPUT.lock() {
-                    *last = Some(std::time::Instant::now());
+            // The loop wakes on input — and once a second regardless. Rescue used to be
+            // event-driven only: a laptop that died HOLDING the pointer left the person
+            // staring at a dead cursor, and input only came home when they happened to
+            // move the mouse — measured live at 34 seconds of an invisible pointer,
+            // because who keeps wiggling a mouse that is visibly dead? The idle tick
+            // runs the same reconciliation with no event required.
+            let mut idle = tokio::time::interval(Duration::from_secs(1));
+            idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let event = tokio::select! {
+                    received = rx.recv() => match received {
+                        Some(event) => Some(event),
+                        None => break,
+                    },
+                    _ = idle.tick() => None,
+                };
+                if event.is_some() {
+                    if let Ok(mut last) = LAST_INPUT.lock() {
+                        *last = Some(std::time::Instant::now());
+                    }
+                    seq = seq.wrapping_add(1);
                 }
-                seq = seq.wrapping_add(1);
 
                 sync_peers(&links, &mut graph, &mut known, &geometry, &dir).await;
 
@@ -4082,6 +4099,10 @@ fn start_pointer_forwarding(
                     holder = None;
                     detached = handover(u, detached);
                 }
+
+                // A tick has no event to forward; its work — reconciliation and the
+                // safety nets above — is done.
+                let Some(event) = event else { continue };
 
                 // Movement decides ownership; everything else follows whoever owns it.
                 let update = match event {
