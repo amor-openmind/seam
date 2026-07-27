@@ -990,12 +990,19 @@ async fn apply_clipboard_image(
         tracing::debug!(%peer, generation, "clipboard image ignored as an echo or older");
         return;
     }
-    match seam_input::clipboard::write_image(width, height, &rgba) {
+    // The wire carries deflate (protocol v2); the clipboard and the signature both
+    // want raw pixels. The relay below forwards the compressed original untouched —
+    // decompressing just to recompress would tax the hub for nothing.
+    let Some(raw) = inflate_pixels(&rgba, width, height) else {
+        tracing::warn!(%peer, width, height, "clipboard image discarded: pixels did not decompress to the claimed size");
+        return;
+    };
+    match seam_input::clipboard::write_image(width, height, &raw) {
         Ok(()) => {
             tracing::info!(%peer, width, height, bytes = rgba.len(), "clipboard image received");
             note_transfer("image received", format!("{width} x {height}"));
             state.record(peer, generation);
-            state.image_sig = Some(image_signature(width, height, &rgba));
+            state.image_sig = Some(image_signature(width, height, &raw));
             state.last_seen = None;
             // Reissued under this machine's counter — same reasoning as the text relay.
             state.generation += 1;
@@ -3120,6 +3127,42 @@ impl ClipboardState {
     }
 }
 
+/// Compress pixels for the wire. Protocol v2: `ClipboardImage.rgba` carries deflate.
+///
+/// Raw RGBA was killing the fleet. A copied screenshot is 14–17 MB of uncompressed
+/// pixels, fanned out to every peer at once; on Wi-Fi that saturates the link long
+/// enough that keep-alive acks stop arriving, the 15-second patience runs out, and the
+/// transfer strangles the very connection carrying it — measured live twice, on two
+/// evenings: "clipboard changed; sharing kind=files/image", then every peer timing out
+/// within the minute, the pointer trapped on whichever machine held it. Screenshots
+/// deflate 5–10×, which turns the blast into something a radio can carry politely.
+fn deflate_pixels(rgba: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    // Writing into a Vec cannot fail; the unwrap_or covers the trait's signature.
+    let _ = encoder.write_all(rgba);
+    encoder.finish().unwrap_or_default()
+}
+
+/// Decompress wire pixels, refusing anything that does not inflate to exactly
+/// `width * height * 4` bytes — a mismatch is corruption, not something to guess at.
+fn inflate_pixels(wire: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    // A screen larger than this does not exist; a claim that one does is an attack or
+    // corruption, and either way not worth the allocation.
+    if expected > 512 * 1024 * 1024 {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(expected.min(64 * 1024 * 1024));
+    let decoder = flate2::read::ZlibDecoder::new(wire);
+    // The take() bound keeps a corrupt stream from inflating without limit.
+    let mut bounded = decoder.take(expected as u64 + 1);
+    bounded.read_to_end(&mut raw).ok()?;
+    (raw.len() == expected).then_some(raw)
+}
+
 /// Cheap identity for clipboard images: dimensions plus a streaming hash of the pixels.
 /// Collisions would only cost a skipped share of a near-identical image.
 fn image_signature(width: u32, height: u32, rgba: &[u8]) -> u64 {
@@ -3255,7 +3298,7 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
                     generation: state.generation,
                     width,
                     height,
-                    rgba,
+                    rgba: deflate_pixels(&rgba),
                 }
             };
             share_with_all(&links, &frame, "image").await;
@@ -4333,6 +4376,19 @@ mod tests {
         assert!(state.already_applied(peer, 1), "the old life's watermark blocks the reborn counter");
         state.forget_peer(peer);
         assert!(!state.already_applied(peer, 1), "after the link re-registers, generation 1 is heard");
+    }
+
+    #[test]
+    fn pixels_survive_the_wire_and_lies_about_size_do_not() {
+        // 100x50 of gradient-ish pixels: representative of a screenshot's compressibility.
+        let (w, h) = (100u32, 50u32);
+        let raw: Vec<u8> = (0..(w * h * 4)).map(|i| (i % 251) as u8).collect();
+        let wire = deflate_pixels(&raw);
+        assert!(wire.len() < raw.len(), "screenshot-like pixels must shrink");
+        assert_eq!(inflate_pixels(&wire, w, h).as_deref(), Some(raw.as_slice()));
+        // A frame whose dimensions do not match its pixels is corruption, not a guess.
+        assert_eq!(inflate_pixels(&wire, w, h + 1), None);
+        assert_eq!(inflate_pixels(&wire[..wire.len() / 2], w, h), None);
     }
 
     #[test]
