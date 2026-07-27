@@ -40,8 +40,17 @@ fn transport_config() -> quinn::TransportConfig {
 
     // Default is 30 s. A peer that has genuinely gone must be noticed quickly, because
     // the receiving side releases held keys and returns the cursor on that signal (R2).
+    //
+    // But not in 5 s. A power-managed Wi-Fi adapter naps for longer than that while a
+    // link is idle, and both sides then declare "timed out" while both processes are
+    // demonstrably fine — a laptop spent a whole morning connecting and dying every few
+    // seconds-to-minutes, dropping out of the desk each time, its console and the
+    // server's log each blaming the other side's silence. Fifteen seconds rides out an
+    // adapter nap; with a 1 s keep-alive it still means fifteen missed heartbeats
+    // before anyone is declared dead, and a machine that really is gone still hands
+    // input back well inside a person's patience.
     tc.max_idle_timeout(Some(
-        Duration::from_secs(5).try_into().expect("5s is a valid idle timeout"),
+        Duration::from_secs(15).try_into().expect("15s is a valid idle timeout"),
     ));
 
     // Default is 1200, then MTU discovery ramps up. On a LAN the path supports 1500, and
