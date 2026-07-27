@@ -2219,6 +2219,42 @@ fn recover_this_machine() {
     seam_input::windows::disable_console_quick_edit();
     seam_input::windows::reveal_cursor();
     seam_input::windows::release_stuck_modifiers();
+    repair_start_at_login_path();
+}
+
+/// Point start-at-login at the seam that is actually running.
+///
+/// The Run key records the exe path that was current when the toggle was written — and
+/// then outlives it. A laptop's key still said `Downloads\seam.exe` from version 0.4.2,
+/// so every sign-in resurrected a months-old relic that fought the real seam for the
+/// port all morning: handshakes failing with "authentication failed", links resetting
+/// as the port changed hands. The running seam is the truth; the key follows it.
+#[cfg(target_os = "windows")]
+fn repair_start_at_login_path() {
+    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(out) =
+        std::process::Command::new("reg").args(["query", RUN_KEY, "/v", "seam"]).output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return; // Start-at-login is off; nothing to repair.
+    }
+    let recorded = String::from_utf8_lossy(&out.stdout);
+    let wanted = format!("\"{}\" run --no-ui", exe.to_string_lossy());
+    if recorded.contains(&*exe.to_string_lossy()) {
+        return; // Already points at this seam.
+    }
+    let ok = std::process::Command::new("reg")
+        .args(["add", RUN_KEY, "/v", "seam", "/t", "REG_SZ", "/d", &wanted, "/f"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if ok {
+        tracing::info!(
+            "start-at-login pointed at an older seam; it now starts this one"
+        );
+    }
 }
 
 /// Bind the endpoint, or — if seam is already running here — show that one instead.
@@ -2245,6 +2281,28 @@ fn bind_or_show_running(
                     if let Ok(endpoint) =
                         Endpoint::bind(Arc::clone(identity), format!("0.0.0.0:{port}").parse()?)
                     {
+                        return Ok(std::ops::ControlFlow::Continue(Arc::new(endpoint)));
+                    }
+                }
+            }
+            // The polite quit did not free the port. A seam old enough predates the quit
+            // endpoint entirely, and it must not win by seniority — the seam a person
+            // just started is the one they mean. A stale autostart resurrected a
+            // version-0.4.2 relic every sign-in, and the fresh seam bowed out to it.
+            #[cfg(target_os = "windows")]
+            {
+                let own = std::process::id().to_string();
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/IM", "seam.exe", "/FI", &format!("PID ne {own}")])
+                    .output();
+                for _ in 0..20 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if let Ok(endpoint) =
+                        Endpoint::bind(Arc::clone(identity), format!("0.0.0.0:{port}").parse()?)
+                    {
+                        tracing::info!(
+                            "an older seam would not quit politely; it was stopped, this one runs"
+                        );
                         return Ok(std::ops::ControlFlow::Continue(Arc::new(endpoint)));
                     }
                 }
