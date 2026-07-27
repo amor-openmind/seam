@@ -811,11 +811,28 @@ not an implementation detail and requires an explicit version decision.
 
 ---
 
-## 14. The join flow is wrong, and how it must work
+## 14. The join flow is wrong, and how it must work — **built in v0.9.0**
+
+Status: implemented and verified end-to-end (two isolated daemons paired on one machine:
+codes matched, both confirmed over `POST /action/pair/confirm`, trust persisted to both
+peers files, fleet links established without a restart). The pieces:
+
+- A stranger connecting is **parked, not refused**: the accept path holds the link and
+  derives the SAS code (`park_pairing`), shown on both machines' pairing pages.
+- A seam that trusts nobody yet **offers itself** to whatever it discovers or was told to
+  `--connect` to — a fresh install rings the doorbell with nothing typed anywhere.
+- `/state` carries `discovered` (everyone mDNS can see, stranger or not) and `pairing`
+  (`code`, `with`, `showing|paired|declined`); `POST /action/pair/<peer>` dials a listed
+  machine, `…/confirm` writes trust and saves, `…/decline` closes without trusting.
+- The pairing page binds those states through `page-pairing.js`; the design's state
+  catalogue (discovering, found, verify, paired, differ) collapses to the live one.
+
+The command in "Add a machine" remains as the download vehicle and firewall fallback.
 
 A person downloads an app and opens it. They do not paste shell commands into a terminal
-they have never used. "Add a machine" currently hands out a `curl | sh` one-liner, which is
-a developer's install flow wearing a product's clothes — and the user said so plainly.
+they have never used. "Add a machine" previously handed out only a `curl | sh` one-liner,
+which is a developer's install flow wearing a product's clothes — and the user said so
+plainly.
 
 **What it must be:**
 

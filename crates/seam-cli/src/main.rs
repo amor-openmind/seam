@@ -717,7 +717,7 @@ async fn daemon(
     // only reliable defence, because the process that broke it is already gone.
     seam_input::release_input();
 
-    let store = Arc::new(store::load_peers(dir));
+    let store: SharedTrust = Arc::new(std::sync::RwLock::new(store::load_peers(dir)));
     let endpoint =
         match bind_or_show_running(dir, &identity, port)? {
             std::ops::ControlFlow::Continue(endpoint) => endpoint,
@@ -729,16 +729,20 @@ async fn daemon(
     let mut discovery = Discovery::new()?;
     discovery.advertise(&name, identity.peer_id(), identity.fingerprint(), bound.port())?;
 
+    let paired_count = store.read().map_or(0, |s| s.len());
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         %name,
         id = %identity.peer_id(),
         %bound,
-        peers = store.len(),
+        peers = paired_count,
         "seam is running"
     );
-    if store.is_empty() {
-        tracing::warn!("no paired machines yet — run `seam pair` on this and another machine");
+    if paired_count == 0 {
+        tracing::info!(
+            "no paired machines yet — when another seam appears on this network, both \
+             screens will show the same six digits; confirm them to pair"
+        );
     }
 
     // Real screen size of each peer, learned from its `Hello`. Until a peer reports its
@@ -796,48 +800,27 @@ async fn daemon(
     #[cfg(target_os = "windows")]
     recover_this_machine();
 
-    start_ui_server(dir.to_path_buf(), name.clone(), identity.peer_id(), port, Arc::clone(&links));
+    start_ui_server(
+        dir.to_path_buf(),
+        name.clone(),
+        identity.peer_id(),
+        port,
+        Arc::clone(&links),
+        Arc::clone(&store),
+        Some(Arc::clone(&endpoint)),
+    );
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry), dir.to_path_buf());
 
     start_clipboard_sync(Arc::clone(&links), Arc::clone(&clipboard));
     start_input_watchdog();
 
-    let accepting = {
-        let endpoint = Arc::clone(&endpoint);
-        let store = Arc::clone(&store);
-        let links = Arc::clone(&links);
-        let geometry = Arc::clone(&geometry);
-        let clipboard = Arc::clone(&clipboard);
-        tokio::spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
-                match incoming {
-                    Ok(link) => {
-                        let peer = link.peer_id();
-                        match link.authorize(&store) {
-                            Ok(()) => {
-                                tracing::info!(%peer, remote = %link.remote_address(), "peer connected");
-                                let link = Arc::new(link);
-                                register_link(&links, &link, &clipboard).await;
-                                announce_geometry(&link).await;
-                                tokio::spawn(receive_from(
-                                    link,
-                                    Arc::clone(&geometry),
-                                    Arc::clone(&clipboard),
-                                    Arc::clone(&links),
-                                ));
-                            }
-                            Err(e) => {
-                                // Never silent: a refused peer says why (goal O5).
-                                tracing::warn!(%peer, "refused: {e}");
-                                link.close("not paired");
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!("an inbound connection failed: {e}"),
-                }
-            }
-        })
-    };
+    let accepting = start_accepting(
+        Arc::clone(&endpoint),
+        Arc::clone(&store),
+        Arc::clone(&links),
+        Arc::clone(&geometry),
+        Arc::clone(&clipboard),
+    );
 
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("shutting down");
@@ -1054,6 +1037,109 @@ struct Serving<'a> {
     id: seam_proto::PeerId,
     links: &'a Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
     ui_port_note: &'a std::path::Path,
+    store: &'a SharedTrust,
+    /// Absent in the UI-only test server; pairing actions answer 503 without it.
+    endpoint: Option<&'a Arc<seam_transport::Endpoint>>,
+    dir: &'a std::path::Path,
+}
+
+/// The pairing page's slice of `/state`: who is visible, and the ceremony in flight.
+fn pairing_state_json() -> (String, String) {
+    use std::fmt::Write as _;
+    let mut discovered = String::new();
+    if let Ok(seen) = UI_DISCOVERED.lock() {
+        for machine in seen.iter() {
+            if !discovered.is_empty() {
+                discovered.push(',');
+            }
+            let _ = write!(
+                discovered,
+                r#"{{"id":"{}","addr":"{}","trusted":{}}}"#,
+                machine.short.replace('"', "'"),
+                machine.addr,
+                machine.trusted
+            );
+        }
+    }
+    let pairing = UI_PAIRING
+        .lock()
+        .ok()
+        .and_then(|slot| {
+            slot.as_ref().map(|pending| {
+                let state = match pending.outcome {
+                    None => "showing",
+                    Some(true) => "paired",
+                    Some(false) => "declined",
+                };
+                format!(
+                    r#"{{"code":"{}","with":"{}","state":"{state}"}}"#,
+                    pending.code,
+                    pending.with.replace('"', "'")
+                )
+            })
+        })
+        .unwrap_or_else(|| "null".to_owned());
+    (discovered, pairing)
+}
+
+/// Answer the pairing actions: confirm, decline, or dial a listed machine.
+fn pair_action(path: &str, ctx: &Serving<'_>) -> (&'static str, &'static str, String) {
+    if path == "/action/pair/confirm" {
+        // "They match": trust is written and saved before the link closes, so the peer's
+        // very next dial connects as a member of the fleet.
+        let ok = if let Ok(mut slot) = UI_PAIRING.lock()
+            && let Some(pending) = slot.as_mut()
+            && pending.outcome.is_none()
+        {
+            let saved = if let Ok(mut trust) = ctx.store.write() {
+                trust.trust(pending.link.peer_fingerprint(), pending.with.clone());
+                store::save_peers(ctx.dir, &trust).is_ok()
+            } else {
+                false
+            };
+            pending.link.close("paired");
+            pending.outcome = Some(true);
+            tracing::info!(peer = %pending.with, "paired — both screens agreed on the six digits");
+            saved
+        } else {
+            false
+        };
+        return ("200 OK", "application/json", format!(r#"{{"ok":{ok}}}"#));
+    }
+    if path == "/action/pair/decline" {
+        let ok = if let Ok(mut slot) = UI_PAIRING.lock()
+            && let Some(pending) = slot.as_mut()
+            && pending.outcome.is_none()
+        {
+            pending.link.close("pairing declined");
+            pending.outcome = Some(false);
+            tracing::warn!(peer = %pending.with, "pairing declined — the numbers did not match, nothing was trusted");
+            true
+        } else {
+            false
+        };
+        return ("200 OK", "application/json", format!(r#"{{"ok":{ok}}}"#));
+    }
+    // Pair… on a listed machine: dial it and put the six digits on both screens.
+    let Some(endpoint) = ctx.endpoint else {
+        return ("503 Service Unavailable", "application/json", r#"{"ok":false}"#.to_owned());
+    };
+    let short = path.trim_start_matches("/action/pair/").to_owned();
+    let target = UI_DISCOVERED
+        .lock()
+        .ok()
+        .and_then(|seen| seen.iter().find(|m| m.short.starts_with(&short)).map(|m| m.addr));
+    let ok = target.is_some();
+    if let Some(addr) = target {
+        let endpoint = Arc::clone(endpoint);
+        tokio::spawn(async move {
+            match endpoint.connect(addr).await {
+                Ok(link) => park_pairing(link),
+                Err(e) => tracing::warn!(%addr, "could not reach the machine to pair: {e}"),
+            }
+        });
+    }
+    ("200 OK", "application/json", format!(r#"{{"ok":{ok}}}"#))
 }
 
 async fn route(
@@ -1093,6 +1179,8 @@ async fn route(
             std::process::exit(0);
         });
         ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+    } else if method == "POST" && path.starts_with("/action/pair/") {
+        pair_action(path, ctx)
     } else if method == "POST" && path.starts_with("/action/startup/") {
         let on = path.ends_with("/on");
         let now = set_start_at_login(on);
@@ -1301,6 +1389,81 @@ static UI_HOME: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex:
 /// indistinguishable from one that is broken.
 static UI_TRANSFER: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
+/// The daemon's trust store, shared and writable: pairing from the page adds a peer
+/// while every connection path keeps checking it. Reads vastly outnumber writes.
+type SharedTrust = Arc<std::sync::RwLock<seam_transport::TrustStore>>;
+
+/// A machine seen on the network right now, paired or not, for the pairing page.
+#[derive(Clone)]
+struct DiscoveredMachine {
+    /// DNS-SD instance name — the only key a removal event carries.
+    instance: String,
+    short: String,
+    addr: std::net::SocketAddr,
+    trusted: bool,
+}
+
+static UI_DISCOVERED: std::sync::Mutex<Vec<DiscoveredMachine>> = std::sync::Mutex::new(Vec::new());
+
+/// An in-flight pairing: the parked link and the six digits both screens are showing.
+///
+/// The link is held open, unregistered and unauthorised, for exactly as long as the
+/// person needs to compare two numbers. Everything else about it stays quarantined.
+struct PendingPairing {
+    code: String,
+    with: String,
+    link: Arc<Link>,
+    /// `None` while the digits are showing; the page keeps the outcome visible after.
+    outcome: Option<bool>,
+}
+
+static UI_PAIRING: std::sync::Mutex<Option<PendingPairing>> = std::sync::Mutex::new(None);
+
+/// Park an unpaired link and show its six digits, instead of hanging up on it.
+///
+/// This is the whole command-free join: a machine nobody has vouched for connects, the
+/// same code derives from the encrypted channel on both ends, and two people compare
+/// two numbers. Refusing outright — which is what the accept path used to do — meant
+/// the only way in was a shell command nobody should have to know.
+fn park_pairing(link: Link) {
+    let Ok(code) = link.pairing_code() else {
+        link.close("pairing code unavailable");
+        return;
+    };
+    let Ok(mut slot) = UI_PAIRING.lock() else {
+        link.close("busy");
+        return;
+    };
+    if slot.as_ref().is_some_and(|pending| pending.outcome.is_none()) {
+        // One pairing at a time: a second machine mid-ceremony would put two codes on
+        // one screen and the person could confirm the wrong one.
+        link.close("another pairing is in progress");
+        return;
+    }
+    let with = link.peer_id().to_string();
+    tracing::info!(peer = %with, "a machine wants to pair — the same six digits are showing on both screens");
+    let link = Arc::new(link);
+    *slot = Some(PendingPairing {
+        code: code.to_display_string().replace(' ', ""),
+        with,
+        link: Arc::clone(&link),
+        outcome: None,
+    });
+    drop(slot);
+    // Two minutes of patience: a code nobody confirms is a doorbell nobody answered.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        if let Ok(mut slot) = UI_PAIRING.lock()
+            && let Some(pending) = slot.as_ref()
+            && pending.outcome.is_none()
+            && Arc::ptr_eq(&pending.link, &link)
+        {
+            pending.link.close("pairing timed out");
+            *slot = None;
+        }
+    });
+}
+
 /// The loopback port THIS process's page is on — zero until the page is up.
 ///
 /// Exists so shutdown can tell whether the `ui-port` note on disk is still its own.
@@ -1403,6 +1566,11 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
         "text/javascript; charset=utf-8",
     ),
     (
+        "/_ds/page-pairing.js",
+        include_str!("../ui/_ds/page-pairing.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
         "/notifications.html",
         include_str!("../ui/notifications.html"),
         "text/html; charset=utf-8",
@@ -1460,6 +1628,8 @@ fn start_ui_server(
     id: seam_proto::PeerId,
     seam_port: u16,
     links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    store: SharedTrust,
+    endpoint: Option<Arc<seam_transport::Endpoint>>,
 ) {
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
@@ -1488,6 +1658,9 @@ fn start_ui_server(
             let links = Arc::clone(&links);
             let name = name.clone();
             let ui_port_note = ui_port_note.clone();
+            let store = Arc::clone(&store);
+            let endpoint = endpoint.clone();
+            let dir = dir.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 // Read until the headers end, not just once: a single read is not
@@ -1522,6 +1695,9 @@ fn start_ui_server(
                             id,
                             links: &links,
                             ui_port_note: &ui_port_note,
+                            store: &store,
+                            endpoint: endpoint.as_ref(),
+                            dir: &dir,
                         },
                     )
                     .await;
@@ -1686,6 +1862,8 @@ mod ui_origin {
             seam_proto::PeerId([1; 16]),
             24810,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::RwLock::new(seam_transport::TrustStore::new())),
+            None,
         );
         let port = wait_for_ui_port(&dir).await;
         let response = fetch(port, UI_ASSETS[0].0).await;
@@ -2178,8 +2356,10 @@ async fn ui_state_json(
         push_health(elevated, if elevated { "elevated" } else { "not elevated — see doctor" });
     }
 
+    let (discovered, pairing) = pairing_state_json();
+
     format!(
-        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"seamPort":{},"lan":"{}","focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"licence":{},"update":{},"activity":[{}],"peers":[{peers}],"health":[{health}]}}"#,
+        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"seamPort":{},"lan":"{}","focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"licence":{},"update":{},"activity":[{}],"peers":[{peers}],"health":[{health}],"discovered":[{discovered}],"pairing":{pairing}}}"#,
         env!("CARGO_PKG_VERSION"),
         name.replace('"', "'"),
         std::env::consts::OS,
@@ -2208,6 +2388,53 @@ async fn ui_state_json(
     )
 }
 
+/// Accept inbound links: members join the fleet, strangers ring the pairing doorbell.
+fn start_accepting(
+    endpoint: Arc<seam_transport::Endpoint>,
+    store: SharedTrust,
+    links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    geometry: Geometry,
+    clipboard: Clipboard,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            match incoming {
+                Ok(link) => {
+                    let peer = link.peer_id();
+                    let verdict = store
+                        .read()
+                        .map_or(Err(seam_transport::Error::NotPaired), |s| link.authorize(&s));
+                    match verdict {
+                        Ok(()) => {
+                            tracing::info!(%peer, remote = %link.remote_address(), "peer connected");
+                            let link = Arc::new(link);
+                            register_link(&links, &link, &clipboard).await;
+                            announce_geometry(&link).await;
+                            tokio::spawn(receive_from(
+                                link,
+                                Arc::clone(&geometry),
+                                Arc::clone(&clipboard),
+                                Arc::clone(&links),
+                            ));
+                        }
+                        Err(seam_transport::Error::NotPaired) => {
+                            // A stranger is not an error, it is a doorbell: hold the
+                            // link and put six digits on both screens (goal §14).
+                            park_pairing(link);
+                        }
+                        Err(e) => {
+                            // Never silent: a refused peer says why (goal O5).
+                            tracing::warn!(%peer, "refused: {e}");
+                            link.close("not paired");
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("an inbound connection failed: {e}"),
+            }
+        }
+    })
+}
+
 /// Undo whatever a previous seam left behind, and armour the console.
 ///
 /// Crash recovery: a seam that died while the cursor was concealed leaves this machine
@@ -2233,6 +2460,14 @@ fn recover_this_machine() {
 fn repair_start_at_login_path() {
     const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
     let Ok(exe) = std::env::current_exe() else { return };
+    if starts_at_login() && seam_input::windows::is_elevated() {
+        // Re-record unconditionally: the logon task follows the exe that is actually
+        // running, and a leftover Run key gets migrated to a highest-privileges task —
+        // which is what stops sign-ins producing an unelevated seam whose pointer dies
+        // on every administrator window.
+        let _ = set_start_at_login(true);
+        return;
+    }
     let Ok(out) =
         std::process::Command::new("reg").args(["query", RUN_KEY, "/v", "seam"]).output()
     else {
@@ -2339,7 +2574,13 @@ fn starts_at_login() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("reg")
+        // Either mechanism counts: the scheduled task is the elevated one, the Run key
+        // the fallback a non-elevated seam can still write.
+        let task = std::process::Command::new("schtasks")
+            .args(["/query", "/tn", "seam"])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        task || std::process::Command::new("reg")
             .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "seam"])
             .output()
             .is_ok_and(|out| out.status.success())
@@ -2399,8 +2640,38 @@ fn set_start_at_login(enable: bool) -> bool {
     #[cfg(target_os = "windows")]
     {
         const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-        let ok = if enable {
-            std::process::Command::new("reg")
+        if enable {
+            // An elevated seam records itself as a highest-privileges logon task, so
+            // every sign-in starts it already elevated — no UAC prompt at the door and
+            // no pointer silently dying on admin windows (UIPI). A Run key cannot do
+            // that: entries there start unelevated, self-elevation then means a UAC
+            // prompt at every sign-in, and a declined prompt means input that fails
+            // exactly when an administrator window has focus.
+            if seam_input::windows::is_elevated() {
+                let ok = std::process::Command::new("schtasks")
+                    .args([
+                        "/create",
+                        "/tn",
+                        "seam",
+                        "/tr",
+                        &format!("\"{}\" run --no-ui", exe.to_string_lossy()),
+                        "/sc",
+                        "onlogon",
+                        "/rl",
+                        "highest",
+                        "/f",
+                    ])
+                    .output()
+                    .is_ok_and(|out| out.status.success());
+                if ok {
+                    // The task supersedes the key; leaving both starts seam twice.
+                    let _ = std::process::Command::new("reg")
+                        .args(["delete", RUN_KEY, "/v", "seam", "/f"])
+                        .output();
+                    return starts_at_login();
+                }
+            }
+            let _ = std::process::Command::new("reg")
                 .args([
                     "add",
                     RUN_KEY,
@@ -2412,13 +2683,15 @@ fn set_start_at_login(enable: bool) -> bool {
                     &format!("\"{}\" run --no-ui", exe.to_string_lossy()),
                     "/f",
                 ])
-                .output()
+                .output();
         } else {
-            std::process::Command::new("reg")
+            let _ = std::process::Command::new("schtasks")
+                .args(["/delete", "/tn", "seam", "/f"])
+                .output();
+            let _ = std::process::Command::new("reg")
                 .args(["delete", RUN_KEY, "/v", "seam", "/f"])
-                .output()
-        };
-        let _ = ok;
+                .output();
+        }
         starts_at_login()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -2999,7 +3272,7 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
 /// connection, not a loop.
 fn start_auto_dial(
     discovery: &Discovery,
-    store: &Arc<seam_transport::TrustStore>,
+    store: &SharedTrust,
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
     geometry: &Geometry,
     clipboard: &Clipboard,
@@ -3013,14 +3286,54 @@ fn start_auto_dial(
             let clipboard = Arc::clone(clipboard);
             let endpoint = Arc::clone(endpoint);
             tokio::spawn(async move {
+                let own = endpoint.identity().peer_id();
                 while let Some(event) = found.next().await {
-                    let seam_transport::DiscoveryEvent::Found(peer) = event else { continue };
-                    // Trust is still decided by the handshake; this only decides who is
-                    // worth dialling, so an unpaired machine is skipped, not refused.
-                    if !peer
-                        .advertised_fingerprint
-                        .is_some_and(|fingerprint| store.is_trusted(fingerprint))
+                    let peer = match event {
+                        seam_transport::DiscoveryEvent::Found(peer) => peer,
+                        seam_transport::DiscoveryEvent::Lost { instance } => {
+                            if let Ok(mut seen) = UI_DISCOVERED.lock() {
+                                seen.retain(|m| m.instance != instance);
+                            }
+                            continue;
+                        }
+                    };
+                    if peer.advertised_peer_id == Some(own) {
+                        continue;
+                    }
+                    let trusted = peer.advertised_fingerprint.is_some_and(|fingerprint| {
+                        store.read().is_ok_and(|s| s.is_trusted(fingerprint))
+                    });
+                    // The pairing page lists everyone on the network, stranger or not.
+                    if let (Ok(mut seen), Some(&addr)) =
+                        (UI_DISCOVERED.lock(), peer.addresses.first())
                     {
+                        seen.retain(|m| m.instance != peer.instance);
+                        seen.push(DiscoveredMachine {
+                            instance: peer.instance.clone(),
+                            short: peer
+                                .advertised_peer_id
+                                .map_or_else(|| peer.name.clone(), |id| id.to_string()),
+                            addr,
+                            trusted,
+                        });
+                    }
+                    // Trust is still decided by the handshake; this only decides who is
+                    // worth dialling, so an unpaired machine is skipped, not refused —
+                    // with one exception. A seam that trusts NOBODY yet is a machine
+                    // someone just installed: it offers itself to whatever fleet it can
+                    // see, which puts the six digits on both screens with nothing typed
+                    // anywhere. A machine with even one pairing never volunteers.
+                    if !trusted {
+                        let lonely = store.read().is_ok_and(|s| s.is_empty());
+                        let idle = UI_PAIRING.lock().is_ok_and(|slot| slot.is_none());
+                        if lonely && idle {
+                            for address in &peer.addresses {
+                                if let Ok(link) = endpoint.connect(*address).await {
+                                    park_pairing(link);
+                                    break;
+                                }
+                            }
+                        }
                         continue;
                     }
                     let already = links.lock().await.iter().any(|link| {
@@ -3045,7 +3358,10 @@ fn start_auto_dial(
                         // `presented` is the whole diagnosis when an address is answered
                         // by the wrong machine: a stale entry after standby points at a
                         // box that completes the handshake happily — as someone else.
-                        if let Err(e) = link.authorize(&store) {
+                        let verdict = store
+                            .read()
+                            .map_or(Err(seam_transport::Error::NotPaired), |s| link.authorize(&s));
+                        if let Err(e) = verdict {
                             tracing::warn!(peer = %peer.name, %address, presented = %link.peer_id(), "answered by a machine we are not paired with: {e}");
                             link.close("not paired");
                             continue;
@@ -3152,7 +3468,7 @@ fn spawn_reconnector(
     target: SocketAddr,
     port: u16,
     endpoint: Arc<seam_transport::Endpoint>,
-    store: Arc<seam_transport::TrustStore>,
+    store: SharedTrust,
     links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
     geometry: Geometry,
     clipboard: Clipboard,
@@ -3170,15 +3486,30 @@ fn spawn_reconnector(
                     // machine after standby, killed this loop for good and nothing ever
                     // dialled again. `presented` names who actually answered, which is
                     // the whole diagnosis when it is not who the address used to be.
-                    Ok(link) if link.authorize(&store).is_err() => {
-                        let refusal =
-                            link.authorize(&store).expect_err("checked in the guard");
-                        if failures == 0 {
-                            tracing::warn!(%target, presented = %link.peer_id(), "refused: {refusal}; keeping this lane alive");
+                    Ok(link)
+                        if store.read().is_ok_and(|s| link.authorize(&s).is_err()) =>
+                    {
+                        let refusal = store
+                            .read()
+                            .map_or(Err(seam_transport::Error::NotPaired), |s| {
+                                link.authorize(&s)
+                            })
+                            .expect_err("checked in the guard");
+                        let lonely = store.read().is_ok_and(|s| s.is_empty());
+                        if lonely && matches!(refusal, seam_transport::Error::NotPaired) {
+                            // A machine told to connect somewhere before it trusts
+                            // anyone is a machine someone is joining to a fleet: put
+                            // the six digits on both screens rather than refusing the
+                            // very thing the person asked for.
+                            park_pairing(link);
                         } else {
-                            tracing::debug!(%target, presented = %link.peer_id(), "still refused: {refusal}");
+                            if failures == 0 {
+                                tracing::warn!(%target, presented = %link.peer_id(), "refused: {refusal}; keeping this lane alive");
+                            } else {
+                                tracing::debug!(%target, presented = %link.peer_id(), "still refused: {refusal}");
+                            }
+                            link.close("not paired");
                         }
-                        link.close("not paired");
                     }
                     Ok(link) => {
                         tracing::info!(peer = %link.peer_id(), %target, "connected to peer");
