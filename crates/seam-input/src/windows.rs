@@ -309,6 +309,38 @@ pub fn release_everything() {
     }
 }
 
+/// Which modifiers the OS considers held right now that seam did not press.
+///
+/// The diagnosis this exists for: "clicks and keyboard not working" on a machine whose
+/// links, elevation and injection all checked out — because a phantom Ctrl or Win was
+/// held, turning every click into a chord and every keypress into a shortcut, while
+/// motion sailed through untouched. One log line naming the held key ends the guessing.
+#[must_use]
+pub fn oddly_held_modifiers() -> Vec<&'static str> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(vk: i32) -> i16;
+    }
+    const CHECKS: [(i32, u16, &str); 8] = [
+        (0xA2, 224, "left Ctrl"),
+        (0xA3, 228, "right Ctrl"),
+        (0xA0, 225, "left Shift"),
+        (0xA1, 229, "right Shift"),
+        (0xA4, 226, "left Alt"),
+        (0xA5, 230, "right Alt"),
+        (0x5B, 227, "left Win"),
+        (0x5C, 231, "right Win"),
+    ];
+    let ours = PRESSED_KEYS.lock().map(|held| held.clone()).unwrap_or_default();
+    CHECKS
+        .iter()
+        // SAFETY: documented stateless query.
+        .filter(|(vk, _, _)| unsafe { GetAsyncKeyState(*vk) }.cast_unsigned() & 0x8000 != 0)
+        .filter(|(_, usage, _)| !ours.contains(usage))
+        .map(|(_, _, name)| *name)
+        .collect()
+}
+
 /// Release the modifiers and buttons a *previous* seam may have left held.
 ///
 /// A fresh process has an empty pressed set, so `release_everything` cannot undo what a

@@ -959,6 +959,9 @@ async fn receive_from_inner(
                 }
             }
             Ok(seam_proto::Frame::Button(b)) => {
+                if b.press.is_down() {
+                    warn_if_modifiers_held();
+                }
                 if let Err(e) = seam_input::inject_button(b.button.to_u8(), b.press.is_down()) {
                     tracing::warn!(%peer, "could not press a mouse button: {e}");
                 }
@@ -2468,6 +2471,39 @@ fn start_accepting(
             }
         }
     })
+}
+
+/// Name any modifier held on this machine that seam did not press — throttled.
+///
+/// Runs when a click arrives, because that is the moment a phantom modifier turns the
+/// click into a chord: "clicks and keyboard not working" on a machine whose elevation,
+/// links and injection all checked out was a held key nobody could see. Windows only;
+/// elsewhere this is a no-op.
+fn warn_if_modifiers_held() {
+    #[cfg(target_os = "windows")]
+    {
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let due = LAST
+            .lock()
+            .ok()
+            .is_some_and(|slot| slot.is_none_or(|at| at.elapsed() > Duration::from_secs(5)));
+        if !due {
+            return;
+        }
+        let held = seam_input::windows::oddly_held_modifiers();
+        if held.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = LAST.lock() {
+            *slot = Some(std::time::Instant::now());
+        }
+        tracing::warn!(
+            held = held.join(", "),
+            "a modifier seam did not press is held on this machine — clicks land as \
+             chords and keys as shortcuts; press and release it on this machine's own \
+             keyboard"
+        );
+    }
 }
 
 /// Undo whatever a previous seam left behind, and armour the console.
@@ -4005,6 +4041,9 @@ async fn receive_reliable(
                 }
             }
             Ok(seam_proto::Frame::Button(b)) => {
+                if b.press.is_down() {
+                    warn_if_modifiers_held();
+                }
                 if let Err(e) = seam_input::inject_button(b.button.to_u8(), b.press.is_down()) {
                     tracing::warn!(%peer, "could not press a mouse button: {e}");
                 }
