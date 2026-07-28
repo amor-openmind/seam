@@ -3427,7 +3427,27 @@ fn start_auto_dial(
             let endpoint = Arc::clone(endpoint);
             tokio::spawn(async move {
                 let own = endpoint.identity().peer_id();
-                while let Some(event) = found.next().await {
+                // A paired machine can drop off the links with no discovery event: its
+                // record is still cached, so Found never re-fires — and if ITS dials
+                // are blackholed (a dual-homed peer answering from the wrong interface,
+                // a stale ARP entry) nothing on this side ever tried again. Observed
+                // live: a laptop placed and entered at 18:02:59, dead at 18:03:03, and
+                // stranded for minutes on an address this machine never redialled. The
+                // sweep retries every trusted, visible, absent machine on a slow tick.
+                let mut resweep = tokio::time::interval(Duration::from_secs(20));
+                resweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    let event = tokio::select! {
+                        event = found.next() => match event {
+                            Some(event) => event,
+                            None => break,
+                        },
+                        _ = resweep.tick() => {
+                            redial_absent_peers(&endpoint, &store, &links, &geometry, &clipboard)
+                                .await;
+                            continue;
+                        }
+                    };
                     let peer = match event {
                         seam_transport::DiscoveryEvent::Found(peer) => peer,
                         seam_transport::DiscoveryEvent::Lost { instance } => {
@@ -3483,47 +3503,90 @@ fn start_auto_dial(
                         continue;
                     }
                     tracing::info!(peer = %peer.name, "found a paired machine; connecting");
-                    for address in &peer.addresses {
-                        // Every failed address is named. This loop used to swallow its
-                        // failures whole, and that exact silence meant an afternoon of a
-                        // client logging "authentication failed" every few seconds left
-                        // no trace at all on the machine doing the dialling.
-                        let link = match endpoint.connect(*address).await {
-                            Ok(link) => link,
-                            Err(e) => {
-                                tracing::info!(peer = %peer.name, %address, "no luck at this address: {e}");
-                                continue;
-                            }
-                        };
-                        // `presented` is the whole diagnosis when an address is answered
-                        // by the wrong machine: a stale entry after standby points at a
-                        // box that completes the handshake happily — as someone else.
-                        let verdict = store
-                            .read()
-                            .map_or(Err(seam_transport::Error::NotPaired), |s| link.authorize(&s));
-                        if let Err(e) = verdict {
-                            tracing::warn!(peer = %peer.name, %address, presented = %link.peer_id(), "answered by a machine we are not paired with: {e}");
-                            link.close("not paired");
-                            continue;
-                        }
-                        tracing::info!(peer = %link.peer_id(), %address, "found and connected");
-                        let link = Arc::new(link);
-                        register_link(&links, &link, &clipboard).await;
-                        announce_geometry(&link).await;
-                        tokio::spawn(receive_from(
-                            link,
-                            Arc::clone(&geometry),
-                            Arc::clone(&clipboard),
-                            Arc::clone(&links),
-                        ));
-                        break;
-                    }
+                    dial_trusted(
+                        &endpoint,
+                        &store,
+                        &links,
+                        &geometry,
+                        &clipboard,
+                        &peer.name,
+                        &peer.addresses,
+                    )
+                    .await;
                 }
             });
         }
         Err(e) => tracing::warn!("discovery unavailable; only --connect addresses work: {e}"),
     }
+}
 
+/// One sweep pass: redial every trusted machine that is visible but not connected.
+async fn redial_absent_peers(
+    endpoint: &Arc<seam_transport::Endpoint>,
+    store: &SharedTrust,
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    geometry: &Geometry,
+    clipboard: &Clipboard,
+) {
+    let connected: Vec<String> =
+        links.lock().await.iter().map(|l| l.peer_id().to_string()).collect();
+    let absent: Vec<(String, std::net::SocketAddr)> = UI_DISCOVERED
+        .lock()
+        .map(|seen| {
+            seen.iter()
+                .filter(|m| m.trusted && !connected.iter().any(|c| c.starts_with(&m.short)))
+                .map(|m| (m.short.clone(), m.addr))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (short, addr) in absent {
+        tracing::info!(peer = %short, %addr, "a paired machine is visible but not connected; dialling it");
+        dial_trusted(endpoint, store, links, geometry, clipboard, &short, &[addr]).await;
+    }
+}
+
+/// Dial a trusted machine at the given addresses; register the first that answers as
+/// itself. Every failed address is named — that exact silence once cost an afternoon.
+async fn dial_trusted(
+    endpoint: &Arc<seam_transport::Endpoint>,
+    store: &SharedTrust,
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    geometry: &Geometry,
+    clipboard: &Clipboard,
+    label: &str,
+    addresses: &[std::net::SocketAddr],
+) {
+    for address in addresses {
+        let link = match endpoint.connect(*address).await {
+            Ok(link) => link,
+            Err(e) => {
+                tracing::info!(peer = %label, %address, "no luck at this address: {e}");
+                continue;
+            }
+        };
+        // `presented` is the whole diagnosis when an address is answered by the wrong
+        // machine: a stale entry after standby points at a box that completes the
+        // handshake happily — as someone else.
+        let verdict = store
+            .read()
+            .map_or(Err(seam_transport::Error::NotPaired), |s| link.authorize(&s));
+        if let Err(e) = verdict {
+            tracing::warn!(peer = %label, %address, presented = %link.peer_id(), "answered by a machine we are not paired with: {e}");
+            link.close("not paired");
+            continue;
+        }
+        tracing::info!(peer = %link.peer_id(), %address, "found and connected");
+        let link = Arc::new(link);
+        register_link(links, &link, clipboard).await;
+        announce_geometry(&link).await;
+        tokio::spawn(receive_from(
+            link,
+            Arc::clone(geometry),
+            Arc::clone(clipboard),
+            Arc::clone(links),
+        ));
+        return;
+    }
 }
 
 /// Peer id to real screen size, as reported by that peer.
