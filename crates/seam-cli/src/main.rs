@@ -3652,15 +3652,22 @@ async fn register_link(
     clipboard: &Clipboard,
 ) {
     let id = link.peer_id();
-    let replaced = {
+    let replaced: Vec<Arc<Link>> = {
         let mut peers = links.lock().await;
-        let replaced = peers.iter().any(|l| l.peer_id() == id);
+        let replaced = peers.iter().filter(|l| l.peer_id() == id).map(Arc::clone).collect();
         peers.retain(|l| l.peer_id() != id);
         peers.push(Arc::clone(link));
         replaced
     };
-    if replaced {
-        tracing::info!(peer = %id, "peer reconnected; dropped the stale link");
+    for stale in &replaced {
+        // Close it, don't just forget it. A replaced link left open is a zombie: its
+        // tasks keep reading, the other side may keep SENDING on it, and the two
+        // machines can end up talking through different connections — one of which
+        // nobody is reading. One peer, one link, and the loser is told it lost.
+        stale.close("replaced by a newer link");
+    }
+    if !replaced.is_empty() {
+        tracing::info!(peer = %id, "peer reconnected; closed the stale link");
     }
     // A fresh link may be a fresh process, and a fresh process counts from one again.
     clipboard.lock().await.forget_peer(id);
@@ -4199,7 +4206,14 @@ async fn receive_reliable(
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::debug!(%peer, "reliable stream ended: {e}");
+                // Loud, and fatal to the link. This reader is the only thing that
+                // delivers buttons, keys and clipboard from the peer: letting the
+                // connection outlive it produced a link that looked healthy while
+                // clicks poured into a stream nobody read — and the sender's machine
+                // eventually wedged its own input on the backed-up send. If the reader
+                // ends, the link ends, both sides notice, and the sweep re-dials.
+                tracing::info!(%peer, "reliable stream ended: {e} — closing this link so it can heal");
+                link.close("reliable stream ended");
                 return;
             }
         }
@@ -4513,14 +4527,39 @@ fn start_pointer_forwarding(
                 };
                 log_event(&frame);
 
-                let peers = links.lock().await;
-                let Some(link) = peers.iter().find(|l| l.peer_id() == target) else {
-                    continue;
+                // Clone out of the lock before awaiting anything: holding the fleet's
+                // link list across a blocked send would freeze every other user of it.
+                let link = {
+                    let peers = links.lock().await;
+                    match peers.iter().find(|l| l.peer_id() == target) {
+                        Some(link) => Arc::clone(link),
+                        None => continue,
+                    }
                 };
                 let result = if frame.is_datagram_safe() {
                     link.send_datagram(&frame, &mut buf)
                 } else {
-                    link.send_reliable(&frame).await
+                    // Bounded, because this loop owns this machine's own input. A peer
+                    // whose reliable stream is not being drained exerts backpressure
+                    // here, and an unbounded await turned one sick client into a server
+                    // whose own mouse and keyboard were dead until that client
+                    // disconnected. Two seconds without progress means the peer is not
+                    // accepting input; close the link and let the sweep heal it.
+                    let Ok(sent) = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        link.send_reliable(&frame),
+                    )
+                    .await
+                    else {
+                        tracing::warn!(
+                            peer = %target,
+                            "an input send made no progress for two seconds; \
+                             closing the link so it can heal"
+                        );
+                        link.close("input send stalled");
+                        continue;
+                    };
+                    sent
                 };
                 if let Err(e) = result {
                     tracing::warn!(peer = %target, "could not forward input: {e}");

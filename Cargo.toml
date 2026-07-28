@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/seam-proto", "crates/seam-transport", "crates/seam-cli", "crates/seam-input"]
 
 [workspace.package]
-version = "0.9.6"
+version = "0.9.7"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
