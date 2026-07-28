@@ -342,6 +342,16 @@ impl Drop for CursorGuard {
                 for _ in 0..hides.saturating_add(8) {
                     CGDisplayShowCursor(CGMainDisplayID());
                 }
+                // Verify rather than trust the arithmetic: if anything hid the cursor
+                // outside the counter's knowledge, keep showing until the window server
+                // agrees it is visible. Bounded, because a display mid-sleep can answer
+                // "not visible" forever and this must never spin.
+                for _ in 0..64 {
+                    if CGCursorIsVisible() != 0 {
+                        break;
+                    }
+                    CGDisplayShowCursor(CGMainDisplayID());
+                }
             }
             CGAssociateMouseAndMouseCursorPosition(1);
         }

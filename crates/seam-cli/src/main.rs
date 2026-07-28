@@ -866,6 +866,24 @@ async fn receive_from(
     tracing::info!(peer = %peer_id, "peer disconnected; removed from the fleet");
 }
 
+/// Close the link if the peer's `Hello` names another protocol. Enforced, not
+/// advisory: a v1 and a v2 machine spent a morning connected, exchanging payloads each
+/// interpreted differently — mixed protocols must fail at the handshake, loudly, not
+/// at the first garbled paste.
+fn hello_speaks_another_protocol(link: &Link, peer: seam_proto::PeerId, theirs: u16) -> bool {
+    if theirs == seam_proto::PROTOCOL_VERSION {
+        return false;
+    }
+    tracing::warn!(
+        %peer,
+        ours = seam_proto::PROTOCOL_VERSION,
+        theirs,
+        "peer speaks a different protocol; closing the link — update every machine to the same version"
+    );
+    link.close("protocol mismatch — update every machine");
+    true
+}
+
 /// The receive loop itself. Split so `receive_from` owns the cleanup for every exit.
 async fn receive_from_inner(
     link: Arc<Link>,
@@ -1335,7 +1353,17 @@ async fn apply_clipboard_files(
         tracing::debug!(%peer, generation, "clipboard files ignored as an echo or older");
         return;
     }
-    let spooled = match spool_clipboard_files(generation, &entries) {
+    // The wire carries deflate per file (protocol v2); the spool wants real bytes. The
+    // relay below forwards the compressed originals untouched.
+    let mut raw_entries = Vec::with_capacity(entries.len());
+    for (name, wire) in &entries {
+        let Some(raw) = inflate_file_bytes(wire) else {
+            tracing::warn!(%peer, %name, "clipboard files discarded: an entry did not decompress to its claimed size");
+            return;
+        };
+        raw_entries.push((name.clone(), raw));
+    }
+    let spooled = match spool_clipboard_files(generation, &raw_entries) {
         Ok(tops) => tops,
         Err(e) => {
             tracing::warn!(%peer, "could not store the received files: {e}");
@@ -1344,7 +1372,7 @@ async fn apply_clipboard_files(
     };
     match seam_input::clipboard::write_file_list(&spooled) {
         Ok(()) => {
-            let bytes: usize = entries.iter().map(|(_, b)| b.len()).sum();
+            let bytes: usize = raw_entries.iter().map(|(_, b)| b.len()).sum();
             tracing::info!(%peer, files = entries.len(), bytes, "clipboard files received");
             note_transfer("files received", format!("{} files, {} KB", entries.len(), bytes / 1024));
             state.record(peer, generation);
@@ -3163,6 +3191,36 @@ fn inflate_pixels(wire: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     (raw.len() == expected).then_some(raw)
 }
 
+/// Compress one file's bytes for the wire: an 8-byte length, then deflate.
+///
+/// Files got the same disease as images one release later: "sharing kind=files", then
+/// the peer timing out twenty-one seconds after — the payload saturating the link that
+/// carried it. The length prefix is what lets the receiver refuse a stream that does
+/// not inflate to exactly what was promised.
+fn deflate_file_bytes(raw: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut wire = (raw.len() as u64).to_le_bytes().to_vec();
+    let mut encoder =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    let _ = encoder.write_all(raw);
+    wire.extend(encoder.finish().unwrap_or_default());
+    wire
+}
+
+/// Inverse of [`deflate_file_bytes`]; `None` on any mismatch or absurd claim.
+fn inflate_file_bytes(wire: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let (len_bytes, deflated) = wire.split_at_checked(8)?;
+    let expected = usize::try_from(u64::from_le_bytes(len_bytes.try_into().ok()?)).ok()?;
+    if expected > 256 * 1024 * 1024 {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(expected.min(64 * 1024 * 1024));
+    let mut bounded = flate2::read::ZlibDecoder::new(deflated).take(expected as u64 + 1);
+    bounded.read_to_end(&mut raw).ok()?;
+    (raw.len() == expected).then_some(raw)
+}
+
 /// Cheap identity for clipboard images: dimensions plus a streaming hash of the pixels.
 /// Collisions would only cost a skipped share of a near-identical image.
 fn image_signature(width: u32, height: u32, rgba: &[u8]) -> u64 {
@@ -3239,7 +3297,10 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
                             seam_proto::Frame::ClipboardFiles {
                                 seq: 0,
                                 generation: state.generation,
-                                entries,
+                                entries: entries
+                                    .into_iter()
+                                    .map(|(name, raw)| (name, deflate_file_bytes(&raw)))
+                                    .collect(),
                             }
                         };
                         note_transfer("sending files", format!("{} files", paths.len()));
@@ -4005,6 +4066,9 @@ async fn receive_reliable(
                     .await;
             }
             Ok(seam_proto::Frame::Hello(hello)) => {
+                if hello_speaks_another_protocol(&link, peer, hello.version) {
+                    return;
+                }
                 let (w, h) = (
                     i32::try_from(hello.width).unwrap_or(0),
                     i32::try_from(hello.height).unwrap_or(0),
@@ -4194,6 +4258,14 @@ fn start_pointer_forwarding(
                         Focus::Remote(_) if parked.is_none() => {
                             match seam_input::cursor_position() {
                                 Ok((px, py)) => {
+                                    // A crossing happens AT an edge, so the raw position
+                                    // is often the screen's last pixel row — and a cursor
+                                    // returned to a screen seam is, from a chair, not
+                                    // there at all: "mouse not shown even after the peer
+                                    // disconnected" was a cursor parked at (59, 1080) on
+                                    // a 1080-tall display. Hold it a visible distance in.
+                                    let px = px.clamp(24, (local_w - 25).max(24));
+                                    let py = py.clamp(24, (local_h - 25).max(24));
                                     tracing::info!(
                                         x = px,
                                         y = py,
