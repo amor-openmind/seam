@@ -959,12 +959,7 @@ async fn receive_from_inner(
                 }
             }
             Ok(seam_proto::Frame::Button(b)) => {
-                if b.press.is_down() {
-                    warn_if_modifiers_held();
-                }
-                if let Err(e) = seam_input::inject_button(b.button.to_u8(), b.press.is_down()) {
-                    tracing::warn!(%peer, "could not press a mouse button: {e}");
-                }
+                apply_button(peer, b.button.to_u8(), b.press.is_down());
             }
             Ok(seam_proto::Frame::Scroll(sc)) => {
                 if let Err(e) = seam_input::inject_scroll(sc.dx, sc.dy) {
@@ -2471,6 +2466,27 @@ fn start_accepting(
             }
         }
     })
+}
+
+/// Inject a remote button press, with the two witnesses that end silent failures:
+/// the held-modifier check before, and the pressed-state read-back after.
+fn apply_button(peer: seam_proto::PeerId, button: u8, down: bool) {
+    if down {
+        warn_if_modifiers_held();
+    }
+    if let Err(e) = seam_input::inject_button(button, down) {
+        tracing::warn!(%peer, "could not press a mouse button: {e}");
+    }
+    #[cfg(target_os = "windows")]
+    if down && !seam_input::windows::button_reads_pressed(button) {
+        tracing::warn!(
+            %peer,
+            button,
+            "a click was injected and accepted, yet the system does not show the \
+             button as pressed — something between seam and the desktop is \
+             discarding clicks"
+        );
+    }
 }
 
 /// Name any modifier held on this machine that seam did not press — throttled.
@@ -4104,12 +4120,7 @@ async fn receive_reliable(
                 }
             }
             Ok(seam_proto::Frame::Button(b)) => {
-                if b.press.is_down() {
-                    warn_if_modifiers_held();
-                }
-                if let Err(e) = seam_input::inject_button(b.button.to_u8(), b.press.is_down()) {
-                    tracing::warn!(%peer, "could not press a mouse button: {e}");
-                }
+                apply_button(peer, b.button.to_u8(), b.press.is_down());
             }
             Ok(seam_proto::Frame::Scroll(sc)) => {
                 if let Err(e) = seam_input::inject_scroll(sc.dx, sc.dy) {

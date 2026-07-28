@@ -309,6 +309,29 @@ pub fn release_everything() {
     }
 }
 
+/// After injecting a button-down, ask the OS whether the button reads as pressed.
+///
+/// `SendInput` returning success means the event was queued, not that anything kept
+/// it: the same silent-discard family as UIPI. Motion already verifies by reading the
+/// cursor back; this is the button equivalent. Two days were spent on a machine where
+/// clicks were accepted, elevation checked out, no modifier was held — and nothing on
+/// screen ever happened. This read-back is the missing witness.
+#[must_use]
+pub fn button_reads_pressed(button: u8) -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(vk: i32) -> i16;
+    }
+    let vk = match button {
+        1 => 0x01,
+        2 => 0x02,
+        3 => 0x04,
+        _ => return true,
+    };
+    // SAFETY: documented stateless query.
+    (unsafe { GetAsyncKeyState(vk) }).cast_unsigned() & 0x8000 != 0
+}
+
 /// Which modifiers the OS considers held right now that seam did not press.
 ///
 /// The diagnosis this exists for: "clicks and keyboard not working" on a machine whose
