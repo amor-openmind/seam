@@ -112,18 +112,29 @@ fn virtual_screen() -> PixelRect {
 /// Where the pointer is, in virtual-desktop pixel coordinates.
 pub fn cursor_position() -> Result<(i32, i32), Error> {
     let mut point = POINT { x: 0, y: 0 };
-    // SAFETY: `point` is a valid, initialised out-parameter.
-    if unsafe { GetCursorPos(&raw mut point) } == 0 {
-        return Err(Error::Platform("GetCursorPos failed".into()));
+    // SAFETY: `point` is a valid, initialised out-parameter. A failure is retried once
+    // after re-attaching to the input desktop — a lock/unlock cycle detaches this
+    // thread's desktop, and every cursor call fails until someone re-attaches.
+    unsafe {
+        if GetCursorPos(&raw mut point) == 0
+            && !(reattach_to_input_desktop() && GetCursorPos(&raw mut point) != 0)
+        {
+            return Err(Error::Platform("GetCursorPos failed".into()));
+        }
     }
     Ok((point.x, point.y))
 }
 
 /// Move the pointer without generating input events.
 pub fn warp_cursor(x: i32, y: i32) -> Result<(), Error> {
-    // SAFETY: plain integer arguments; the OS clamps out-of-range values.
-    if unsafe { SetCursorPos(x, y) } == 0 {
-        return Err(Error::Platform("SetCursorPos failed".into()));
+    // SAFETY: plain integer arguments; the OS clamps out-of-range values. Same
+    // re-attach-and-retry as `cursor_position`, for the same lock-screen reason.
+    unsafe {
+        if SetCursorPos(x, y) == 0
+            && !(reattach_to_input_desktop() && SetCursorPos(x, y) != 0)
+        {
+            return Err(Error::Platform("SetCursorPos failed".into()));
+        }
     }
     Ok(())
 }
@@ -226,7 +237,52 @@ fn send_one(input: INPUT) -> Result<(), Error> {
     // SAFETY: one correctly initialised INPUT, with the size the API requires.
     let sent =
         unsafe { SendInput(1, &raw const input, i32::try_from(size_of::<INPUT>()).unwrap_or(0)) };
-    if sent == 1 { Ok(()) } else { Err(Error::Platform("SendInput accepted no events".into())) }
+    if sent == 1 {
+        return Ok(());
+    }
+    // A refused injection after a lock/unlock cycle is a thread still attached to a
+    // desktop that no longer receives input. Windows swaps the interactive desktop for
+    // the secure one at the sign-in screen; a process that lived through that swap
+    // keeps its old attachment, and every SendInput after unlock returns zero —
+    // "keyboard share stopped after the laptop slept and woke" was exactly this.
+    // Re-attach to whatever desktop currently receives input and try once more.
+    if reattach_to_input_desktop() {
+        let retried = unsafe {
+            SendInput(1, &raw const input, i32::try_from(size_of::<INPUT>()).unwrap_or(0))
+        };
+        if retried == 1 {
+            return Ok(());
+        }
+    }
+    Err(Error::Platform("SendInput accepted no events".into()))
+}
+
+/// Attach this thread to the desktop that currently receives input.
+///
+/// Per-thread, cheap, and idempotent. The handle deliberately stays open on success:
+/// the assignment is only valid while it is.
+fn reattach_to_input_desktop() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenInputDesktop(flags: u32, inherit: i32, access: u32) -> *mut core::ffi::c_void;
+        fn SetThreadDesktop(desktop: *mut core::ffi::c_void) -> i32;
+        fn CloseDesktop(desktop: *mut core::ffi::c_void) -> i32;
+    }
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    // SAFETY: documented calls; the handle is closed only when the attach failed and
+    // it is therefore not in use.
+    unsafe {
+        let desktop = OpenInputDesktop(0, 0, GENERIC_ALL);
+        if desktop.is_null() {
+            return false;
+        }
+        if SetThreadDesktop(desktop) != 0 {
+            true
+        } else {
+            CloseDesktop(desktop);
+            false
+        }
+    }
 }
 
 fn mouse_input(flags: u32, data: i32) -> INPUT {
