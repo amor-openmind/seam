@@ -2534,6 +2534,32 @@ fn recover_this_machine() {
     seam_input::windows::reveal_cursor();
     seam_input::windows::release_stuck_modifiers();
     repair_start_at_login_path();
+    sweep_fossil_binaries();
+}
+
+/// Delete versioned seam binaries left beside this one by an early installer.
+///
+/// The install folder held `seam-0.6.2.exe` fossils from the era before the installer
+/// settled on one filename. They are complete, runnable, ancient seams — and one of
+/// them, woken by a stray double-click, held the fleet's port for an afternoon while
+/// speaking a protocol two generations old. A fossil that does not exist cannot be
+/// resurrected. Best effort: a fossil that is RUNNING holds a lock and stays; the
+/// takeover's wildcard kill handles that one.
+#[cfg(target_os = "windows")]
+fn sweep_fossil_binaries() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_lowercase();
+        if name.starts_with("seam-")
+            && name.ends_with(".exe")
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            tracing::info!(%name, "removed a versioned seam binary left by an older installer");
+        }
+    }
 }
 
 /// Point start-at-login at the seam that is actually running.
@@ -2614,8 +2640,11 @@ fn bind_or_show_running(
             #[cfg(target_os = "windows")]
             {
                 let own = std::process::id().to_string();
+                // Wildcard, not the exact name: an early installer saved VERSIONED
+                // binaries, and a resurrected seam-0.6.2.exe held the port for an
+                // afternoon while a kill aimed at "seam.exe" sailed right past it.
                 let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/IM", "seam.exe", "/FI", &format!("PID ne {own}")])
+                    .args(["/F", "/IM", "seam*", "/FI", &format!("PID ne {own}")])
                     .output();
                 for _ in 0..20 {
                     std::thread::sleep(Duration::from_millis(100));
