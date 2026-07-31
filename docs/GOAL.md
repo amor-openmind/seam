@@ -893,3 +893,20 @@ Three preconditions, none of which seam controls:
 is: attempt the wake, and if the machine does not answer within a few seconds, say plainly
 that it is asleep and could not be woken — rather than a pointer that silently vanishes
 into a machine that is not there.
+
+## 15. The sign-in screen — the one desktop seam cannot reach yet
+
+After sleep, a Windows machine wakes to the Secure Desktop (Winlogon), and Windows
+refuses injected input there from any user-session process, elevated or not — the same
+boundary that protects UAC prompts. Physical keyboard only. This is OS design, and the
+v0.9.9 desktop-reattach deliberately fixes only the moment AFTER unlock.
+
+Reaching the sign-in screen itself is possible and well-trodden: Synergy and Barrier run
+a Windows service as SYSTEM whose helper process follows desktop switches (console
+session tracking + `SetThreadDesktop` onto Winlogon) and injects from the one privilege
+level Windows permits there. For seam that means: a service mode (install/uninstall via
+the existing elevated path), a SYSTEM-launched helper in the active console session, a
+desktop-switch watcher, and input forwarding handed to whichever process currently owns
+the reachable desktop. Substantial, self-contained, and the last input surface seam does
+not cover. Until then: the machine's own keyboard at sign-in, or Windows' own
+"require sign-in: Never" setting for machines where that tradeoff is acceptable.
