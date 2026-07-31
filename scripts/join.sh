@@ -33,6 +33,20 @@ HOME_DIR="${SEAM_HOME:-$HOME/.seam}"
 BIN="$HOME_DIR/seam"
 mkdir -p "$HOME_DIR"
 
+# Quit whatever seam is already running, FIRST — before any download or file move.
+# Overwriting a running signed binary on macOS can kill the process mid-page-in, and
+# two seams racing a port is a mess this script should never create. The quit is a
+# loopback request; a copy too old to answer is handled by the new seam's own takeover.
+echo "seam: stopping any running seam…"
+NOTE="$HOME/Library/Application Support/dev.seam.seam/ui-port"
+if [ -f "$NOTE" ]; then
+  UIPORT="$(head -1 "$NOTE" 2>/dev/null || true)"
+  if [ -n "$UIPORT" ]; then
+    curl -s -m 3 -X POST "http://127.0.0.1:$UIPORT/action/quit" >/dev/null 2>&1 || true
+    sleep 1
+  fi
+fi
+
 # Fetch every time: a few megabytes over a LAN is cheaper than reasoning about whether the
 # copy on disk is still the newest, and re-running the command is how a person updates.
 echo "seam: fetching the latest release…"
