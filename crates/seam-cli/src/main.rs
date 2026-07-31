@@ -2551,11 +2551,12 @@ fn sweep_fossil_binaries() {
     let Some(dir) = exe.parent() else { return };
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
+        let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy().to_lowercase();
         if name.starts_with("seam-")
-            && name.ends_with(".exe")
-            && std::fs::remove_file(entry.path()).is_ok()
+            && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+            && std::fs::remove_file(&path).is_ok()
         {
             tracing::info!(%name, "removed a versioned seam binary left by an older installer");
         }
