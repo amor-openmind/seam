@@ -792,16 +792,16 @@ async fn daemon(
     #[cfg(target_os = "windows")]
     recover_this_machine();
 
-    start_ui_server(
-        dir.to_path_buf(),
-        name.clone(),
-        identity.peer_id(),
-        port,
-        Arc::clone(&links),
-        Arc::clone(&store),
-        Some(Arc::clone(&endpoint)),
-        open_ui_when_ready,
-    );
+    start_ui_server(UiServerSetup {
+        dir: dir.to_path_buf(),
+        name: name.clone(),
+        id: identity.peer_id(),
+        seam_port: port,
+        links: Arc::clone(&links),
+        store: Arc::clone(&store),
+        endpoint: Some(Arc::clone(&endpoint)),
+        open_when_ready: open_ui_when_ready,
+    });
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry), dir.to_path_buf());
 
     start_clipboard_sync(Arc::clone(&links), Arc::clone(&clipboard));
@@ -1648,16 +1648,23 @@ fn ui_asset_response(request: &str, path: &str, port: u16) -> Option<Vec<u8>> {
 /// Loopback only, read-only, no external requests possible. Hand-rolled GET handling
 /// rather than a web framework: nine static routes and one JSON endpoint do not justify
 /// a dependency tree on the input path's binary.
-fn start_ui_server(
+/// Everything the fleet-page server needs, grouped because it travels together.
+struct UiServerSetup {
     dir: std::path::PathBuf,
     name: String,
     id: seam_proto::PeerId,
     seam_port: u16,
     links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
     store: SharedTrust,
+    /// Absent in the UI-only test server; pairing actions answer 503 without it.
     endpoint: Option<Arc<seam_transport::Endpoint>>,
+    /// Open the browser the moment the page binds — the honest alternative to a timer.
     open_when_ready: bool,
-) {
+}
+
+fn start_ui_server(setup: UiServerSetup) {
+    let UiServerSetup { dir, name, id, seam_port, links, store, endpoint, open_when_ready } =
+        setup;
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
             Ok(listener) => listener,
@@ -1893,16 +1900,16 @@ mod ui_origin {
     async fn fleet_server_serves_the_embedded_logo() {
         let dir = std::env::temp_dir().join(format!("seam-logo-fleet-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("test state directory");
-        start_ui_server(
-            dir.clone(),
-            "test".to_owned(),
-            seam_proto::PeerId([1; 16]),
-            24810,
-            Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            Arc::new(std::sync::RwLock::new(seam_transport::TrustStore::new())),
-            None,
-            false,
-        );
+        start_ui_server(UiServerSetup {
+            dir: dir.clone(),
+            name: "test".to_owned(),
+            id: seam_proto::PeerId([1; 16]),
+            seam_port: 24810,
+            links: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            store: Arc::new(std::sync::RwLock::new(seam_transport::TrustStore::new())),
+            endpoint: None,
+            open_when_ready: false,
+        });
         let port = wait_for_ui_port(&dir).await;
         let response = fetch(port, UI_ASSETS[0].0).await;
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n"));
