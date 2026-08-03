@@ -1266,6 +1266,24 @@ unsafe extern "C" {
     fn CFDataCreate(alloc: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
     fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
     fn CFDataGetLength(data: *const c_void) -> isize;
+    fn CFURLCreateWithBytes(
+        alloc: *const c_void,
+        bytes: *const u8,
+        length: isize,
+        encoding: u32,
+        base: *const c_void,
+    ) -> *const c_void;
+    fn CFURLCreateFilePathURL(
+        alloc: *const c_void,
+        url: *const c_void,
+        error: *mut *const c_void,
+    ) -> *const c_void;
+    fn CFURLGetFileSystemRepresentation(
+        url: *const c_void,
+        resolve_against_base: u8,
+        buffer: *mut u8,
+        buffer_len: isize,
+    ) -> u8;
 }
 
 /// The name of the general clipboard — the value of Apple's `kPasteboardClipboard`,
@@ -1298,6 +1316,52 @@ fn file_url_flavor() -> *const c_void {
             ) as usize
         }
     }) as *const c_void
+}
+
+/// Resolve a file-REFERENCE URL (`file:///.file/id=…`) to the real path it points at.
+///
+/// Some applications put the inode-style reference form on the pasteboard instead of a
+/// path URL — a copied zip arrived as `/.file/id=6571367.412610877`, which was then
+/// read literally: "not sharing the copied files: … is unreadable". CoreFoundation
+/// owns the id-to-path mapping; `CFURLCreateFilePathURL` is the documented inverse.
+fn resolve_reference_url(url_bytes: &[u8]) -> Option<std::path::PathBuf> {
+    // SAFETY: documented CoreFoundation calls; every created object is released on
+    // every path, and the byte buffer outlives the call that reads it.
+    unsafe {
+        let url = CFURLCreateWithBytes(
+            core::ptr::null(),
+            url_bytes.as_ptr(),
+            isize::try_from(url_bytes.len()).ok()?,
+            K_CF_STRING_ENCODING_UTF8,
+            core::ptr::null(),
+        );
+        if url.is_null() {
+            return None;
+        }
+        let mut error: *const c_void = core::ptr::null();
+        let resolved = CFURLCreateFilePathURL(core::ptr::null(), url, &raw mut error);
+        CFRelease(url);
+        if resolved.is_null() {
+            if !error.is_null() {
+                CFRelease(error);
+            }
+            return None;
+        }
+        let mut buffer = [0u8; 4096];
+        let ok = CFURLGetFileSystemRepresentation(
+            resolved,
+            1,
+            buffer.as_mut_ptr(),
+            isize::try_from(buffer.len()).unwrap_or(0),
+        );
+        CFRelease(resolved);
+        if ok == 0 {
+            return None;
+        }
+        let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+        let text = core::str::from_utf8(&buffer[..end]).ok()?;
+        Some(std::path::PathBuf::from(text))
+    }
 }
 
 /// Percent-decode the path of a `file://` URL. Returns `None` for anything else.
@@ -1373,6 +1437,13 @@ pub fn read_file_list() -> Result<Option<Vec<std::path::PathBuf>>, Error> {
             let len = usize::try_from(CFDataGetLength(data)).unwrap_or(0);
             let bytes = core::slice::from_raw_parts(CFDataGetBytePtr(data), len);
             if let Some(path) = path_from_file_url(bytes) {
+                // A reference-form URL decodes to `/.file/id=…`, which is not a place
+                // on disk — ask CoreFoundation for the path it actually means.
+                let path = if path.starts_with("/.file") {
+                    resolve_reference_url(bytes).unwrap_or(path)
+                } else {
+                    path
+                };
                 paths.push(path);
             }
             CFRelease(data);
@@ -1424,6 +1495,65 @@ pub fn write_file_list(paths: &[std::path::PathBuf]) -> Result<(), Error> {
         }
         CFRelease(pasteboard.cast_const());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reference_urls {
+    //! The `/.file/id=…` form, proven against the real filesystem: some applications
+    //! put the inode-style reference URL on the pasteboard, and a copied zip arriving
+    //! that way was read literally and refused as unreadable.
+
+    use super::*;
+
+    #[test]
+    fn a_reference_url_resolves_to_the_real_path() {
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFURLCreateFileReferenceURL(
+                alloc: *const c_void,
+                url: *const c_void,
+                error: *mut *const c_void,
+            ) -> *const c_void;
+            fn CFURLGetBytes(url: *const c_void, buffer: *mut u8, buffer_len: isize) -> isize;
+        }
+        let dir = std::env::temp_dir().join(format!("seam-refurl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let file = dir.join("archive.zip");
+        std::fs::write(&file, b"not really a zip").expect("test file");
+
+        // Build the reference form the same way an application would.
+        let url_text = file_url_from_path(&file);
+        // SAFETY: documented calls; every created object is released below.
+        let reference_bytes = unsafe {
+            let path_url = CFURLCreateWithBytes(
+                core::ptr::null(),
+                url_text.as_ptr(),
+                isize::try_from(url_text.len()).expect("short url"),
+                K_CF_STRING_ENCODING_UTF8,
+                core::ptr::null(),
+            );
+            assert!(!path_url.is_null(), "the path URL must parse");
+            let mut error: *const c_void = core::ptr::null();
+            let reference = CFURLCreateFileReferenceURL(core::ptr::null(), path_url, &raw mut error);
+            CFRelease(path_url);
+            assert!(!reference.is_null(), "the file must yield a reference URL");
+            let mut buffer = [0u8; 1024];
+            let written = CFURLGetBytes(reference, buffer.as_mut_ptr(), 1024);
+            CFRelease(reference);
+            buffer[..usize::try_from(written).expect("short url")].to_vec()
+        };
+        let as_text = String::from_utf8_lossy(&reference_bytes).to_string();
+        assert!(as_text.contains("/.file/id="), "precondition: got {as_text}");
+
+        let resolved = resolve_reference_url(&reference_bytes)
+            .expect("the reference URL must resolve");
+        assert_eq!(
+            std::fs::canonicalize(&resolved).expect("resolved path exists"),
+            std::fs::canonicalize(&file).expect("original path exists"),
+            "the reference must point back at the file it was made from"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 
