@@ -2333,13 +2333,19 @@ async fn ui_state_json(
         let (edge, anchor, role, enabled) = peer_facts(dir, peer);
         let _ = write!(
             peers,
-            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}","anchor":"{anchor}","role":"{role}","enabled":{enabled},"version":"{}"}}"#,
+            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}","anchor":"{anchor}","role":"{role}","enabled":{enabled},"version":"{}","rtt_ms":{}}}"#,
             link.remote_address(),
             UI_VERSIONS
                 .lock()
                 .ok()
                 .and_then(|v| v.iter().find(|(p, _)| *p == peer).map(|(_, ver)| ver.clone()))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            // The QUIC smoothed round-trip: a continuous, in-band measurement of the
+            // exact path input rides. "Everything pauses for seconds then works" is
+            // either this number spiking (the network breathing) or this number flat
+            // while the far machine chokes — one glance separates the two, where ping
+            // cannot (ICMP is firewalled off on the Windows machines).
+            link.rtt().as_millis()
         );
     }
 
