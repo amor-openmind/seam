@@ -1787,8 +1787,8 @@ fn request_is_local(request: &str, port: u16) -> bool {
 #[cfg(test)]
 mod ui_origin {
     use super::{
-        UI_ASSETS, UI_PAGES, request_is_local, serve_activation_only, start_ui_server,
-        ui_asset_response,
+        UI_ASSETS, UI_PAGES, UiServerSetup, request_is_local, serve_activation_only,
+        start_ui_server, ui_asset_response,
     };
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
