@@ -292,16 +292,7 @@ async fn run_daemon(
             }
             #[cfg(not(target_os = "windows"))]
             let _ = no_elevate;
-            if open_ui_when_ready {
-                let dir = dir.to_path_buf();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
-                    if let Err(e) = open_ui(&dir) {
-                        tracing::warn!("could not open the fleet page: {e}");
-                    }
-                });
-            }
-            daemon(dir, identity, port, connect).await
+            daemon(dir, identity, port, connect, open_ui_when_ready).await
     }
 }
 
@@ -706,6 +697,7 @@ async fn daemon(
     identity: Arc<Identity>,
     port: u16,
     connect: Vec<String>,
+    open_ui_when_ready: bool,
 ) -> Result<()> {
     // Clear any input state a previous run left behind, before doing anything else.
     //
@@ -808,6 +800,7 @@ async fn daemon(
         Arc::clone(&links),
         Arc::clone(&store),
         Some(Arc::clone(&endpoint)),
+        open_ui_when_ready,
     );
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry), dir.to_path_buf());
 
@@ -1663,6 +1656,7 @@ fn start_ui_server(
     links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
     store: SharedTrust,
     endpoint: Option<Arc<seam_transport::Endpoint>>,
+    open_when_ready: bool,
 ) {
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
@@ -1684,6 +1678,16 @@ fn start_ui_server(
         }
         UI_PORT_SELF.store(port, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(port, "fleet page ready — 'seam ui' opens it");
+        if open_when_ready {
+            // Opened HERE, on readiness, not on a timer. A tab opened 1.5 seconds
+            // after startup raced everything — sometimes early enough to show a page
+            // nobody was serving yet, and always adding a second of "open but dead"
+            // to the feel of a fresh install. The page exists the moment this line
+            // runs, so this is the moment the browser gets it.
+            if let Err(e) = open_ui(&dir) {
+                tracing::warn!("could not open the fleet page: {e}");
+            }
+        }
 
         let ui_port_note = dir.join("ui-port");
         loop {
@@ -1897,6 +1901,7 @@ mod ui_origin {
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             Arc::new(std::sync::RwLock::new(seam_transport::TrustStore::new())),
             None,
+            false,
         );
         let port = wait_for_ui_port(&dir).await;
         let response = fetch(port, UI_ASSETS[0].0).await;
@@ -2948,7 +2953,10 @@ async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result
 fn elevated_child_started(dir: &std::path::Path) -> bool {
     let note = dir.join("ui-port");
     let before = std::fs::read_to_string(&note).unwrap_or_default();
-    for _ in 0..40 {
+    // A minute, not ten seconds: the wait covers the elevated child's whole startup on
+    // a machine that may be busy installing updates. The parent idles unbound while it
+    // waits — the only cost of patience is patience.
+    for _ in 0..240 {
         std::thread::sleep(Duration::from_millis(250));
         let now = std::fs::read_to_string(&note).unwrap_or_default();
         if !now.is_empty() && now != before {
