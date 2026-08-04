@@ -1023,7 +1023,10 @@ async fn apply_clipboard_image(
                 rgba,
             };
             drop(state);
-            for other in links.lock().await.iter() {
+            for other in {
+                let guard = links.lock().await;
+                guard.iter().map(Arc::clone).collect::<Vec<_>>()
+            } {
                 if other.peer_id() == peer {
                     continue;
                 }
@@ -1378,7 +1381,10 @@ async fn apply_clipboard_files(
                 entries,
             };
             drop(state);
-            for other in links.lock().await.iter() {
+            for other in {
+                let guard = links.lock().await;
+                guard.iter().map(Arc::clone).collect::<Vec<_>>()
+            } {
                 if other.peer_id() == peer {
                     continue;
                 }
@@ -3339,12 +3345,22 @@ async fn share_with_all(
     frame: &seam_proto::Frame,
     what: &str,
 ) {
-    let peers = links.lock().await;
+    // Clone out of the lock BEFORE sending. This loop once held the fleet's link list
+    // across full multi-megabyte reliable sends to every peer in sequence — and the
+    // input-forwarding loop needs this same lock for every event. Every screenshot
+    // share froze all forwarded input for the duration of both transfers: "everything
+    // paused in the clients for seconds and then works", many times a day, while the
+    // network's round-trip stayed in single digits. The lock is for the LIST, never
+    // for the sending.
+    let peers: Vec<Arc<Link>> = {
+        let guard = links.lock().await;
+        guard.iter().map(Arc::clone).collect()
+    };
     if peers.is_empty() {
         return;
     }
     tracing::info!(peers = peers.len(), kind = what, "clipboard changed; sharing");
-    for link in peers.iter() {
+    for link in &peers {
         if let Err(e) = link.send_reliable(frame).await {
             tracing::warn!(peer = %link.peer_id(), kind = what, "could not share the clipboard: {e}");
         }
@@ -4217,7 +4233,10 @@ async fn receive_reliable(
                             text,
                         };
                         drop(state);
-                        for other in links.lock().await.iter() {
+                        for other in {
+                let guard = links.lock().await;
+                guard.iter().map(Arc::clone).collect::<Vec<_>>()
+            } {
                             if other.peer_id() == peer {
                                 continue;
                             }
