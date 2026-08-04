@@ -4343,6 +4343,8 @@ fn start_pointer_forwarding(
             // Rate limit for the drift warning below, so a moving cursor does not turn
             // the log into noise at event rate.
             let mut last_drift_warn: Option<std::time::Instant> = None;
+            // When the last local keystroke landed, because typing pins the desk.
+            let mut last_keystroke: Option<std::time::Instant> = None;
 
             // The loop wakes on input — and once a second regardless. Rescue used to be
             // event-driven only: a laptop that died HOLDING the pointer left the person
@@ -4366,6 +4368,21 @@ fn start_pointer_forwarding(
                     }
                     seq = seq.wrapping_add(1);
                 }
+
+                // Typing pins the desk. A keystroke burst means "I am here": while one
+                // is in flight, a mouse grazed by a palm must not carry the pointer —
+                // and the keyboard with it — onto another machine. Words vanished from
+                // a prompt box mid-sentence exactly that way: the edge was crossed
+                // between two words, and the next one was typed into the neighbour.
+                // 400 ms outlasts a fast typist's inter-key gap and expires the moment
+                // a person actually stops to move the mouse somewhere.
+                if let Some(Observed::Key { down: true, .. }) = event {
+                    last_keystroke = Some(std::time::Instant::now());
+                }
+                graph.set_crossing_hold(
+                    last_keystroke
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(400)),
+                );
 
                 sync_peers(&links, &mut graph, &mut known, &geometry, &dir).await;
 

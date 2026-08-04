@@ -109,6 +109,9 @@ pub(crate) struct Graph {
     settling: u8,
     /// Motion events left before another crossing is allowed.
     lockout: u8,
+    /// While true, every edge behaves as a dead end — set while the person is typing,
+    /// because a keystroke burst means "I am here", whatever the mouse grazes.
+    crossing_hold: bool,
 }
 
 impl Graph {
@@ -126,6 +129,7 @@ impl Graph {
             y: height / 2,
             settling: 0,
             lockout: 0,
+            crossing_hold: false,
         }
     }
 
@@ -255,11 +259,34 @@ impl Graph {
         self.lockout = CROSSING_LOCKOUT;
     }
 
+    /// Hold every edge shut, without forgetting the desk.
+    ///
+    /// Typing pins the machine: a person mid-keystroke-burst is never trying to change
+    /// screens, but a palm grazing the mouse can push the pointer across an edge — and
+    /// then the next word is typed into another machine while this one eats it. Words
+    /// vanished from a prompt box exactly this way. While held, the pointer clamps at
+    /// edges as if nothing were there; the moment typing pauses, the desk reopens.
+    pub(crate) fn set_crossing_hold(&mut self, hold: bool) {
+        self.crossing_hold = hold;
+    }
+
     /// Apply movement, crossing edges as needed.
     pub(crate) fn apply_motion(&mut self, dx: i32, dy: i32) -> Update {
         let before = self.current;
         self.x = self.x.saturating_add(dx);
         self.y = self.y.saturating_add(dy);
+
+        if self.crossing_hold {
+            let node = &self.nodes[self.current];
+            self.x = self.x.clamp(0, node.width - 1);
+            self.y = self.y.clamp(0, node.height - 1);
+            return Update {
+                focus: self.focus(),
+                changed: false,
+                x: self.x,
+                y: self.y,
+            };
+        }
 
         // A crossing that just happened locks out the next few, and this is the whole
         // reason focus stopped oscillating.
@@ -572,6 +599,24 @@ mod tests {
         assert!(update.changed);
         assert_eq!(update.focus, Focus::Remote(laptop()));
         assert!(update.y < 100, "should enter near the top, got {}", update.y);
+    }
+
+    #[test]
+    fn typing_holds_every_edge_shut_until_it_stops() {
+        // Words vanished from a prompt box mid-sentence: a palm grazed the mouse, the
+        // pointer crossed between two words, and the next word was typed into the
+        // neighbouring machine. A keystroke burst means "I am here".
+        let mut g = fleet();
+        g.set_crossing_hold(true);
+        let update = g.apply_motion(-5000, 0);
+        assert_eq!(update.focus, Focus::Local, "no edge crossing mid-typing");
+        assert!(!update.changed);
+        g.set_crossing_hold(false);
+        assert_eq!(
+            g.apply_motion(-5000, 0).focus,
+            Focus::Remote(imac()),
+            "the desk reopens the moment typing stops"
+        );
     }
 
     #[test]
