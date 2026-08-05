@@ -274,10 +274,29 @@ impl Link {
     /// per frame means a stalled or failed frame cannot head-of-line-block the next —
     /// which is the whole reason for not using TCP.
     pub async fn send_reliable(&self, frame: &Frame) -> Result<(), Error> {
+        self.send_with_priority(frame, 0).await
+    }
+
+    /// Send a frame as **bulk**: reliable, but scheduled behind everything else.
+    ///
+    /// On a healthy LAN this is indistinguishable from `send_reliable`. On a thin or
+    /// degraded path it is the difference between a usable desk and a glitching one:
+    /// QUIC schedules scarce bandwidth by stream priority, so a megabyte screenshot
+    /// marked bulk trickles while keystrokes and clicks — tiny, priority zero — go
+    /// first. A client on a bad network is a normal machine, not a broken one, and
+    /// input must feel local there too.
+    pub async fn send_bulk(&self, frame: &Frame) -> Result<(), Error> {
+        self.send_with_priority(frame, -1).await
+    }
+
+    async fn send_with_priority(&self, frame: &Frame, priority: i32) -> Result<(), Error> {
         let mut buf = Vec::with_capacity(64);
         frame.encode_framed(&mut buf)?;
         let mut stream =
             self.connection.open_uni().await.map_err(|e| Error::Send(e.to_string()))?;
+        if priority != 0 {
+            let _ = stream.set_priority(priority);
+        }
         stream.write_all(&buf).await.map_err(|e| Error::Send(e.to_string()))?;
         stream.finish().map_err(|e| Error::Send(e.to_string()))?;
         Ok(())

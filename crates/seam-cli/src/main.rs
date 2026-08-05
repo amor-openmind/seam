@@ -1030,7 +1030,7 @@ async fn apply_clipboard_image(
                 if other.peer_id() == peer {
                     continue;
                 }
-                if let Err(e) = other.send_reliable(&relay).await {
+                if let Err(e) = other.send_bulk(&relay).await {
                     tracing::warn!(
                         peer = %other.peer_id(),
                         "could not relay the clipboard image: {e}"
@@ -1388,7 +1388,7 @@ async fn apply_clipboard_files(
                 if other.peer_id() == peer {
                     continue;
                 }
-                if let Err(e) = other.send_reliable(&relay).await {
+                if let Err(e) = other.send_bulk(&relay).await {
                     tracing::warn!(
                         peer = %other.peer_id(),
                         "could not relay the clipboard files: {e}"
@@ -3360,8 +3360,15 @@ async fn share_with_all(
         return;
     }
     tracing::info!(peers = peers.len(), kind = what, "clipboard changed; sharing");
+    // Images and files are bulk: on a thin path they must trickle behind input, not
+    // fight it. Text is a few bytes and rides normally.
+    let bulk = matches!(
+        frame,
+        seam_proto::Frame::ClipboardImage { .. } | seam_proto::Frame::ClipboardFiles { .. }
+    );
     for link in &peers {
-        if let Err(e) = link.send_reliable(frame).await {
+        let sent = if bulk { link.send_bulk(frame).await } else { link.send_reliable(frame).await };
+        if let Err(e) = sent {
             tracing::warn!(peer = %link.peer_id(), kind = what, "could not share the clipboard: {e}");
         }
     }
