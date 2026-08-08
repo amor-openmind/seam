@@ -13,6 +13,7 @@ name = "seam"
 path = "src/main.rs"
 
 [dependencies]
+flate2 = "1"
 seam-proto = { path = "../seam-proto" }
 seam-transport = { path = "../seam-transport" }
 
@@ -26,7 +27,7 @@ anyhow = "1"
 # every target with no system dependencies.
 ring = "0.17"
 hex = "0.4"
-seam-input = { version = "0.7.2", path = "../seam-input" }
+seam-input = { version = "0.9.17", path = "../seam-input" }
 
 [lints]
 workspace = true

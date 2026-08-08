@@ -471,11 +471,21 @@ impl Frame {
                 let width = r.u32()?;
                 let height = r.u32()?;
                 let len = r.u32()? as usize;
-                // Reject before allocating, and require the byte count to match the
-                // dimensions exactly — an image is not a bag of bytes.
-                let expected =
-                    u64::from(width).checked_mul(u64::from(height)).and_then(|p| p.checked_mul(4));
-                if len > MAX_IMAGE_BYTES || expected != Some(len as u64) {
+                // Reject before allocating. Since protocol v2 the field carries
+                // DEFLATE, so the byte count can no longer be required to equal
+                // `width * height * 4` — that exact-equality check, written for raw
+                // pixels and never updated, rejected every compressed image and took
+                // the whole reliable stream down with it: clicks, keys and clipboard
+                // dead while the link looked healthy. The dimensions still bound the
+                // field: a compressed image larger than its raw self (plus deflate's
+                // worst-case overhead) is malformed, and the receiver's inflate step
+                // still verifies the exact pixel count end to end.
+                let raw = u64::from(width).checked_mul(u64::from(height)).and_then(|p| p.checked_mul(4));
+                let Some(raw) = raw else {
+                    return Err(Error::TooLong);
+                };
+                let ceiling = raw.saturating_add(raw / 8).saturating_add(1024);
+                if len > MAX_IMAGE_BYTES || raw > MAX_IMAGE_BYTES as u64 || len as u64 > ceiling {
                     return Err(Error::TooLong);
                 }
                 Self::ClipboardImage { seq, generation, width, height, rgba: r.bytes(len)?.to_vec() }
@@ -626,6 +636,36 @@ mod realistic_sizes {
             Frame::decode_framed(&buf).expect("and decode").expect("complete");
         assert_eq!(used, buf.len());
         assert_eq!(decoded, frame);
+    }
+
+    /// Since protocol v2 the image field carries deflate, so its length is smaller
+    /// than the dimensions imply — usually much smaller. The decoder once required
+    /// exact equality with `width * height * 4`; written for raw pixels and never
+    /// updated, it rejected every compressed screenshot and killed the reliable
+    /// stream carrying it. This is that field failure, pinned.
+    #[test]
+    fn a_compressed_image_smaller_than_its_dimensions_survives_framing() {
+        let (w, h) = (2560u32, 1440u32);
+        let rgba = vec![0x11u8; 2 * 1024 * 1024]; // ~2 MB of "deflate", 14.7 MB raw
+        let frame = Frame::ClipboardImage { seq: 3, generation: 3, width: w, height: h, rgba };
+        let mut buf = Vec::new();
+        frame.encode_framed(&mut buf).expect("a compressed image must encode");
+        let (decoded, used) =
+            Frame::decode_framed(&buf).expect("and decode").expect("complete");
+        assert_eq!(used, buf.len());
+        assert_eq!(decoded, frame);
+    }
+
+    /// The dimensions still bound the field: a payload meaningfully larger than the
+    /// raw pixels it claims to compress is malformed, not merely big.
+    #[test]
+    fn an_image_larger_than_its_own_raw_size_is_refused() {
+        let (w, h) = (16u32, 16u32); // raw = 1 KB
+        let rgba = vec![0u8; 64 * 1024]; // 64 KB claiming to be its compression
+        let frame = Frame::ClipboardImage { seq: 4, generation: 4, width: w, height: h, rgba };
+        let mut buf = Vec::new();
+        frame.encode_framed(&mut buf).expect("encoding is the sender's business");
+        assert!(Frame::decode_framed(&buf).is_err(), "the receiver must refuse it");
     }
 
     /// A files payload at the sender-side cap must survive framing too.

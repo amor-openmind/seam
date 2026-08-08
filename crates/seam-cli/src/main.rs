@@ -265,7 +265,24 @@ async fn run_daemon(
                     args.push("--no-ui".into());
                 }
                 match seam_input::windows::relaunch_elevated(&args) {
-                    Ok(true) => return Ok(()),
+                    // Do NOT exit on the strength of a successful launch call. A
+                    // successful ShellExecute means Windows accepted the request, not
+                    // that a daemon is running: the child can die on a bad argument, a
+                    // missing licence or a refused prompt, and the parent leaving anyway
+                    // means the machine keeps whatever was running before. That is
+                    // exactly how an updated binary reported the OLD version - the new
+                    // one asked for elevation, vanished, and the previous daemon carried
+                    // on serving its page.
+                    Ok(true) => {
+                        if elevated_child_started(dir) {
+                            return Ok(());
+                        }
+                        tracing::warn!(
+                            "the elevated copy did not start; carrying on without \
+                             administrator rights. Input will freeze whenever an elevated \
+                             window has focus."
+                        );
+                    }
                     Ok(false) => tracing::warn!(
                         "running without administrator rights: the pointer and keyboard \
                          will freeze whenever an elevated window has focus"
@@ -275,16 +292,7 @@ async fn run_daemon(
             }
             #[cfg(not(target_os = "windows"))]
             let _ = no_elevate;
-            if open_ui_when_ready {
-                let dir = dir.to_path_buf();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
-                    if let Err(e) = open_ui(&dir) {
-                        tracing::warn!("could not open the fleet page: {e}");
-                    }
-                });
-            }
-            daemon(dir, identity, port, connect).await
+            daemon(dir, identity, port, connect, open_ui_when_ready).await
     }
 }
 
@@ -689,6 +697,7 @@ async fn daemon(
     identity: Arc<Identity>,
     port: u16,
     connect: Vec<String>,
+    open_ui_when_ready: bool,
 ) -> Result<()> {
     // Clear any input state a previous run left behind, before doing anything else.
     //
@@ -700,7 +709,7 @@ async fn daemon(
     // only reliable defence, because the process that broke it is already gone.
     seam_input::release_input();
 
-    let store = Arc::new(store::load_peers(dir));
+    let store: SharedTrust = Arc::new(std::sync::RwLock::new(store::load_peers(dir)));
     let endpoint =
         match bind_or_show_running(dir, &identity, port)? {
             std::ops::ControlFlow::Continue(endpoint) => endpoint,
@@ -712,16 +721,20 @@ async fn daemon(
     let mut discovery = Discovery::new()?;
     discovery.advertise(&name, identity.peer_id(), identity.fingerprint(), bound.port())?;
 
+    let paired_count = store.read().map_or(0, |s| s.len());
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         %name,
         id = %identity.peer_id(),
         %bound,
-        peers = store.len(),
+        peers = paired_count,
         "seam is running"
     );
-    if store.is_empty() {
-        tracing::warn!("no paired machines yet — run `seam pair` on this and another machine");
+    if paired_count == 0 {
+        tracing::info!(
+            "no paired machines yet — when another seam appears on this network, both \
+             screens will show the same six digits; confirm them to pair"
+        );
     }
 
     // Real screen size of each peer, learned from its `Hello`. Until a peer reports its
@@ -754,6 +767,7 @@ async fn daemon(
         // strands every client either.
         spawn_reconnector(
             target,
+            port,
             Arc::clone(&endpoint),
             Arc::clone(&store),
             Arc::clone(&links),
@@ -775,57 +789,35 @@ async fn daemon(
     start_update_watch();
     start_auto_dial(&discovery, &store, &links, &geometry, &clipboard, &endpoint);
 
-    // Crash recovery: a previous seam that died while the cursor was concealed leaves
-    // this machine with an invisible cursor. Restoring is free when nothing was hidden.
     #[cfg(target_os = "windows")]
-    seam_input::windows::reveal_cursor();
+    recover_this_machine();
 
-    start_ui_server(dir.to_path_buf(), name.clone(), identity.peer_id(), port, Arc::clone(&links));
+    start_ui_server(UiServerSetup {
+        dir: dir.to_path_buf(),
+        name: name.clone(),
+        id: identity.peer_id(),
+        seam_port: port,
+        links: Arc::clone(&links),
+        store: Arc::clone(&store),
+        endpoint: Some(Arc::clone(&endpoint)),
+        open_when_ready: open_ui_when_ready,
+    });
     start_pointer_forwarding(Arc::clone(&links), Arc::clone(&geometry), dir.to_path_buf());
 
     start_clipboard_sync(Arc::clone(&links), Arc::clone(&clipboard));
     start_input_watchdog();
 
-    let accepting = {
-        let endpoint = Arc::clone(&endpoint);
-        let store = Arc::clone(&store);
-        let links = Arc::clone(&links);
-        let geometry = Arc::clone(&geometry);
-        let clipboard = Arc::clone(&clipboard);
-        tokio::spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
-                match incoming {
-                    Ok(link) => {
-                        let peer = link.peer_id();
-                        match link.authorize(&store) {
-                            Ok(()) => {
-                                tracing::info!(%peer, remote = %link.remote_address(), "peer connected");
-                                let link = Arc::new(link);
-                                register_link(&links, &link).await;
-                                announce_geometry(&link).await;
-                                tokio::spawn(receive_from(
-                                    link,
-                                    Arc::clone(&geometry),
-                                    Arc::clone(&clipboard),
-                                    Arc::clone(&links),
-                                ));
-                            }
-                            Err(e) => {
-                                // Never silent: a refused peer says why (goal O5).
-                                tracing::warn!(%peer, "refused: {e}");
-                                link.close("not paired");
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!("an inbound connection failed: {e}"),
-                }
-            }
-        })
-    };
+    let accepting = start_accepting(
+        Arc::clone(&endpoint),
+        Arc::clone(&store),
+        Arc::clone(&links),
+        Arc::clone(&geometry),
+        Arc::clone(&clipboard),
+    );
 
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("shutting down");
-    let _ = std::fs::remove_file(dir.join("ui-port"));
+    remove_ui_port_note_if_ours(dir);
     // Never exit while this machine is still withholding its own input.
     seam_input::release_input();
     tracing::info!("this machine's input restored");
@@ -867,6 +859,24 @@ async fn receive_from(
     tracing::info!(peer = %peer_id, "peer disconnected; removed from the fleet");
 }
 
+/// Close the link if the peer's `Hello` names another protocol. Enforced, not
+/// advisory: a v1 and a v2 machine spent a morning connected, exchanging payloads each
+/// interpreted differently — mixed protocols must fail at the handshake, loudly, not
+/// at the first garbled paste.
+fn hello_speaks_another_protocol(link: &Link, peer: seam_proto::PeerId, theirs: u16) -> bool {
+    if theirs == seam_proto::PROTOCOL_VERSION {
+        return false;
+    }
+    tracing::warn!(
+        %peer,
+        ours = seam_proto::PROTOCOL_VERSION,
+        theirs,
+        "peer speaks a different protocol; closing the link — update every machine to the same version"
+    );
+    link.close("protocol mismatch — update every machine");
+    true
+}
+
 /// The receive loop itself. Split so `receive_from` owns the cleanup for every exit.
 async fn receive_from_inner(
     link: Arc<Link>,
@@ -900,7 +910,9 @@ async fn receive_from_inner(
                 #[cfg(target_os = "windows")]
                 {
                     seam_input::windows::conceal_cursor();
-                    tracing::info!("pointer left this machine; cursor hidden");
+                    // Anything still held belongs to the session that just ended.
+                    seam_input::windows::release_everything();
+                    tracing::info!("pointer left this machine; cursor hidden, held keys released");
                 }
             }
             Ok(seam_proto::Frame::Motion(motion)) => {
@@ -940,9 +952,7 @@ async fn receive_from_inner(
                 }
             }
             Ok(seam_proto::Frame::Button(b)) => {
-                if let Err(e) = seam_input::inject_button(b.button.to_u8(), b.press.is_down()) {
-                    tracing::warn!(%peer, "could not press a mouse button: {e}");
-                }
+                apply_button(peer, b.button.to_u8(), b.press.is_down());
             }
             Ok(seam_proto::Frame::Scroll(sc)) => {
                 if let Err(e) = seam_input::inject_scroll(sc.dx, sc.dy) {
@@ -958,7 +968,12 @@ async fn receive_from_inner(
             Err(e) => {
                 tracing::info!(%peer, "link closed: {e}");
                 #[cfg(target_os = "windows")]
-                seam_input::windows::reveal_cursor();
+                {
+                    // The link may have died between a DOWN and its UP. Leaving the key
+                    // held is how "some keys stopped working" happens.
+                    seam_input::windows::release_everything();
+                    seam_input::windows::reveal_cursor();
+                }
                 return;
             }
         }
@@ -980,25 +995,42 @@ async fn apply_clipboard_image(
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
 ) {
     let mut state = clipboard.lock().await;
-    if generation <= state.applied_generation {
+    if state.already_applied(peer, generation) {
+        tracing::debug!(%peer, generation, "clipboard image ignored as an echo or older");
         return;
     }
-    match seam_input::clipboard::write_image(width, height, &rgba) {
+    // The wire carries deflate (protocol v2); the clipboard and the signature both
+    // want raw pixels. The relay below forwards the compressed original untouched —
+    // decompressing just to recompress would tax the hub for nothing.
+    let Some(raw) = inflate_pixels(&rgba, width, height) else {
+        tracing::warn!(%peer, width, height, "clipboard image discarded: pixels did not decompress to the claimed size");
+        return;
+    };
+    match seam_input::clipboard::write_image(width, height, &raw) {
         Ok(()) => {
             tracing::info!(%peer, width, height, bytes = rgba.len(), "clipboard image received");
             note_transfer("image received", format!("{width} x {height}"));
-            state.applied_generation = generation;
-            state.image_sig = Some(image_signature(width, height, &rgba));
+            state.record(peer, generation);
+            state.image_sig = Some(image_signature(width, height, &raw));
             state.last_seen = None;
+            // Reissued under this machine's counter — same reasoning as the text relay.
+            state.generation += 1;
+            let relay = seam_proto::Frame::ClipboardImage {
+                seq: 0,
+                generation: state.generation,
+                width,
+                height,
+                rgba,
+            };
             drop(state);
-
-            let relay =
-                seam_proto::Frame::ClipboardImage { seq: 0, generation, width, height, rgba };
-            for other in links.lock().await.iter() {
+            for other in {
+                let guard = links.lock().await;
+                guard.iter().map(Arc::clone).collect::<Vec<_>>()
+            } {
                 if other.peer_id() == peer {
                     continue;
                 }
-                if let Err(e) = other.send_reliable(&relay).await {
+                if let Err(e) = other.send_bulk(&relay).await {
                     tracing::warn!(
                         peer = %other.peer_id(),
                         "could not relay the clipboard image: {e}"
@@ -1024,6 +1056,109 @@ struct Serving<'a> {
     id: seam_proto::PeerId,
     links: &'a Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
     ui_port_note: &'a std::path::Path,
+    store: &'a SharedTrust,
+    /// Absent in the UI-only test server; pairing actions answer 503 without it.
+    endpoint: Option<&'a Arc<seam_transport::Endpoint>>,
+    dir: &'a std::path::Path,
+}
+
+/// The pairing page's slice of `/state`: who is visible, and the ceremony in flight.
+fn pairing_state_json() -> (String, String) {
+    use std::fmt::Write as _;
+    let mut discovered = String::new();
+    if let Ok(seen) = UI_DISCOVERED.lock() {
+        for machine in seen.iter() {
+            if !discovered.is_empty() {
+                discovered.push(',');
+            }
+            let _ = write!(
+                discovered,
+                r#"{{"id":"{}","addr":"{}","trusted":{}}}"#,
+                machine.short.replace('"', "'"),
+                machine.addr,
+                machine.trusted
+            );
+        }
+    }
+    let pairing = UI_PAIRING
+        .lock()
+        .ok()
+        .and_then(|slot| {
+            slot.as_ref().map(|pending| {
+                let state = match pending.outcome {
+                    None => "showing",
+                    Some(true) => "paired",
+                    Some(false) => "declined",
+                };
+                format!(
+                    r#"{{"code":"{}","with":"{}","state":"{state}"}}"#,
+                    pending.code,
+                    pending.with.replace('"', "'")
+                )
+            })
+        })
+        .unwrap_or_else(|| "null".to_owned());
+    (discovered, pairing)
+}
+
+/// Answer the pairing actions: confirm, decline, or dial a listed machine.
+fn pair_action(path: &str, ctx: &Serving<'_>) -> (&'static str, &'static str, String) {
+    if path == "/action/pair/confirm" {
+        // "They match": trust is written and saved before the link closes, so the peer's
+        // very next dial connects as a member of the fleet.
+        let ok = if let Ok(mut slot) = UI_PAIRING.lock()
+            && let Some(pending) = slot.as_mut()
+            && pending.outcome.is_none()
+        {
+            let saved = if let Ok(mut trust) = ctx.store.write() {
+                trust.trust(pending.link.peer_fingerprint(), pending.with.clone());
+                store::save_peers(ctx.dir, &trust).is_ok()
+            } else {
+                false
+            };
+            pending.link.close("paired");
+            pending.outcome = Some(true);
+            tracing::info!(peer = %pending.with, "paired — both screens agreed on the six digits");
+            saved
+        } else {
+            false
+        };
+        return ("200 OK", "application/json", format!(r#"{{"ok":{ok}}}"#));
+    }
+    if path == "/action/pair/decline" {
+        let ok = if let Ok(mut slot) = UI_PAIRING.lock()
+            && let Some(pending) = slot.as_mut()
+            && pending.outcome.is_none()
+        {
+            pending.link.close("pairing declined");
+            pending.outcome = Some(false);
+            tracing::warn!(peer = %pending.with, "pairing declined — the numbers did not match, nothing was trusted");
+            true
+        } else {
+            false
+        };
+        return ("200 OK", "application/json", format!(r#"{{"ok":{ok}}}"#));
+    }
+    // Pair… on a listed machine: dial it and put the six digits on both screens.
+    let Some(endpoint) = ctx.endpoint else {
+        return ("503 Service Unavailable", "application/json", r#"{"ok":false}"#.to_owned());
+    };
+    let short = path.trim_start_matches("/action/pair/").to_owned();
+    let target = UI_DISCOVERED
+        .lock()
+        .ok()
+        .and_then(|seen| seen.iter().find(|m| m.short.starts_with(&short)).map(|m| m.addr));
+    let ok = target.is_some();
+    if let Some(addr) = target {
+        let endpoint = Arc::clone(endpoint);
+        tokio::spawn(async move {
+            match endpoint.connect(addr).await {
+                Ok(link) => park_pairing(link),
+                Err(e) => tracing::warn!(%addr, "could not reach the machine to pair: {e}"),
+            }
+        });
+    }
+    ("200 OK", "application/json", format!(r#"{{"ok":{ok}}}"#))
 }
 
 async fn route(
@@ -1050,10 +1185,21 @@ async fn route(
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
             seam_input::release_input();
-            let _ = std::fs::remove_file(note);
+            // Only take the note down if it still names this process. A takeover
+            // quits the old seam politely, and by the time this timer fires the
+            // replacement has often already written its own port here — deleting it
+            // unconditionally left the survivor healthy but unfindable.
+            let noted = std::fs::read_to_string(&note)
+                .ok()
+                .and_then(|text| text.trim().parse::<u16>().ok());
+            if noted == Some(port) {
+                let _ = std::fs::remove_file(note);
+            }
             std::process::exit(0);
         });
         ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+    } else if method == "POST" && path.starts_with("/action/pair/") {
+        pair_action(path, ctx)
     } else if method == "POST" && path.starts_with("/action/startup/") {
         let on = path.ends_with("/on");
         let now = set_start_at_login(on);
@@ -1074,6 +1220,14 @@ async fn route(
         persist_settings();
         tracing::info!(kind, on, "clipboard sharing changed from the page");
         ("200 OK", "application/json", r#"{"ok":true}"#.to_owned())
+    } else if method == "POST" && path.starts_with("/action/layout/") {
+        let mut parts = path.trim_start_matches("/action/layout/").split('/');
+        let peer = parts.next().unwrap_or("");
+        let edge = parts.next().unwrap_or("");
+        let anchor = parts.next().unwrap_or("self");
+        let dir = ui_port_note.parent().unwrap_or(ui_port_note);
+        let ok = set_layout(dir, peer, edge, anchor);
+        ("200 OK", "application/json", format!(r#"{{"ok":{ok}}}"#))
     } else if method == "POST" && path.starts_with("/action/peer/") {
         let mut parts = path.trim_start_matches("/action/peer/").split('/');
         let target = parts.next().unwrap_or("").to_owned();
@@ -1189,10 +1343,21 @@ async fn apply_clipboard_files(
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
 ) {
     let mut state = clipboard.lock().await;
-    if generation <= state.applied_generation {
+    if state.already_applied(peer, generation) {
+        tracing::debug!(%peer, generation, "clipboard files ignored as an echo or older");
         return;
     }
-    let spooled = match spool_clipboard_files(generation, &entries) {
+    // The wire carries deflate per file (protocol v2); the spool wants real bytes. The
+    // relay below forwards the compressed originals untouched.
+    let mut raw_entries = Vec::with_capacity(entries.len());
+    for (name, wire) in &entries {
+        let Some(raw) = inflate_file_bytes(wire) else {
+            tracing::warn!(%peer, %name, "clipboard files discarded: an entry did not decompress to its claimed size");
+            return;
+        };
+        raw_entries.push((name.clone(), raw));
+    }
+    let spooled = match spool_clipboard_files(generation, &raw_entries) {
         Ok(tops) => tops,
         Err(e) => {
             tracing::warn!(%peer, "could not store the received files: {e}");
@@ -1201,21 +1366,29 @@ async fn apply_clipboard_files(
     };
     match seam_input::clipboard::write_file_list(&spooled) {
         Ok(()) => {
-            let bytes: usize = entries.iter().map(|(_, b)| b.len()).sum();
+            let bytes: usize = raw_entries.iter().map(|(_, b)| b.len()).sum();
             tracing::info!(%peer, files = entries.len(), bytes, "clipboard files received");
             note_transfer("files received", format!("{} files, {} KB", entries.len(), bytes / 1024));
-            state.applied_generation = generation;
+            state.record(peer, generation);
             state.files_sig = Some(files_signature(&spooled));
             state.last_seen = None;
             state.image_sig = None;
+            // Reissued under this machine's counter — same reasoning as the text relay.
+            state.generation += 1;
+            let relay = seam_proto::Frame::ClipboardFiles {
+                seq: 0,
+                generation: state.generation,
+                entries,
+            };
             drop(state);
-
-            let relay = seam_proto::Frame::ClipboardFiles { seq: 0, generation, entries };
-            for other in links.lock().await.iter() {
+            for other in {
+                let guard = links.lock().await;
+                guard.iter().map(Arc::clone).collect::<Vec<_>>()
+            } {
                 if other.peer_id() == peer {
                     continue;
                 }
-                if let Err(e) = other.send_reliable(&relay).await {
+                if let Err(e) = other.send_bulk(&relay).await {
                     tracing::warn!(
                         peer = %other.peer_id(),
                         "could not relay the clipboard files: {e}"
@@ -1247,6 +1420,101 @@ static UI_HOME: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex:
 /// an image or a folder is not, and a page that shows nothing while megabytes move is
 /// indistinguishable from one that is broken.
 static UI_TRANSFER: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// The daemon's trust store, shared and writable: pairing from the page adds a peer
+/// while every connection path keeps checking it. Reads vastly outnumber writes.
+type SharedTrust = Arc<std::sync::RwLock<seam_transport::TrustStore>>;
+
+/// A machine seen on the network right now, paired or not, for the pairing page.
+#[derive(Clone)]
+struct DiscoveredMachine {
+    /// DNS-SD instance name — the only key a removal event carries.
+    instance: String,
+    short: String,
+    addr: std::net::SocketAddr,
+    trusted: bool,
+}
+
+static UI_DISCOVERED: std::sync::Mutex<Vec<DiscoveredMachine>> = std::sync::Mutex::new(Vec::new());
+
+/// An in-flight pairing: the parked link and the six digits both screens are showing.
+///
+/// The link is held open, unregistered and unauthorised, for exactly as long as the
+/// person needs to compare two numbers. Everything else about it stays quarantined.
+struct PendingPairing {
+    code: String,
+    with: String,
+    link: Arc<Link>,
+    /// `None` while the digits are showing; the page keeps the outcome visible after.
+    outcome: Option<bool>,
+}
+
+static UI_PAIRING: std::sync::Mutex<Option<PendingPairing>> = std::sync::Mutex::new(None);
+
+/// Park an unpaired link and show its six digits, instead of hanging up on it.
+///
+/// This is the whole command-free join: a machine nobody has vouched for connects, the
+/// same code derives from the encrypted channel on both ends, and two people compare
+/// two numbers. Refusing outright — which is what the accept path used to do — meant
+/// the only way in was a shell command nobody should have to know.
+fn park_pairing(link: Link) {
+    let Ok(code) = link.pairing_code() else {
+        link.close("pairing code unavailable");
+        return;
+    };
+    let Ok(mut slot) = UI_PAIRING.lock() else {
+        link.close("busy");
+        return;
+    };
+    if slot.as_ref().is_some_and(|pending| pending.outcome.is_none()) {
+        // One pairing at a time: a second machine mid-ceremony would put two codes on
+        // one screen and the person could confirm the wrong one.
+        link.close("another pairing is in progress");
+        return;
+    }
+    let with = link.peer_id().to_string();
+    tracing::info!(peer = %with, "a machine wants to pair — the same six digits are showing on both screens");
+    let link = Arc::new(link);
+    *slot = Some(PendingPairing {
+        code: code.to_display_string().replace(' ', ""),
+        with,
+        link: Arc::clone(&link),
+        outcome: None,
+    });
+    drop(slot);
+    // Two minutes of patience: a code nobody confirms is a doorbell nobody answered.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        if let Ok(mut slot) = UI_PAIRING.lock()
+            && let Some(pending) = slot.as_ref()
+            && pending.outcome.is_none()
+            && Arc::ptr_eq(&pending.link, &link)
+        {
+            pending.link.close("pairing timed out");
+            *slot = None;
+        }
+    });
+}
+
+/// The loopback port THIS process's page is on — zero until the page is up.
+///
+/// Exists so shutdown can tell whether the `ui-port` note on disk is still its own.
+/// During a takeover the dying seam and the one replacing it share that file, and
+/// deleting it unconditionally erased the survivor's note: the running seam kept
+/// serving, but every page and script that looks the port up found nothing. Observed
+/// live — the fleet was healthy and unreachable at the same time.
+static UI_PORT_SELF: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Remove the `ui-port` note only if it still names this process's own page.
+fn remove_ui_port_note_if_ours(dir: &std::path::Path) {
+    let own = UI_PORT_SELF.load(std::sync::atomic::Ordering::Relaxed);
+    let note = dir.join("ui-port");
+    let noted =
+        std::fs::read_to_string(&note).ok().and_then(|text| text.trim().parse::<u16>().ok());
+    if own != 0 && noted == Some(own) {
+        let _ = std::fs::remove_file(note);
+    }
+}
 
 /// Note what the clipboard is doing, for the UI.
 fn note_transfer(what: &str, detail: String) {
@@ -1288,6 +1556,13 @@ static UI_FOCUS: std::sync::Mutex<Option<seam_proto::PeerId>> = std::sync::Mutex
 /// truth for everything visible. They are pulled from there, never edited here; see
 /// docs/GOAL.md §12a. The daemon serves them so the UI always matches the daemon it
 /// talks to, with no separate install.
+/// Binary assets — the logo. Kept apart from `UI_PAGES` because those are text and these
+/// are not; one table of `&str` cannot hold a PNG.
+const UI_ASSETS: &[(&str, &[u8], &str)] = &[
+    ("/_ds/assets/logo/seam-logo-32.png", include_bytes!("../ui/_ds/assets/logo/seam-logo-32.png"), "image/png"),
+    ("/_ds/assets/logo/seam-logo-128.png", include_bytes!("../ui/_ds/assets/logo/seam-logo-128.png"), "image/png"),
+];
+
 const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/", include_str!("../ui/index.html"), "text/html; charset=utf-8"),
     ("/index.html", include_str!("../ui/index.html"), "text/html; charset=utf-8"),
@@ -1300,6 +1575,12 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ("/update.html", include_str!("../ui/update.html"), "text/html; charset=utf-8"),
     ("/ideas.html", include_str!("../ui/ideas.html"), "text/html; charset=utf-8"),
     ("/join.html", include_str!("../ui/join.html"), "text/html; charset=utf-8"),
+    ("/layout.html", include_str!("../ui/layout.html"), "text/html; charset=utf-8"),
+    (
+        "/_ds/page-layout.js",
+        include_str!("../ui/_ds/page-layout.js"),
+        "text/javascript; charset=utf-8",
+    ),
     ("/licence.html", include_str!("../ui/licence.html"), "text/html; charset=utf-8"),
     (
         "/_ds/page-licence.js",
@@ -1314,6 +1595,11 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     (
         "/_ds/page-join.js",
         include_str!("../ui/_ds/page-join.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "/_ds/page-pairing.js",
+        include_str!("../ui/_ds/page-pairing.js"),
         "text/javascript; charset=utf-8",
     ),
     (
@@ -1346,18 +1632,45 @@ const UI_PAGES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+fn ui_asset_response(request: &str, path: &str, port: u16) -> Option<Vec<u8>> {
+    let (_, asset, content_type) = UI_ASSETS.iter().find(|(route, _, _)| *route == path)?;
+    let (status, content_type, body): (&str, &str, &[u8]) = if request_is_local(request, port) {
+        ("200 OK", content_type, asset)
+    } else {
+        ("403 Forbidden", "text/plain", b"refused")
+    };
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len(),
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    Some(response)
+}
+
 /// Serve the fleet UI on a loopback port, and record the port for `seam ui`.
 ///
 /// Loopback only, read-only, no external requests possible. Hand-rolled GET handling
 /// rather than a web framework: nine static routes and one JSON endpoint do not justify
 /// a dependency tree on the input path's binary.
-fn start_ui_server(
+/// Everything the fleet-page server needs, grouped because it travels together.
+struct UiServerSetup {
     dir: std::path::PathBuf,
     name: String,
     id: seam_proto::PeerId,
     seam_port: u16,
     links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
-) {
+    store: SharedTrust,
+    /// Absent in the UI-only test server; pairing actions answer 503 without it.
+    endpoint: Option<Arc<seam_transport::Endpoint>>,
+    /// Open the browser the moment the page binds — the honest alternative to a timer.
+    open_when_ready: bool,
+}
+
+fn start_ui_server(setup: UiServerSetup) {
+    let UiServerSetup { dir, name, id, seam_port, links, store, endpoint, open_when_ready } =
+        setup;
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
             Ok(listener) => listener,
@@ -1376,7 +1689,18 @@ fn start_ui_server(
         if let Err(e) = std::fs::write(dir.join("ui-port"), port.to_string()) {
             tracing::warn!("ui is up but 'seam ui' will not find it: {e}");
         }
+        UI_PORT_SELF.store(port, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(port, "fleet page ready — 'seam ui' opens it");
+        if open_when_ready {
+            // Opened HERE, on readiness, not on a timer. A tab opened 1.5 seconds
+            // after startup raced everything — sometimes early enough to show a page
+            // nobody was serving yet, and always adding a second of "open but dead"
+            // to the feel of a fresh install. The page exists the moment this line
+            // runs, so this is the moment the browser gets it.
+            if let Err(e) = open_ui(&dir) {
+                tracing::warn!("could not open the fleet page: {e}");
+            }
+        }
 
         let ui_port_note = dir.join("ui-port");
         loop {
@@ -1384,6 +1708,9 @@ fn start_ui_server(
             let links = Arc::clone(&links);
             let name = name.clone();
             let ui_port_note = ui_port_note.clone();
+            let store = Arc::clone(&store);
+            let endpoint = endpoint.clone();
+            let dir = dir.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 // Read until the headers end, not just once: a single read is not
@@ -1403,6 +1730,10 @@ fn start_ui_server(
                 }
                 let request = String::from_utf8_lossy(&buf);
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
+                if let Some(response) = ui_asset_response(&request, path, port) {
+                    let _ = socket.write_all(&response).await;
+                    return;
+                }
                 let (status, ctype, body) =
                     route(
                         &request,
@@ -1414,6 +1745,9 @@ fn start_ui_server(
                             id,
                             links: &links,
                             ui_port_note: &ui_port_note,
+                            store: &store,
+                            endpoint: endpoint.as_ref(),
+                            dir: &dir,
                         },
                     )
                     .await;
@@ -1458,7 +1792,12 @@ fn request_is_local(request: &str, port: u16) -> bool {
 
 #[cfg(test)]
 mod ui_origin {
-    use super::request_is_local;
+    use super::{
+        UI_ASSETS, UI_PAGES, UiServerSetup, request_is_local, serve_activation_only,
+        start_ui_server, ui_asset_response,
+    };
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     fn get(headers: &str) -> String {
         format!("POST /action/quit HTTP/1.1\r\n{headers}\r\n\r\n")
@@ -1492,6 +1831,139 @@ mod ui_origin {
     fn a_non_browser_caller_is_allowed() {
         // curl and scripts send no Origin; they already run as the user.
         assert!(request_is_local(&get("Host: 127.0.0.1:5000"), 5000));
+    }
+
+    #[test]
+    fn every_embedded_logo_is_a_real_png() {
+        assert_eq!(UI_ASSETS.len(), 2);
+        for (path, bytes, content_type) in UI_ASSETS {
+            assert!(
+                std::path::Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+            );
+            assert_eq!(*content_type, "image/png");
+            assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+            assert!(bytes.len() > 100, "{path} is unexpectedly small");
+        }
+    }
+
+    #[test]
+    fn an_embedded_logo_response_preserves_the_exact_png_bytes() {
+        let path = UI_ASSETS[0].0;
+        let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:5000\r\n\r\n");
+        let response = ui_asset_response(&request, path, 5000).expect("known logo route");
+        let split = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP response has a header terminator");
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n"));
+        assert_eq!(&response[split + 4..], UI_ASSETS[0].1);
+    }
+
+    #[test]
+    fn an_embedded_logo_refuses_a_foreign_origin() {
+        let path = UI_ASSETS[0].0;
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:5000\r\nOrigin: https://evil.example\r\n\r\n"
+        );
+        let response = ui_asset_response(&request, path, 5000).expect("known logo route");
+        assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"));
+        assert!(response.ends_with(b"\r\n\r\nrefused"));
+    }
+
+    #[test]
+    fn a_non_asset_path_stays_with_the_text_router() {
+        assert!(ui_asset_response("GET / HTTP/1.1\r\n\r\n", "/", 5000).is_none());
+    }
+
+    async fn wait_for_ui_port(dir: &std::path::Path) -> u16 {
+        for _ in 0..100 {
+            if let Ok(port) = std::fs::read_to_string(dir.join("ui-port"))
+                && let Ok(port) = port.trim().parse()
+            {
+                return port;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("UI server did not publish its port");
+    }
+
+    async fn fetch(port: u16, path: &str) -> Vec<u8> {
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("test UI server accepts a loopback connection");
+        socket
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes())
+            .await
+            .expect("request writes");
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response).await.expect("response reads");
+        response
+    }
+
+    #[tokio::test]
+    async fn fleet_server_serves_the_embedded_logo() {
+        let dir = std::env::temp_dir().join(format!("seam-logo-fleet-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test state directory");
+        start_ui_server(UiServerSetup {
+            dir: dir.clone(),
+            name: "test".to_owned(),
+            id: seam_proto::PeerId([1; 16]),
+            seam_port: 24810,
+            links: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            store: Arc::new(std::sync::RwLock::new(seam_transport::TrustStore::new())),
+            endpoint: None,
+            open_when_ready: false,
+        });
+        let port = wait_for_ui_port(&dir).await;
+        let response = fetch(port, UI_ASSETS[0].0).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n"));
+        assert!(response.ends_with(UI_ASSETS[0].1));
+        std::fs::remove_dir_all(dir).expect("test state directory removes");
+    }
+
+    #[tokio::test]
+    async fn activation_server_serves_the_embedded_logo() {
+        let dir =
+            std::env::temp_dir().join(format!("seam-logo-activation-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test state directory");
+        let server_dir = dir.clone();
+        let server = tokio::spawn(async move { serve_activation_only(&server_dir, false).await });
+        let port = wait_for_ui_port(&dir).await;
+        let response = fetch(port, UI_ASSETS[1].0).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n"));
+        assert!(response.ends_with(UI_ASSETS[1].1));
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(dir).expect("test state directory removes");
+    }
+
+    #[test]
+    fn every_html_page_uses_the_embedded_favicon() {
+        let pages: Vec<_> = UI_PAGES
+            .iter()
+            .filter(|(_, _, content_type)| content_type.starts_with("text/html"))
+            .collect();
+        assert!(!pages.is_empty());
+        for (path, html, _) in pages {
+            assert!(
+                html.contains(r#"href="_ds/assets/logo/seam-logo-32.png""#),
+                "{path} has no seam favicon"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_brand_surfaces_use_the_full_lockup() {
+        for path in ["/", "/index.html", "/onboarding.html", "/licence.html"] {
+            let (_, html, _) = UI_PAGES
+                .iter()
+                .find(|(route, _, _)| *route == path)
+                .expect("primary brand page must be embedded");
+            assert!(html.contains(r#"class="brand-lockup""#), "{path}");
+            assert!(html.contains("seam-logo-128.png"), "{path}");
+        }
     }
 }
 
@@ -1685,6 +2157,89 @@ fn lan_address() -> Option<String> {
     (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
 }
 
+/// The arrangement a person set, if they set one.
+///
+/// Pairing order is a guess: first paired sits left, second below. It is right often
+/// enough to be useful and wrong in a way nothing could detect — a screen's physical
+/// position is the one fact about a desk that is not visible from software. When someone
+/// says where a machine actually is, that answer outranks the guess and survives restarts.
+/// Where machine-wide state lives, whatever folder seam was started from.
+///
+/// The same reasoning as the licence: things that describe the MACHINE — its licence, the
+/// shape of its desk — belong somewhere a reinstall cannot move. `SEAM_HOME` still
+/// overrides everything, for testing.
+fn layout_home() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("SEAM_HOME")
+        && !home.is_empty()
+    {
+        return Some(std::path::PathBuf::from(home));
+    }
+    let dir = directories::ProjectDirs::from("dev", "seam", "seam")?.data_dir().to_path_buf();
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn stored_layout(dir: &std::path::Path) -> Vec<(String, String, String)> {
+    // Machine-wide first, then beside the install. How your screens are arranged is a fact
+    // about the desk, not about which folder the binary happens to sit in — storing it
+    // beside the install meant a reinstall to a new folder silently lost the arrangement,
+    // exactly as it once lost the licence.
+    let text = layout_home()
+        .and_then(|home| std::fs::read_to_string(home.join("layout")).ok())
+        .or_else(|| std::fs::read_to_string(dir.join("layout")).ok());
+    let Some(text) = text else { return Vec::new() };
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().split(' ');
+            let peer = parts.next()?;
+            let edge = parts.next()?;
+            // A missing anchor means "next to this machine", which is what every
+            // arrangement written before relations existed meant.
+            let anchor = parts.next().unwrap_or("self");
+            matches!(edge, "left" | "right" | "top" | "bottom").then(|| {
+                (peer.to_owned(), edge.to_owned(), anchor.to_owned())
+            })
+        })
+        .collect()
+}
+
+/// Record that a machine sits on one side of another, replacing any earlier answer.
+///
+/// A relation, not a side of this machine. A desk is a chain: a laptop below the iMac,
+/// which is itself left of this machine. Describing that as "below this machine" is simply
+/// false, and it sent the pointer through an edge nothing was on.
+fn set_layout(dir: &std::path::Path, short_id: &str, edge: &str, anchor: &str) -> bool {
+    if !matches!(edge, "left" | "right" | "top" | "bottom") || short_id.is_empty() {
+        return false;
+    }
+    // A machine cannot sit beside itself, and a pair cannot each be beside the other:
+    // either would be a layout with no fixed point to draw from.
+    if anchor == short_id {
+        return false;
+    }
+    let mut lines: Vec<String> = stored_layout(dir)
+        .into_iter()
+        .filter(|(peer, _, _)| peer != short_id)
+        .map(|(peer, e, a)| format!("{peer} {e} {a}"))
+        .collect();
+    lines.push(format!("{short_id} {edge} {anchor}"));
+    let body = lines.join("\n");
+    // Written machine-wide so it survives a reinstall anywhere, and beside the install too
+    // so a portable copy carried to another machine takes the desk with it.
+    if let Some(home) = layout_home() {
+        let _ = std::fs::write(home.join("layout"), &body);
+    }
+    let written = std::fs::write(dir.join("layout"), &body).is_ok();
+    if written {
+        tracing::info!(peer = short_id, edge, anchor, "arrangement set from the desk page");
+        UI_RELAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    written
+}
+
+/// Set when the arrangement changed and the layout must be rebuilt.
+static UI_RELAYOUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Was this the first machine seam was installed on?
 ///
 /// Decided once, on first run, by whether anything had been paired yet — then written
@@ -1728,6 +2283,48 @@ fn update_json() -> String {
     )
 }
 
+/// Everything the page needs to say about one peer.
+///
+/// Split out of `ui_state_json` for length, but the grouping is real: each of these is
+/// derived, none configured, and the arrangement ones come from what a person SET rather
+/// than from what the graph currently managed to place.
+fn peer_facts(
+    dir: &std::path::Path,
+    peer: seam_proto::PeerId,
+) -> (String, String, &'static str, bool) {
+    let chosen = stored_layout(dir)
+        .into_iter()
+        .find(|(p, _, _)| peer.to_string().starts_with(p.as_str()));
+
+    // A machine that could not be placed yet — because its neighbour was still asleep —
+    // reported no edge at all, and the page drew it somewhere default. From a chair that
+    // is the desk rearranging itself after a laptop sleeps, when the arrangement on disk
+    // was right the whole time. Placement is a consequence; what was set is the fact.
+    let edge = chosen.as_ref().map_or_else(
+        || {
+            UI_PLACES
+                .lock()
+                .ok()
+                .and_then(|places| {
+                    places.iter().find(|(p, _)| *p == peer).map(|(_, e)| (*e).to_owned())
+                })
+                .unwrap_or_default()
+        },
+        |(_, e, _)| e.clone(),
+    );
+    let anchor = chosen.map_or_else(|| "self".to_owned(), |(_, _, a)| a);
+
+    // Capability, learned by observation: a peer that has sent motion captures input.
+    let role = UI_ROLES
+        .lock()
+        .ok()
+        .and_then(|roles| roles.iter().find(|(p, _)| *p == peer).map(|(_, r)| *r))
+        .unwrap_or("receives input");
+    let enabled = UI_DISABLED.lock().is_ok_and(|off| !off.contains(&peer));
+
+    (edge, anchor, role, enabled)
+}
+
 /// The live state the UI binds to. Assembled by hand — ten fields do not justify serde.
 async fn ui_state_json(
     name: &str,
@@ -1751,38 +2348,22 @@ async fn ui_state_json(
             peers.push(',');
         }
         let peer = link.peer_id();
-        let edge = UI_PLACES
-            .lock()
-            .ok()
-            .and_then(|places| {
-                places.iter().find(|(p, _)| *p == peer).map(|(_, edge)| *edge)
-            })
-            .unwrap_or("");
-        // Role is a fact about who dialled whom, not a setting: the machine that
-        // accepted the connection is the server for that pair.
-        let we_dialled =
-            UI_DIALLED.lock().is_ok_and(|dialled| dialled.contains(&peer));
-        // Not server/client. Both machines dial each other now that discovery
-        // auto-connects, so who-accepted is a race and every machine could call itself
-        // the server — which is exactly what three screens showed. The distinction that
-        // is real and stable is CAPABILITY: this build captures input on macOS and only
-        // replays it on Windows, and that is what a person actually wants to know.
-        let role = UI_ROLES
-            .lock()
-            .ok()
-            .and_then(|roles| roles.iter().find(|(p, _)| *p == peer).map(|(_, r)| *r))
-            .unwrap_or("receives input");
-        let _ = we_dialled;
-        let enabled = UI_DISABLED.lock().is_ok_and(|off| !off.contains(&peer));
+        let (edge, anchor, role, enabled) = peer_facts(dir, peer);
         let _ = write!(
             peers,
-            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}","role":"{role}","enabled":{enabled},"version":"{}"}}"#,
+            r#"{{"id":"{peer}","name":"{peer}","addr":"{}","edge":"{edge}","anchor":"{anchor}","role":"{role}","enabled":{enabled},"version":"{}","rtt_ms":{}}}"#,
             link.remote_address(),
             UI_VERSIONS
                 .lock()
                 .ok()
                 .and_then(|v| v.iter().find(|(p, _)| *p == peer).map(|(_, ver)| ver.clone()))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            // The QUIC smoothed round-trip: a continuous, in-band measurement of the
+            // exact path input rides. "Everything pauses for seconds then works" is
+            // either this number spiking (the network breathing) or this number flat
+            // while the far machine chokes — one glance separates the two, where ping
+            // cannot (ICMP is firewalled off on the Windows machines).
+            link.rtt().as_millis()
         );
     }
 
@@ -1832,8 +2413,10 @@ async fn ui_state_json(
         push_health(elevated, if elevated { "elevated" } else { "not elevated — see doctor" });
     }
 
+    let (discovered, pairing) = pairing_state_json();
+
     format!(
-        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"seamPort":{},"lan":"{}","focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"licence":{},"update":{},"activity":[{}],"peers":[{peers}],"health":[{health}]}}"#,
+        r#"{{"version":"{}","name":"{}","id":"{id}","platform":"{}/{}","role":"{}","port":{},"seamPort":{},"lan":"{}","focus":"{focus}","transfer":{},"shares":{{"text":{},"images":{},"files":{}}},"startup":{},"licence":{},"update":{},"activity":[{}],"peers":[{peers}],"health":[{health}],"discovered":[{discovered}],"pairing":{pairing}}}"#,
         env!("CARGO_PKG_VERSION"),
         name.replace('"', "'"),
         std::env::consts::OS,
@@ -1862,6 +2445,191 @@ async fn ui_state_json(
     )
 }
 
+/// Accept inbound links: members join the fleet, strangers ring the pairing doorbell.
+fn start_accepting(
+    endpoint: Arc<seam_transport::Endpoint>,
+    store: SharedTrust,
+    links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    geometry: Geometry,
+    clipboard: Clipboard,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            match incoming {
+                Ok(link) => {
+                    let peer = link.peer_id();
+                    let verdict = store
+                        .read()
+                        .map_or(Err(seam_transport::Error::NotPaired), |s| link.authorize(&s));
+                    match verdict {
+                        Ok(()) => {
+                            tracing::info!(%peer, remote = %link.remote_address(), "peer connected");
+                            let link = Arc::new(link);
+                            register_link(&links, &link, &clipboard).await;
+                            announce_geometry(&link).await;
+                            tokio::spawn(receive_from(
+                                link,
+                                Arc::clone(&geometry),
+                                Arc::clone(&clipboard),
+                                Arc::clone(&links),
+                            ));
+                        }
+                        Err(seam_transport::Error::NotPaired) => {
+                            // A stranger is not an error, it is a doorbell: hold the
+                            // link and put six digits on both screens (goal §14).
+                            park_pairing(link);
+                        }
+                        Err(e) => {
+                            // Never silent: a refused peer says why (goal O5).
+                            tracing::warn!(%peer, "refused: {e}");
+                            link.close("not paired");
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("an inbound connection failed: {e}"),
+            }
+        }
+    })
+}
+
+/// Inject a remote button press, with the two witnesses that end silent failures:
+/// the held-modifier check before, and the pressed-state read-back after.
+fn apply_button(peer: seam_proto::PeerId, button: u8, down: bool) {
+    if down {
+        warn_if_modifiers_held();
+    }
+    if let Err(e) = seam_input::inject_button(button, down) {
+        tracing::warn!(%peer, "could not press a mouse button: {e}");
+    }
+    #[cfg(target_os = "windows")]
+    if down && !seam_input::windows::button_reads_pressed(button) {
+        tracing::warn!(
+            %peer,
+            button,
+            "a click was injected and accepted, yet the system does not show the \
+             button as pressed — something between seam and the desktop is \
+             discarding clicks"
+        );
+    }
+}
+
+/// Name any modifier held on this machine that seam did not press — throttled.
+///
+/// Runs when a click arrives, because that is the moment a phantom modifier turns the
+/// click into a chord: "clicks and keyboard not working" on a machine whose elevation,
+/// links and injection all checked out was a held key nobody could see. Windows only;
+/// elsewhere this is a no-op.
+fn warn_if_modifiers_held() {
+    #[cfg(target_os = "windows")]
+    {
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let due = LAST
+            .lock()
+            .ok()
+            .is_some_and(|slot| slot.is_none_or(|at| at.elapsed() > Duration::from_secs(5)));
+        if !due {
+            return;
+        }
+        let held = seam_input::windows::oddly_held_modifiers();
+        if held.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = LAST.lock() {
+            *slot = Some(std::time::Instant::now());
+        }
+        tracing::warn!(
+            held = held.join(", "),
+            "a modifier seam did not press is held on this machine — clicks land as \
+             chords and keys as shortcuts; press and release it on this machine's own \
+             keyboard"
+        );
+    }
+}
+
+/// Undo whatever a previous seam left behind, and armour the console.
+///
+/// Crash recovery: a seam that died while the cursor was concealed leaves this machine
+/// with an invisible cursor, and one that died mid-keystroke leaves phantom held keys —
+/// both restores are free when nothing was left behind. `QuickEdit` goes off so a stray
+/// click in our own console can never freeze the daemon at a log line again.
+#[cfg(target_os = "windows")]
+fn recover_this_machine() {
+    seam_input::windows::disable_console_quick_edit();
+    seam_input::windows::reveal_cursor();
+    seam_input::windows::release_stuck_modifiers();
+    repair_start_at_login_path();
+    sweep_fossil_binaries();
+}
+
+/// Delete versioned seam binaries left beside this one by an early installer.
+///
+/// The install folder held `seam-0.6.2.exe` fossils from the era before the installer
+/// settled on one filename. They are complete, runnable, ancient seams — and one of
+/// them, woken by a stray double-click, held the fleet's port for an afternoon while
+/// speaking a protocol two generations old. A fossil that does not exist cannot be
+/// resurrected. Best effort: a fossil that is RUNNING holds a lock and stays; the
+/// takeover's wildcard kill handles that one.
+#[cfg(target_os = "windows")]
+fn sweep_fossil_binaries() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_lowercase();
+        if name.starts_with("seam-")
+            && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+            && std::fs::remove_file(&path).is_ok()
+        {
+            tracing::info!(%name, "removed a versioned seam binary left by an older installer");
+        }
+    }
+}
+
+/// Point start-at-login at the seam that is actually running.
+///
+/// The Run key records the exe path that was current when the toggle was written — and
+/// then outlives it. A laptop's key still said `Downloads\seam.exe` from version 0.4.2,
+/// so every sign-in resurrected a months-old relic that fought the real seam for the
+/// port all morning: handshakes failing with "authentication failed", links resetting
+/// as the port changed hands. The running seam is the truth; the key follows it.
+#[cfg(target_os = "windows")]
+fn repair_start_at_login_path() {
+    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let Ok(exe) = std::env::current_exe() else { return };
+    if starts_at_login() && seam_input::windows::is_elevated() {
+        // Re-record unconditionally: the logon task follows the exe that is actually
+        // running, and a leftover Run key gets migrated to a highest-privileges task —
+        // which is what stops sign-ins producing an unelevated seam whose pointer dies
+        // on every administrator window.
+        let _ = set_start_at_login(true);
+        return;
+    }
+    let Ok(out) =
+        std::process::Command::new("reg").args(["query", RUN_KEY, "/v", "seam"]).output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return; // Start-at-login is off; nothing to repair.
+    }
+    let recorded = String::from_utf8_lossy(&out.stdout);
+    let wanted = format!("\"{}\" run --no-ui", exe.to_string_lossy());
+    if recorded.contains(&*exe.to_string_lossy()) {
+        return; // Already points at this seam.
+    }
+    let ok = std::process::Command::new("reg")
+        .args(["add", RUN_KEY, "/v", "seam", "/t", "REG_SZ", "/d", &wanted, "/f"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if ok {
+        tracing::info!(
+            "start-at-login pointed at an older seam; it now starts this one"
+        );
+    }
+}
+
 /// Bind the endpoint, or — if seam is already running here — show that one instead.
 ///
 /// Launching twice is what a person does by double-clicking the icon again. Failing with
@@ -1886,6 +2654,31 @@ fn bind_or_show_running(
                     if let Ok(endpoint) =
                         Endpoint::bind(Arc::clone(identity), format!("0.0.0.0:{port}").parse()?)
                     {
+                        return Ok(std::ops::ControlFlow::Continue(Arc::new(endpoint)));
+                    }
+                }
+            }
+            // The polite quit did not free the port. A seam old enough predates the quit
+            // endpoint entirely, and it must not win by seniority — the seam a person
+            // just started is the one they mean. A stale autostart resurrected a
+            // version-0.4.2 relic every sign-in, and the fresh seam bowed out to it.
+            #[cfg(target_os = "windows")]
+            {
+                let own = std::process::id().to_string();
+                // Wildcard, not the exact name: an early installer saved VERSIONED
+                // binaries, and a resurrected seam-0.6.2.exe held the port for an
+                // afternoon while a kill aimed at "seam.exe" sailed right past it.
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/IM", "seam*", "/FI", &format!("PID ne {own}")])
+                    .output();
+                for _ in 0..20 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if let Ok(endpoint) =
+                        Endpoint::bind(Arc::clone(identity), format!("0.0.0.0:{port}").parse()?)
+                    {
+                        tracing::info!(
+                            "an older seam would not quit politely; it was stopped, this one runs"
+                        );
                         return Ok(std::ops::ControlFlow::Continue(Arc::new(endpoint)));
                     }
                 }
@@ -1922,7 +2715,13 @@ fn starts_at_login() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("reg")
+        // Either mechanism counts: the scheduled task is the elevated one, the Run key
+        // the fallback a non-elevated seam can still write.
+        let task = std::process::Command::new("schtasks")
+            .args(["/query", "/tn", "seam"])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        task || std::process::Command::new("reg")
             .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "seam"])
             .output()
             .is_ok_and(|out| out.status.success())
@@ -1982,8 +2781,38 @@ fn set_start_at_login(enable: bool) -> bool {
     #[cfg(target_os = "windows")]
     {
         const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-        let ok = if enable {
-            std::process::Command::new("reg")
+        if enable {
+            // An elevated seam records itself as a highest-privileges logon task, so
+            // every sign-in starts it already elevated — no UAC prompt at the door and
+            // no pointer silently dying on admin windows (UIPI). A Run key cannot do
+            // that: entries there start unelevated, self-elevation then means a UAC
+            // prompt at every sign-in, and a declined prompt means input that fails
+            // exactly when an administrator window has focus.
+            if seam_input::windows::is_elevated() {
+                let ok = std::process::Command::new("schtasks")
+                    .args([
+                        "/create",
+                        "/tn",
+                        "seam",
+                        "/tr",
+                        &format!("\"{}\" run --no-ui", exe.to_string_lossy()),
+                        "/sc",
+                        "onlogon",
+                        "/rl",
+                        "highest",
+                        "/f",
+                    ])
+                    .output()
+                    .is_ok_and(|out| out.status.success());
+                if ok {
+                    // The task supersedes the key; leaving both starts seam twice.
+                    let _ = std::process::Command::new("reg")
+                        .args(["delete", RUN_KEY, "/v", "seam", "/f"])
+                        .output();
+                    return starts_at_login();
+                }
+            }
+            let _ = std::process::Command::new("reg")
                 .args([
                     "add",
                     RUN_KEY,
@@ -1995,13 +2824,15 @@ fn set_start_at_login(enable: bool) -> bool {
                     &format!("\"{}\" run --no-ui", exe.to_string_lossy()),
                     "/f",
                 ])
-                .output()
+                .output();
         } else {
-            std::process::Command::new("reg")
+            let _ = std::process::Command::new("schtasks")
+                .args(["/delete", "/tn", "seam", "/f"])
+                .output();
+            let _ = std::process::Command::new("reg")
                 .args(["delete", RUN_KEY, "/v", "seam", "/f"])
-                .output()
-        };
-        let _ = ok;
+                .output();
+        }
         starts_at_login()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -2021,6 +2852,7 @@ async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     std::fs::write(dir.join("ui-port"), port.to_string()).ok();
+    UI_PORT_SELF.store(port, std::sync::atomic::Ordering::Relaxed);
     println!("\n  seam needs a licence on this machine.");
     println!("  Activate it at http://127.0.0.1:{port}/licence.html\n");
 
@@ -2045,6 +2877,10 @@ async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result
                     let request = String::from_utf8_lossy(&buf[..n]);
                     let path = request.split_whitespace().nth(1).unwrap_or("/");
                     let method = request.split_whitespace().next().unwrap_or("GET");
+                    if let Some(response) = ui_asset_response(&request, path, port) {
+                        let _ = socket.write_all(&response).await;
+                        return;
+                    }
 
                     let (status, ctype, body) = if !request_is_local(&request, port) {
                         ("403 Forbidden", "text/plain", "refused".to_owned())
@@ -2085,6 +2921,22 @@ async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result
                     } else {
                         ("404 Not Found", "text/plain", "not found".to_owned())
                     };
+                    // Images are bytes and must not go through a String. Served with a
+                    // long cache lifetime because the logo changes with the binary, and
+                    // the binary is what gets replaced on an update.
+                    if let Some((_, bytes, ctype)) =
+                        UI_ASSETS.iter().find(|(route, _, _)| *route == path)
+                    {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+                             Cache-Control: max-age=86400\r\nConnection: close\r\n\r\n",
+                            bytes.len(),
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(bytes).await;
+                        return;
+                    }
+
                     let response = format!(
                         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
                          Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
@@ -2096,12 +2948,36 @@ async fn serve_activation_only(dir: &std::path::Path, open_page: bool) -> Result
             () = tokio::time::sleep(Duration::from_secs(1)) => {
                 if licence::stored(dir).is_some() {
                     println!("  activated — starting seam");
-                    let _ = std::fs::remove_file(dir.join("ui-port"));
+                    remove_ui_port_note_if_ours(dir);
                     return Ok(());
                 }
             }
         }
     }
+}
+
+/// Wait for the elevated copy to actually be running, rather than assuming it is.
+///
+/// It proves itself by writing its own `ui-port` note, which happens once its page is up —
+/// so this waits for that file to change from whatever was there before. Ten seconds is
+/// generous for a local process and short enough that a refused UAC prompt does not leave
+/// someone staring at a terminal.
+#[cfg(target_os = "windows")]
+fn elevated_child_started(dir: &std::path::Path) -> bool {
+    let note = dir.join("ui-port");
+    let before = std::fs::read_to_string(&note).unwrap_or_default();
+    // A minute, not ten seconds: the wait covers the elevated child's whole startup on
+    // a machine that may be busy installing updates. The parent idles unbound while it
+    // waits — the only cost of patience is patience.
+    for _ in 0..240 {
+        std::thread::sleep(Duration::from_millis(250));
+        let now = std::fs::read_to_string(&note).unwrap_or_default();
+        if !now.is_empty() && now != before {
+            tracing::info!("the elevated copy is running; this one is done");
+            return true;
+        }
+    }
+    false
 }
 
 /// Ask the seam already running here to stop, so a newly launched one can take over.
@@ -2236,8 +3112,14 @@ type Clipboard = Arc<tokio::sync::Mutex<ClipboardState>>;
 struct ClipboardState {
     /// The last text seen on this machine, whether typed here or received from a peer.
     last_seen: Option<String>,
-    /// Highest generation applied from a peer, so an echo is recognised and dropped.
-    applied_generation: u64,
+    /// Highest generation applied, PER PEER.
+    ///
+    /// Generations are each machine's own counter, so comparing them across machines is
+    /// meaningless: a peer that restarts begins at 1, and a machine that has been running
+    /// for hours is at 40 — every frame from the fresh peer then looks older than what is
+    /// already applied and is silently dropped. Keyed by peer, the counter does what it
+    /// was for: recognising that machine's own echo.
+    applied: Vec<(seam_proto::PeerId, u64)>,
     /// This machine's own change counter.
     generation: u64,
     /// Signature of the last image seen or applied, so an echo is recognised without
@@ -2358,6 +3240,96 @@ fn spool_clipboard_files(
     Ok(tops)
 }
 
+impl ClipboardState {
+    /// Has this peer already sent us this generation, or a newer one?
+    fn already_applied(&self, peer: seam_proto::PeerId, generation: u64) -> bool {
+        self.applied.iter().any(|(p, g)| *p == peer && *g >= generation)
+    }
+
+    /// Record what was applied from a peer.
+    fn record(&mut self, peer: seam_proto::PeerId, generation: u64) {
+        self.applied.retain(|(p, _)| *p != peer);
+        self.applied.push((peer, generation));
+    }
+
+    /// A peer's link was just (re)registered — its counter may have been reborn.
+    ///
+    /// Generations are a process's own counter, so a watermark outlives the process it
+    /// described: a laptop that restarts begins again at 1, and every copy it makes is
+    /// then "older" than the 40 remembered from its previous life and silently dropped.
+    /// Observed live: after a laptop restart, its copies reached this machine and
+    /// vanished at the gate — no receipt logged, nothing applied, nothing relayed.
+    fn forget_peer(&mut self, peer: seam_proto::PeerId) {
+        self.applied.retain(|(p, _)| *p != peer);
+    }
+}
+
+/// Compress pixels for the wire. Protocol v2: `ClipboardImage.rgba` carries deflate.
+///
+/// Raw RGBA was killing the fleet. A copied screenshot is 14–17 MB of uncompressed
+/// pixels, fanned out to every peer at once; on Wi-Fi that saturates the link long
+/// enough that keep-alive acks stop arriving, the 15-second patience runs out, and the
+/// transfer strangles the very connection carrying it — measured live twice, on two
+/// evenings: "clipboard changed; sharing kind=files/image", then every peer timing out
+/// within the minute, the pointer trapped on whichever machine held it. Screenshots
+/// deflate 5–10×, which turns the blast into something a radio can carry politely.
+fn deflate_pixels(rgba: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    // Writing into a Vec cannot fail; the unwrap_or covers the trait's signature.
+    let _ = encoder.write_all(rgba);
+    encoder.finish().unwrap_or_default()
+}
+
+/// Decompress wire pixels, refusing anything that does not inflate to exactly
+/// `width * height * 4` bytes — a mismatch is corruption, not something to guess at.
+fn inflate_pixels(wire: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    // A screen larger than this does not exist; a claim that one does is an attack or
+    // corruption, and either way not worth the allocation.
+    if expected > 512 * 1024 * 1024 {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(expected.min(64 * 1024 * 1024));
+    let decoder = flate2::read::ZlibDecoder::new(wire);
+    // The take() bound keeps a corrupt stream from inflating without limit.
+    let mut bounded = decoder.take(expected as u64 + 1);
+    bounded.read_to_end(&mut raw).ok()?;
+    (raw.len() == expected).then_some(raw)
+}
+
+/// Compress one file's bytes for the wire: an 8-byte length, then deflate.
+///
+/// Files got the same disease as images one release later: "sharing kind=files", then
+/// the peer timing out twenty-one seconds after — the payload saturating the link that
+/// carried it. The length prefix is what lets the receiver refuse a stream that does
+/// not inflate to exactly what was promised.
+fn deflate_file_bytes(raw: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut wire = (raw.len() as u64).to_le_bytes().to_vec();
+    let mut encoder =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    let _ = encoder.write_all(raw);
+    wire.extend(encoder.finish().unwrap_or_default());
+    wire
+}
+
+/// Inverse of [`deflate_file_bytes`]; `None` on any mismatch or absurd claim.
+fn inflate_file_bytes(wire: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let (len_bytes, deflated) = wire.split_at_checked(8)?;
+    let expected = usize::try_from(u64::from_le_bytes(len_bytes.try_into().ok()?)).ok()?;
+    if expected > 256 * 1024 * 1024 {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(expected.min(64 * 1024 * 1024));
+    let mut bounded = flate2::read::ZlibDecoder::new(deflated).take(expected as u64 + 1);
+    bounded.read_to_end(&mut raw).ok()?;
+    (raw.len() == expected).then_some(raw)
+}
+
 /// Cheap identity for clipboard images: dimensions plus a streaming hash of the pixels.
 /// Collisions would only cost a skipped share of a near-identical image.
 fn image_signature(width: u32, height: u32, rgba: &[u8]) -> u64 {
@@ -2373,13 +3345,30 @@ async fn share_with_all(
     frame: &seam_proto::Frame,
     what: &str,
 ) {
-    let peers = links.lock().await;
+    // Clone out of the lock BEFORE sending. This loop once held the fleet's link list
+    // across full multi-megabyte reliable sends to every peer in sequence — and the
+    // input-forwarding loop needs this same lock for every event. Every screenshot
+    // share froze all forwarded input for the duration of both transfers: "everything
+    // paused in the clients for seconds and then works", many times a day, while the
+    // network's round-trip stayed in single digits. The lock is for the LIST, never
+    // for the sending.
+    let peers: Vec<Arc<Link>> = {
+        let guard = links.lock().await;
+        guard.iter().map(Arc::clone).collect()
+    };
     if peers.is_empty() {
         return;
     }
     tracing::info!(peers = peers.len(), kind = what, "clipboard changed; sharing");
-    for link in peers.iter() {
-        if let Err(e) = link.send_reliable(frame).await {
+    // Images and files are bulk: on a thin path they must trickle behind input, not
+    // fight it. Text is a few bytes and rides normally.
+    let bulk = matches!(
+        frame,
+        seam_proto::Frame::ClipboardImage { .. } | seam_proto::Frame::ClipboardFiles { .. }
+    );
+    for link in &peers {
+        let sent = if bulk { link.send_bulk(frame).await } else { link.send_reliable(frame).await };
+        if let Err(e) = sent {
             tracing::warn!(peer = %link.peer_id(), kind = what, "could not share the clipboard: {e}");
         }
     }
@@ -2434,7 +3423,10 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
                             seam_proto::Frame::ClipboardFiles {
                                 seq: 0,
                                 generation: state.generation,
-                                entries,
+                                entries: entries
+                                    .into_iter()
+                                    .map(|(name, raw)| (name, deflate_file_bytes(&raw)))
+                                    .collect(),
                             }
                         };
                         note_transfer("sending files", format!("{} files", paths.len()));
@@ -2493,7 +3485,7 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
                     generation: state.generation,
                     width,
                     height,
-                    rgba,
+                    rgba: deflate_pixels(&rgba),
                 }
             };
             share_with_all(&links, &frame, "image").await;
@@ -2510,7 +3502,7 @@ fn start_clipboard_sync(links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, clipboar
 /// connection, not a loop.
 fn start_auto_dial(
     discovery: &Discovery,
-    store: &Arc<seam_transport::TrustStore>,
+    store: &SharedTrust,
     links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
     geometry: &Geometry,
     clipboard: &Clipboard,
@@ -2524,14 +3516,74 @@ fn start_auto_dial(
             let clipboard = Arc::clone(clipboard);
             let endpoint = Arc::clone(endpoint);
             tokio::spawn(async move {
-                while let Some(event) = found.next().await {
-                    let seam_transport::DiscoveryEvent::Found(peer) = event else { continue };
-                    // Trust is still decided by the handshake; this only decides who is
-                    // worth dialling, so an unpaired machine is skipped, not refused.
-                    if !peer
-                        .advertised_fingerprint
-                        .is_some_and(|fingerprint| store.is_trusted(fingerprint))
+                let own = endpoint.identity().peer_id();
+                // A paired machine can drop off the links with no discovery event: its
+                // record is still cached, so Found never re-fires — and if ITS dials
+                // are blackholed (a dual-homed peer answering from the wrong interface,
+                // a stale ARP entry) nothing on this side ever tried again. Observed
+                // live: a laptop placed and entered at 18:02:59, dead at 18:03:03, and
+                // stranded for minutes on an address this machine never redialled. The
+                // sweep retries every trusted, visible, absent machine on a slow tick.
+                let mut resweep = tokio::time::interval(Duration::from_secs(20));
+                resweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    let event = tokio::select! {
+                        event = found.next() => match event {
+                            Some(event) => event,
+                            None => break,
+                        },
+                        _ = resweep.tick() => {
+                            redial_absent_peers(&endpoint, &store, &links, &geometry, &clipboard)
+                                .await;
+                            continue;
+                        }
+                    };
+                    let peer = match event {
+                        seam_transport::DiscoveryEvent::Found(peer) => peer,
+                        seam_transport::DiscoveryEvent::Lost { instance } => {
+                            if let Ok(mut seen) = UI_DISCOVERED.lock() {
+                                seen.retain(|m| m.instance != instance);
+                            }
+                            continue;
+                        }
+                    };
+                    if peer.advertised_peer_id == Some(own) {
+                        continue;
+                    }
+                    let trusted = peer.advertised_fingerprint.is_some_and(|fingerprint| {
+                        store.read().is_ok_and(|s| s.is_trusted(fingerprint))
+                    });
+                    // The pairing page lists everyone on the network, stranger or not.
+                    if let (Ok(mut seen), Some(&addr)) =
+                        (UI_DISCOVERED.lock(), peer.addresses.first())
                     {
+                        seen.retain(|m| m.instance != peer.instance);
+                        seen.push(DiscoveredMachine {
+                            instance: peer.instance.clone(),
+                            short: peer
+                                .advertised_peer_id
+                                .map_or_else(|| peer.name.clone(), |id| id.to_string()),
+                            addr,
+                            trusted,
+                        });
+                    }
+                    // Trust is still decided by the handshake; this only decides who is
+                    // worth dialling, so an unpaired machine is skipped, not refused —
+                    // with one exception. A seam that trusts NOBODY yet is a machine
+                    // someone just installed: it offers itself to whatever fleet it can
+                    // see, which puts the six digits on both screens with nothing typed
+                    // anywhere. A machine with even one pairing never volunteers.
+                    if !trusted {
+                        let lonely = store.read().is_ok_and(|s| s.is_empty());
+                        let idle = UI_PAIRING.lock().is_ok_and(|slot| slot.is_none());
+                        if lonely && idle {
+                            for address in &peer.addresses {
+                                if let Ok(link) = endpoint.connect(*address).await {
+                                    park_pairing(link);
+                                    break;
+                                }
+                            }
+                        }
                         continue;
                     }
                     let already = links.lock().await.iter().any(|link| {
@@ -2541,29 +3593,90 @@ fn start_auto_dial(
                         continue;
                     }
                     tracing::info!(peer = %peer.name, "found a paired machine; connecting");
-                    for address in &peer.addresses {
-                        if let Ok(link) = endpoint.connect(*address).await
-                            && link.authorize(&store).is_ok()
-                        {
-                            tracing::info!(peer = %link.peer_id(), %address, "found and connected");
-                            let link = Arc::new(link);
-                            register_link(&links, &link).await;
-                            announce_geometry(&link).await;
-                            tokio::spawn(receive_from(
-                                link,
-                                Arc::clone(&geometry),
-                                Arc::clone(&clipboard),
-                                Arc::clone(&links),
-                            ));
-                            break;
-                        }
-                    }
+                    dial_trusted(
+                        &endpoint,
+                        &store,
+                        &links,
+                        &geometry,
+                        &clipboard,
+                        &peer.name,
+                        &peer.addresses,
+                    )
+                    .await;
                 }
             });
         }
         Err(e) => tracing::warn!("discovery unavailable; only --connect addresses work: {e}"),
     }
+}
 
+/// One sweep pass: redial every trusted machine that is visible but not connected.
+async fn redial_absent_peers(
+    endpoint: &Arc<seam_transport::Endpoint>,
+    store: &SharedTrust,
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    geometry: &Geometry,
+    clipboard: &Clipboard,
+) {
+    let connected: Vec<String> =
+        links.lock().await.iter().map(|l| l.peer_id().to_string()).collect();
+    let absent: Vec<(String, std::net::SocketAddr)> = UI_DISCOVERED
+        .lock()
+        .map(|seen| {
+            seen.iter()
+                .filter(|m| m.trusted && !connected.iter().any(|c| c.starts_with(&m.short)))
+                .map(|m| (m.short.clone(), m.addr))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (short, addr) in absent {
+        tracing::info!(peer = %short, %addr, "a paired machine is visible but not connected; dialling it");
+        dial_trusted(endpoint, store, links, geometry, clipboard, &short, &[addr]).await;
+    }
+}
+
+/// Dial a trusted machine at the given addresses; register the first that answers as
+/// itself. Every failed address is named — that exact silence once cost an afternoon.
+async fn dial_trusted(
+    endpoint: &Arc<seam_transport::Endpoint>,
+    store: &SharedTrust,
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    geometry: &Geometry,
+    clipboard: &Clipboard,
+    label: &str,
+    addresses: &[std::net::SocketAddr],
+) {
+    for address in addresses {
+        let link = match endpoint.connect(*address).await {
+            Ok(link) => link,
+            Err(e) => {
+                tracing::info!(peer = %label, %address, "no luck at this address: {e}");
+                continue;
+            }
+        };
+        // `presented` is the whole diagnosis when an address is answered by the wrong
+        // machine: a stale entry after standby points at a box that completes the
+        // handshake happily — as someone else.
+        let verdict = store
+            .read()
+            .map_or(Err(seam_transport::Error::NotPaired), |s| link.authorize(&s));
+        if let Err(e) = verdict {
+            tracing::warn!(peer = %label, %address, presented = %link.peer_id(), "answered by a machine we are not paired with: {e}");
+            link.close("not paired");
+            continue;
+        }
+        tracing::info!(peer = %link.peer_id(), %address, "found and connected");
+        let link = Arc::new(link);
+        register_link(links, &link, clipboard).await;
+        announce_geometry(&link).await;
+        tokio::spawn(receive_from(
+            link,
+            Arc::clone(geometry),
+            Arc::clone(clipboard),
+            Arc::clone(links),
+        ));
+        return;
+    }
 }
 
 /// Peer id to real screen size, as reported by that peer.
@@ -2607,15 +3720,41 @@ async fn announce_geometry(link: &Link) {
 ///
 /// Replacing by identity is correct rather than merely tidy: `PeerId` is derived from the
 /// peer's certificate, so two links with the same id are the same machine by construction.
-async fn register_link(links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, link: &Arc<Link>) {
-    let mut peers = links.lock().await;
+async fn register_link(
+    links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
+    link: &Arc<Link>,
+    clipboard: &Clipboard,
+) {
     let id = link.peer_id();
-    let replaced = peers.iter().any(|l| l.peer_id() == id);
-    peers.retain(|l| l.peer_id() != id);
-    peers.push(Arc::clone(link));
-    if replaced {
-        tracing::info!(peer = %id, "peer reconnected; dropped the stale link");
+    let replaced: Vec<Arc<Link>> = {
+        let mut peers = links.lock().await;
+        let replaced = peers.iter().filter(|l| l.peer_id() == id).map(Arc::clone).collect();
+        peers.retain(|l| l.peer_id() != id);
+        peers.push(Arc::clone(link));
+        replaced
+    };
+    for stale in &replaced {
+        // Close it, don't just forget it. A replaced link left open is a zombie: its
+        // tasks keep reading, the other side may keep SENDING on it, and the two
+        // machines can end up talking through different connections — one of which
+        // nobody is reading. One peer, one link, and the loser is told it lost.
+        stale.close("replaced by a newer link");
     }
+    if !replaced.is_empty() {
+        tracing::info!(peer = %id, "peer reconnected; closed the stale link");
+    }
+    // A fresh link may be a fresh process, and a fresh process counts from one again.
+    clipboard.lock().await.forget_peer(id);
+
+    // A machine arriving is as much a change to the desk as someone moving one.
+    //
+    // Without this the layout was only ever rebuilt when a position was edited, so a
+    // laptop that slept came back holding the placement it had before — stale geometry,
+    // and often a placement made while its neighbour was away. Sharing stayed broken until
+    // the arrangement was changed to something wrong and back again, which was the only
+    // thing that forced a rebuild. That is a precise description of this bug, and it was
+    // how the user found it.
+    UI_RELAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 
@@ -2627,8 +3766,9 @@ async fn register_link(links: &Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>, link: &A
 #[allow(clippy::too_many_arguments)]
 fn spawn_reconnector(
     target: SocketAddr,
+    port: u16,
     endpoint: Arc<seam_transport::Endpoint>,
-    store: Arc<seam_transport::TrustStore>,
+    store: SharedTrust,
     links: Arc<tokio::sync::Mutex<Vec<Arc<Link>>>>,
     geometry: Geometry,
     clipboard: Clipboard,
@@ -2637,13 +3777,41 @@ fn spawn_reconnector(
             // Back off up to 5 s: fast enough that starting the server feels immediate,
             // slow enough not to spin when nothing is there.
             let mut delay = Duration::from_millis(500);
+            let mut failures = 0u32;
             loop {
                 match endpoint.connect(target).await {
-                    Ok(link) => {
-                        if let Err(e) = link.authorize(&store) {
-                            tracing::warn!(%target, "refused: {e}");
-                            return;
+                    // Keep the lane alive on a refusal. Returning turned one refusal
+                    // into a permanent disconnection: a peer answering mid-restart
+                    // before its trust store loads, or an address answered by the wrong
+                    // machine after standby, killed this loop for good and nothing ever
+                    // dialled again. `presented` names who actually answered, which is
+                    // the whole diagnosis when it is not who the address used to be.
+                    Ok(link)
+                        if store.read().is_ok_and(|s| link.authorize(&s).is_err()) =>
+                    {
+                        let refusal = store
+                            .read()
+                            .map_or(Err(seam_transport::Error::NotPaired), |s| {
+                                link.authorize(&s)
+                            })
+                            .expect_err("checked in the guard");
+                        let lonely = store.read().is_ok_and(|s| s.is_empty());
+                        if lonely && matches!(refusal, seam_transport::Error::NotPaired) {
+                            // A machine told to connect somewhere before it trusts
+                            // anyone is a machine someone is joining to a fleet: put
+                            // the six digits on both screens rather than refusing the
+                            // very thing the person asked for.
+                            park_pairing(link);
+                        } else {
+                            if failures == 0 {
+                                tracing::warn!(%target, presented = %link.peer_id(), "refused: {refusal}; keeping this lane alive");
+                            } else {
+                                tracing::debug!(%target, presented = %link.peer_id(), "still refused: {refusal}");
+                            }
+                            link.close("not paired");
                         }
+                    }
+                    Ok(link) => {
                         tracing::info!(peer = %link.peer_id(), %target, "connected to peer");
                         if let Ok(mut dialled) = UI_DIALLED.lock() {
                             let id = link.peer_id();
@@ -2652,8 +3820,9 @@ fn spawn_reconnector(
                             }
                         }
                         delay = Duration::from_millis(500);
+                        failures = 0;
                         let link = Arc::new(link);
-                        register_link(&links, &link).await;
+                        register_link(&links, &link, &clipboard).await;
                         announce_geometry(&link).await;
                         // Returns when the peer goes away, and then we try again.
                         receive_from(
@@ -2666,13 +3835,57 @@ fn spawn_reconnector(
                         tracing::info!(%target, "peer went away; reconnecting");
                     }
                     Err(e) => {
-                        tracing::debug!(%target, "not reachable yet ({e}); retrying");
+                        // The first failure of a streak is worth a visible line — it is
+                        // the moment something changed. The rest stay quiet: this loop
+                        // runs every few seconds against a machine that may simply be
+                        // switched off.
+                        if failures == 0 {
+                            tracing::warn!(%target, "could not connect: {e}; retrying quietly");
+                        } else {
+                            tracing::debug!(%target, "not reachable yet ({e}); retrying");
+                        }
                     }
                 }
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(5));
+
+                // A run of failures usually means this machine slept: the socket bound
+                // before standby survives, accepts writes and reaches nothing, so every
+                // attempt fails while looking like an unreachable peer. Rebinding gets a
+                // socket on the network that exists now, keeping this machine's identity
+                // so peers still recognise it.
+                failures += 1;
+                if failures.is_multiple_of(5) {
+                    match endpoint.rebind(port) {
+                        Ok(()) => tracing::info!(
+                            "rebound the network socket after repeated failures (a sleep \
+                             or a network change looks exactly like this)"
+                        ),
+                        Err(e) => tracing::debug!("could not rebind: {e}"),
+                    }
+                }
             }
     });
+}
+
+/// Is a machine sitting somewhere it does not belong?
+///
+/// A machine whose neighbour was away is attached to this one so it stays reachable. Once
+/// that neighbour is back, the stored relation must be restored — otherwise the fallback
+/// quietly becomes the arrangement, which is a layout that changes itself after a laptop
+/// sleeps.
+fn layout_needs_rebuild(
+    dir: &std::path::Path,
+    live: &[seam_proto::PeerId],
+    known: &[seam_proto::PeerId],
+) -> bool {
+    let here = |id: &str| live.iter().any(|p| p.to_string().starts_with(id));
+    let placed = |id: &str| known.iter().any(|p| p.to_string().starts_with(id));
+    stored_layout(dir)
+        .into_iter()
+        .any(|(peer, _, anchor)| {
+            anchor != "self" && here(&peer) && here(&anchor) && placed(&peer) && !placed(&anchor)
+        })
 }
 
 /// Keep the layout in step with which peers are actually connected.
@@ -2689,7 +3902,23 @@ async fn sync_peers(
     geometry: &Geometry,
     dir: &std::path::Path,
 ) {
+    // An arrangement change means every placement is stale, so start again rather than
+    // patching one screen and leaving the rest describing the old desk.
     let live: Vec<seam_proto::PeerId> = links.lock().await.iter().map(|l| l.peer_id()).collect();
+
+    let waiting_for = layout_needs_rebuild(dir, &live, known);
+
+    if waiting_for || UI_RELAYOUT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        // Clearing `known` alone was not enough: the graph kept its old node, so
+        // `is_placed` still answered yes and the peer was skipped rather than re-placed
+        // with the geometry and neighbour it has now.
+        known.clear();
+        graph.forget_all();
+        if let Ok(mut places) = UI_PLACES.lock() {
+            places.clear();
+        }
+    }
+
     let sizes = geometry.lock().await.clone();
 
     // Place in PAIRING order, never connection order. Connection order is a race, and
@@ -2712,6 +3941,63 @@ async fn sync_peers(
         // layout: the first machine sits to the LEFT, the next one BELOW that. A layout
         // editor belongs in the UI; this makes handover work without asking anyone to
         // draw anything (goal Z3).
+        // A person's answer outranks the guess — and it is a relation, so the machine it
+        // is placed against has to be on the desk first. If it is not yet, this one waits
+        // for a later pass rather than being anchored to something arbitrary.
+        if let Some((_, edge, anchor)) = stored_layout(dir)
+            .into_iter()
+            .find(|(peer, _, _)| id.to_string().starts_with(peer.as_str()))
+        {
+            let chosen = match edge.as_str() {
+                "left" => focus::Edge::Left,
+                "right" => focus::Edge::Right,
+                "top" => focus::Edge::Top,
+                _ => focus::Edge::Bottom,
+            };
+            let against = if anchor == "self" {
+                None
+            } else if let Some(peer) =
+                known.iter().find(|k| k.to_string().starts_with(anchor.as_str()))
+            {
+                Some(*peer)
+            } else if live.iter().any(|k| k.to_string().starts_with(anchor.as_str())) {
+                // Its neighbour is connected but not placed yet — it is earlier in this
+                // same pass. Come back to this one; the order settles within a tick.
+                continue;
+            } else {
+                // Its neighbour is not here at all: asleep, or switched off. Attaching to
+                // this machine instead keeps the machine reachable, and the stored
+                // arrangement is untouched, so the moment its neighbour returns the
+                // relation is restored exactly as it was.
+                //
+                // Skipping it instead - which is what happened - left the machine with no
+                // place on the desk, so the pointer could not reach it and the layout
+                // looked like it had changed itself after a laptop slept.
+                tracing::info!(
+                    peer = %id,
+                    %anchor,
+                    "its neighbour is away; attaching to this machine until it returns"
+                );
+                None
+            };
+            graph.place(*id, chosen, against, w, h);
+            if let Ok(mut places) = UI_PLACES.lock() {
+                places.retain(|(p, _)| p != id);
+                places.push((
+                    *id,
+                    match chosen {
+                        focus::Edge::Left => "left",
+                        focus::Edge::Right => "right",
+                        focus::Edge::Top => "top",
+                        focus::Edge::Bottom => "bottom",
+                    },
+                ));
+            }
+            known.push(*id);
+            tracing::info!(peer = %id, %edge, %anchor, "placed where you said it sits");
+            continue;
+        }
+
         let (edge, anchor) = match known.first() {
             None => (focus::Edge::Left, None),
             Some(first) => (focus::Edge::Bottom, Some(*first)),
@@ -2915,9 +4201,7 @@ async fn receive_reliable(
                 }
             }
             Ok(seam_proto::Frame::Button(b)) => {
-                if let Err(e) = seam_input::inject_button(b.button.to_u8(), b.press.is_down()) {
-                    tracing::warn!(%peer, "could not press a mouse button: {e}");
-                }
+                apply_button(peer, b.button.to_u8(), b.press.is_down());
             }
             Ok(seam_proto::Frame::Scroll(sc)) => {
                 if let Err(e) = seam_input::inject_scroll(sc.dx, sc.dy) {
@@ -2926,29 +4210,40 @@ async fn receive_reliable(
             }
             Ok(seam_proto::Frame::ClipboardText { generation, text, .. }) => {
                 let mut state = clipboard.lock().await;
-                if generation <= state.applied_generation {
+                if state.already_applied(peer, generation) {
                     // An echo, or something older than what we already have.
+                    tracing::debug!(%peer, generation, "clipboard text ignored as an echo or older");
                     continue;
                 }
                 match seam_input::clipboard::write_text(&text) {
                     Ok(()) => {
                         tracing::info!(%peer, chars = text.chars().count(), "clipboard received");
-                        state.applied_generation = generation;
+                        state.record(peer, generation);
                         // Remember what we just wrote, so the poller does not see it as a
                         // local change and send it straight back.
                         state.last_seen = Some(text.clone());
-                        drop(state);
 
                         // Relay to every *other* peer. Machines connect in a star through
                         // whichever one they dialled, so without this a copy on one leaf
-                        // reaches the centre and stops there — which is exactly what was
-                        // reported: only the machine in the middle ever shared anything.
+                        // reaches the centre and stops there.
                         //
-                        // The generation is passed through unchanged rather than reissued,
-                        // so the update keeps its original identity and cannot echo back
-                        // around the star.
-                        let relay = seam_proto::Frame::ClipboardText { seq: 0, generation, text };
-                        for other in links.lock().await.iter() {
+                        // Reissued under THIS machine's counter, not passed through. A
+                        // leaf tracks generations per link, so a passed-through value
+                        // interleaved the origin's counter with this machine's own under
+                        // one key — and whichever counter happened to be ahead silently
+                        // blocked the other's next copy at the far end. Echo is already
+                        // impossible structurally: the origin is skipped below.
+                        state.generation += 1;
+                        let relay = seam_proto::Frame::ClipboardText {
+                            seq: 0,
+                            generation: state.generation,
+                            text,
+                        };
+                        drop(state);
+                        for other in {
+                let guard = links.lock().await;
+                guard.iter().map(Arc::clone).collect::<Vec<_>>()
+            } {
                             if other.peer_id() == peer {
                                 continue;
                             }
@@ -2968,6 +4263,9 @@ async fn receive_reliable(
                     .await;
             }
             Ok(seam_proto::Frame::Hello(hello)) => {
+                if hello_speaks_another_protocol(&link, peer, hello.version) {
+                    return;
+                }
                 let (w, h) = (
                     i32::try_from(hello.width).unwrap_or(0),
                     i32::try_from(hello.height).unwrap_or(0),
@@ -2985,7 +4283,14 @@ async fn receive_reliable(
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::debug!(%peer, "reliable stream ended: {e}");
+                // Loud, and fatal to the link. This reader is the only thing that
+                // delivers buttons, keys and clipboard from the peer: letting the
+                // connection outlive it produced a link that looked healthy while
+                // clicks poured into a stream nobody read — and the sender's machine
+                // eventually wedged its own input on the backed-up send. If the reader
+                // ends, the link ends, both sides notice, and the sweep re-dials.
+                tracing::info!(%peer, "reliable stream ended: {e} — closing this link so it can heal");
+                link.close("reliable stream ended");
                 return;
             }
         }
@@ -3045,12 +4350,46 @@ fn start_pointer_forwarding(
             // Rate limit for the drift warning below, so a moving cursor does not turn
             // the log into noise at event rate.
             let mut last_drift_warn: Option<std::time::Instant> = None;
+            // When the last local keystroke landed, because typing pins the desk.
+            let mut last_keystroke: Option<std::time::Instant> = None;
 
-            while let Some(event) = rx.recv().await {
-                if let Ok(mut last) = LAST_INPUT.lock() {
-                    *last = Some(std::time::Instant::now());
+            // The loop wakes on input — and once a second regardless. Rescue used to be
+            // event-driven only: a laptop that died HOLDING the pointer left the person
+            // staring at a dead cursor, and input only came home when they happened to
+            // move the mouse — measured live at 34 seconds of an invisible pointer,
+            // because who keeps wiggling a mouse that is visibly dead? The idle tick
+            // runs the same reconciliation with no event required.
+            let mut idle = tokio::time::interval(Duration::from_secs(1));
+            idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let event = tokio::select! {
+                    received = rx.recv() => match received {
+                        Some(event) => Some(event),
+                        None => break,
+                    },
+                    _ = idle.tick() => None,
+                };
+                if event.is_some() {
+                    if let Ok(mut last) = LAST_INPUT.lock() {
+                        *last = Some(std::time::Instant::now());
+                    }
+                    seq = seq.wrapping_add(1);
                 }
-                seq = seq.wrapping_add(1);
+
+                // Typing pins the desk. A keystroke burst means "I am here": while one
+                // is in flight, a mouse grazed by a palm must not carry the pointer —
+                // and the keyboard with it — onto another machine. Words vanished from
+                // a prompt box mid-sentence exactly that way: the edge was crossed
+                // between two words, and the next one was typed into the neighbour.
+                // 400 ms outlasts a fast typist's inter-key gap and expires the moment
+                // a person actually stops to move the mouse somewhere.
+                if let Some(Observed::Key { down: true, .. }) = event {
+                    last_keystroke = Some(std::time::Instant::now());
+                }
+                graph.set_crossing_hold(
+                    last_keystroke
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(400)),
+                );
 
                 sync_peers(&links, &mut graph, &mut known, &geometry, &dir).await;
 
@@ -3088,6 +4427,10 @@ fn start_pointer_forwarding(
                     holder = None;
                     detached = handover(u, detached);
                 }
+
+                // A tick has no event to forward; its work — reconciliation and the
+                // safety nets above — is done.
+                let Some(event) = event else { continue };
 
                 // Movement decides ownership; everything else follows whoever owns it.
                 let update = match event {
@@ -3136,6 +4479,14 @@ fn start_pointer_forwarding(
                         Focus::Remote(_) if parked.is_none() => {
                             match seam_input::cursor_position() {
                                 Ok((px, py)) => {
+                                    // A crossing happens AT an edge, so the raw position
+                                    // is often the screen's last pixel row — and a cursor
+                                    // returned to a screen seam is, from a chair, not
+                                    // there at all: "mouse not shown even after the peer
+                                    // disconnected" was a cursor parked at (59, 1080) on
+                                    // a 1080-tall display. Hold it a visible distance in.
+                                    let px = px.clamp(24, (local_w - 25).max(24));
+                                    let py = py.clamp(24, (local_h - 25).max(24));
                                     tracing::info!(
                                         x = px,
                                         y = py,
@@ -3270,14 +4621,39 @@ fn start_pointer_forwarding(
                 };
                 log_event(&frame);
 
-                let peers = links.lock().await;
-                let Some(link) = peers.iter().find(|l| l.peer_id() == target) else {
-                    continue;
+                // Clone out of the lock before awaiting anything: holding the fleet's
+                // link list across a blocked send would freeze every other user of it.
+                let link = {
+                    let peers = links.lock().await;
+                    match peers.iter().find(|l| l.peer_id() == target) {
+                        Some(link) => Arc::clone(link),
+                        None => continue,
+                    }
                 };
                 let result = if frame.is_datagram_safe() {
                     link.send_datagram(&frame, &mut buf)
                 } else {
-                    link.send_reliable(&frame).await
+                    // Bounded, because this loop owns this machine's own input. A peer
+                    // whose reliable stream is not being drained exerts backpressure
+                    // here, and an unbounded await turned one sick client into a server
+                    // whose own mouse and keyboard were dead until that client
+                    // disconnected. Two seconds without progress means the peer is not
+                    // accepting input; close the link and let the sweep heal it.
+                    let Ok(sent) = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        link.send_reliable(&frame),
+                    )
+                    .await
+                    else {
+                        tracing::warn!(
+                            peer = %target,
+                            "an input send made no progress for two seconds; \
+                             closing the link so it can heal"
+                        );
+                        link.close("input send stalled");
+                        continue;
+                    };
+                    sent
                 };
                 if let Err(e) = result {
                     tracing::warn!(peer = %target, "could not forward input: {e}");
@@ -3303,6 +4679,44 @@ mod tests {
     #[test]
     fn the_cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_restarted_peer_is_heard_again() {
+        // A watermark outlives the process it described: the laptop restarted, began
+        // counting from one again, and every copy it made was then "older" than the
+        // generation remembered from its previous life — dropped at the gate with no
+        // receipt logged, nothing applied, nothing relayed. Forgetting the peer when
+        // its link re-registers is what lets the reborn machine speak.
+        let mut state = ClipboardState::default();
+        let peer = seam_proto::PeerId([7; 16]);
+        state.record(peer, 40);
+        assert!(state.already_applied(peer, 1), "the old life's watermark blocks the reborn counter");
+        state.forget_peer(peer);
+        assert!(!state.already_applied(peer, 1), "after the link re-registers, generation 1 is heard");
+    }
+
+    #[test]
+    fn pixels_survive_the_wire_and_lies_about_size_do_not() {
+        // 100x50 of gradient-ish pixels: representative of a screenshot's compressibility.
+        let (w, h) = (100u32, 50u32);
+        let raw: Vec<u8> = (0..(w * h * 4)).map(|i| (i % 251) as u8).collect();
+        let wire = deflate_pixels(&raw);
+        assert!(wire.len() < raw.len(), "screenshot-like pixels must shrink");
+        assert_eq!(inflate_pixels(&wire, w, h).as_deref(), Some(raw.as_slice()));
+        // A frame whose dimensions do not match its pixels is corruption, not a guess.
+        assert_eq!(inflate_pixels(&wire, w, h + 1), None);
+        assert_eq!(inflate_pixels(&wire[..wire.len() / 2], w, h), None);
+    }
+
+    #[test]
+    fn an_echo_is_recognised_and_newer_generations_pass() {
+        let mut state = ClipboardState::default();
+        let peer = seam_proto::PeerId([7; 16]);
+        state.record(peer, 5);
+        assert!(state.already_applied(peer, 5), "the same generation is an echo");
+        assert!(state.already_applied(peer, 4), "an older one is stale");
+        assert!(!state.already_applied(peer, 6), "the next copy must pass");
     }
 
     #[test]

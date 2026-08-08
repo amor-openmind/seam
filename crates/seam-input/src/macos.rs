@@ -342,6 +342,16 @@ impl Drop for CursorGuard {
                 for _ in 0..hides.saturating_add(8) {
                     CGDisplayShowCursor(CGMainDisplayID());
                 }
+                // Verify rather than trust the arithmetic: if anything hid the cursor
+                // outside the counter's knowledge, keep showing until the window server
+                // agrees it is visible. Bounded, because a display mid-sleep can answer
+                // "not visible" forever and this must never spin.
+                for _ in 0..64 {
+                    if CGCursorIsVisible() != 0 {
+                        break;
+                    }
+                    CGDisplayShowCursor(CGMainDisplayID());
+                }
             }
             CGAssociateMouseAndMouseCursorPosition(1);
         }
@@ -538,6 +548,10 @@ const K_CG_KEYBOARD_KEYCODE: u32 = 9;
 
 /// `kCGScrollWheelEventDeltaAxis1` — vertical, in wheel notches.
 const K_CG_SCROLL_DELTA_AXIS1: u32 = 11;
+/// `kCGScrollWheelEventPointDeltaAxis1/2` — the PIXEL deltas. Smooth devices (trackpad,
+/// Magic Mouse) put real motion here while reporting zero wheel notches.
+const K_CG_SCROLL_POINT_DELTA_AXIS1: u32 = 96;
+const K_CG_SCROLL_POINT_DELTA_AXIS2: u32 = 97;
 /// `kCGScrollWheelEventDeltaAxis2` — horizontal.
 const K_CG_SCROLL_DELTA_AXIS2: u32 = 12;
 const K_CG_EVENT_LEFT_MOUSE_DRAGGED: CGEventType = 6;
@@ -820,6 +834,31 @@ unsafe fn decode_media_key(event: CGEventRef) -> Option<Observed> {
 ///
 /// # Safety
 /// `event` must be a valid `CGEventRef` for the duration of the call.
+/// Accumulate smooth-scroll pixels into whole wheel notches the far side understands.
+///
+/// Ten pixels to a notch approximates how macOS itself translates trackpad motion; the
+/// remainder carries across events so slow, fine scrolling still adds up instead of
+/// being rounded away.
+fn notches_from_pixels(px: i64, py: i64) -> Option<Observed> {
+    const PIXELS_PER_NOTCH: i64 = 10;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static ACC_X: AtomicI64 = AtomicI64::new(0);
+    static ACC_Y: AtomicI64 = AtomicI64::new(0);
+    let total_y = ACC_Y.fetch_add(py, Ordering::Relaxed) + py;
+    let total_x = ACC_X.fetch_add(px, Ordering::Relaxed) + px;
+    let notches_y = total_y / PIXELS_PER_NOTCH;
+    let notches_x = total_x / PIXELS_PER_NOTCH;
+    if notches_y == 0 && notches_x == 0 {
+        return None;
+    }
+    ACC_Y.fetch_sub(notches_y * PIXELS_PER_NOTCH, Ordering::Relaxed);
+    ACC_X.fetch_sub(notches_x * PIXELS_PER_NOTCH, Ordering::Relaxed);
+    Some(Observed::Scroll {
+        dx: i32::try_from(notches_x).unwrap_or(0),
+        dy: i32::try_from(notches_y).unwrap_or(0),
+    })
+}
+
 unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observed> {
     match event_type {
         K_CG_EVENT_MOUSE_MOVED
@@ -869,9 +908,25 @@ unsafe fn classify(event_type: CGEventType, event: CGEventRef) -> Option<Observe
                 )
             };
             if dx == 0 && dy == 0 {
-                // A Magic Mouse emits a stream of zero-delta events at the end of an
-                // inertial scroll; forwarding them is pure noise.
-                return None;
+                // Zero wheel notches is not zero motion: a trackpad or Magic Mouse
+                // smooth-scroll carries its movement in the PIXEL delta fields while
+                // the notch fields stay zero. Dropping these lost the whole smooth
+                // portion of every scroll — and, worse, the dropped events passed
+                // through the suppression and scrolled THIS machine in small steps
+                // while a peer held the pointer. Pixels accumulate into notches so
+                // smooth input becomes wheel input the far side understands.
+                // SAFETY: valid event; by-value getters.
+                let (py, px) = unsafe {
+                    (
+                        CGEventGetIntegerValueField(event, K_CG_SCROLL_POINT_DELTA_AXIS1),
+                        CGEventGetIntegerValueField(event, K_CG_SCROLL_POINT_DELTA_AXIS2),
+                    )
+                };
+                if px == 0 && py == 0 {
+                    // Genuinely a no-op (the inertial tail); nothing to forward.
+                    return None;
+                }
+                return notches_from_pixels(px, py);
             }
             Some(Observed::Scroll {
                 dx: i32::try_from(dx).unwrap_or(0),
@@ -1017,7 +1072,17 @@ unsafe extern "C" fn on_event(
     // SAFETY: `event` is valid for the duration of the callback. Every read below is a
     // by-value getter on it.
     let observed = unsafe { classify(event_type, event) };
-    let Some(observed) = observed else { return event };
+    let Some(observed) = observed else {
+        // Declining to FORWARD an event must not mean letting it LAND. While a peer
+        // owns the pointer, a scroll the classifier deemed not worth sending — a
+        // sub-notch pixel movement, an inertial tail — still scrolled this machine
+        // in small steps under the suppressed cursor. Input-shaped events are
+        // swallowed during suppression whether or not they travel.
+        if is_suppressing_local() && event_type == K_CG_EVENT_SCROLL_WHEEL {
+            return core::ptr::null_mut();
+        }
+        return event;
+    };
 
     // Never block: the callback runs on the input path, and a slow callback is exactly
     // what makes macOS disable the tap. A full channel drops the sample, which is
@@ -1256,6 +1321,24 @@ unsafe extern "C" {
     fn CFDataCreate(alloc: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
     fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
     fn CFDataGetLength(data: *const c_void) -> isize;
+    fn CFURLCreateWithBytes(
+        alloc: *const c_void,
+        bytes: *const u8,
+        length: isize,
+        encoding: u32,
+        base: *const c_void,
+    ) -> *const c_void;
+    fn CFURLCreateFilePathURL(
+        alloc: *const c_void,
+        url: *const c_void,
+        error: *mut *const c_void,
+    ) -> *const c_void;
+    fn CFURLGetFileSystemRepresentation(
+        url: *const c_void,
+        resolve_against_base: u8,
+        buffer: *mut u8,
+        buffer_len: isize,
+    ) -> u8;
 }
 
 /// The name of the general clipboard — the value of Apple's `kPasteboardClipboard`,
@@ -1288,6 +1371,52 @@ fn file_url_flavor() -> *const c_void {
             ) as usize
         }
     }) as *const c_void
+}
+
+/// Resolve a file-REFERENCE URL (`file:///.file/id=…`) to the real path it points at.
+///
+/// Some applications put the inode-style reference form on the pasteboard instead of a
+/// path URL — a copied zip arrived as `/.file/id=6571367.412610877`, which was then
+/// read literally: "not sharing the copied files: … is unreadable". CoreFoundation
+/// owns the id-to-path mapping; `CFURLCreateFilePathURL` is the documented inverse.
+fn resolve_reference_url(url_bytes: &[u8]) -> Option<std::path::PathBuf> {
+    // SAFETY: documented CoreFoundation calls; every created object is released on
+    // every path, and the byte buffer outlives the call that reads it.
+    unsafe {
+        let url = CFURLCreateWithBytes(
+            core::ptr::null(),
+            url_bytes.as_ptr(),
+            isize::try_from(url_bytes.len()).ok()?,
+            K_CF_STRING_ENCODING_UTF8,
+            core::ptr::null(),
+        );
+        if url.is_null() {
+            return None;
+        }
+        let mut error: *const c_void = core::ptr::null();
+        let resolved = CFURLCreateFilePathURL(core::ptr::null(), url, &raw mut error);
+        CFRelease(url);
+        if resolved.is_null() {
+            if !error.is_null() {
+                CFRelease(error);
+            }
+            return None;
+        }
+        let mut buffer = [0u8; 4096];
+        let ok = CFURLGetFileSystemRepresentation(
+            resolved,
+            1,
+            buffer.as_mut_ptr(),
+            isize::try_from(buffer.len()).unwrap_or(0),
+        );
+        CFRelease(resolved);
+        if ok == 0 {
+            return None;
+        }
+        let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+        let text = core::str::from_utf8(&buffer[..end]).ok()?;
+        Some(std::path::PathBuf::from(text))
+    }
 }
 
 /// Percent-decode the path of a `file://` URL. Returns `None` for anything else.
@@ -1363,6 +1492,13 @@ pub fn read_file_list() -> Result<Option<Vec<std::path::PathBuf>>, Error> {
             let len = usize::try_from(CFDataGetLength(data)).unwrap_or(0);
             let bytes = core::slice::from_raw_parts(CFDataGetBytePtr(data), len);
             if let Some(path) = path_from_file_url(bytes) {
+                // A reference-form URL decodes to `/.file/id=…`, which is not a place
+                // on disk — ask CoreFoundation for the path it actually means.
+                let path = if path.starts_with("/.file") {
+                    resolve_reference_url(bytes).unwrap_or(path)
+                } else {
+                    path
+                };
                 paths.push(path);
             }
             CFRelease(data);
@@ -1414,6 +1550,65 @@ pub fn write_file_list(paths: &[std::path::PathBuf]) -> Result<(), Error> {
         }
         CFRelease(pasteboard.cast_const());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reference_urls {
+    //! The `/.file/id=…` form, proven against the real filesystem: some applications
+    //! put the inode-style reference URL on the pasteboard, and a copied zip arriving
+    //! that way was read literally and refused as unreadable.
+
+    use super::*;
+
+    #[test]
+    fn a_reference_url_resolves_to_the_real_path() {
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFURLCreateFileReferenceURL(
+                alloc: *const c_void,
+                url: *const c_void,
+                error: *mut *const c_void,
+            ) -> *const c_void;
+            fn CFURLGetBytes(url: *const c_void, buffer: *mut u8, buffer_len: isize) -> isize;
+        }
+        let dir = std::env::temp_dir().join(format!("seam-refurl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let file = dir.join("archive.zip");
+        std::fs::write(&file, b"not really a zip").expect("test file");
+
+        // Build the reference form the same way an application would.
+        let url_text = file_url_from_path(&file);
+        // SAFETY: documented calls; every created object is released below.
+        let reference_bytes = unsafe {
+            let path_url = CFURLCreateWithBytes(
+                core::ptr::null(),
+                url_text.as_ptr(),
+                isize::try_from(url_text.len()).expect("short url"),
+                K_CF_STRING_ENCODING_UTF8,
+                core::ptr::null(),
+            );
+            assert!(!path_url.is_null(), "the path URL must parse");
+            let mut error: *const c_void = core::ptr::null();
+            let reference = CFURLCreateFileReferenceURL(core::ptr::null(), path_url, &raw mut error);
+            CFRelease(path_url);
+            assert!(!reference.is_null(), "the file must yield a reference URL");
+            let mut buffer = [0u8; 1024];
+            let written = CFURLGetBytes(reference, buffer.as_mut_ptr(), 1024);
+            CFRelease(reference);
+            buffer[..usize::try_from(written).expect("short url")].to_vec()
+        };
+        let as_text = String::from_utf8_lossy(&reference_bytes).to_string();
+        assert!(as_text.contains("/.file/id="), "precondition: got {as_text}");
+
+        let resolved = resolve_reference_url(&reference_bytes)
+            .expect("the reference URL must resolve");
+        assert_eq!(
+            std::fs::canonicalize(&resolved).expect("resolved path exists"),
+            std::fs::canonicalize(&file).expect("original path exists"),
+            "the reference must point back at the file it was made from"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 

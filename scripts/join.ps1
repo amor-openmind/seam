@@ -26,6 +26,23 @@ $base = "https://github.com/$repo/releases/latest/download"
 New-Item -ItemType Directory -Force -Path $home_ | Out-Null
 $bin = Join-Path $home_ "seam.exe"
 
+# Quit whatever seam is already running, FIRST - before any download or file move. A
+# running exe holds a lock its replacement trips over, and two seams racing a port is a
+# mess this script should never create. The quit is a loopback request, so it works
+# whatever the running copy is elevated to; a copy too old to answer is handled by the
+# new seam's own takeover when it starts.
+Write-Host "seam: stopping any running seam..."
+$note = Join-Path $env:APPDATA "seam\seam\data\ui-port"
+if (Test-Path $note) {
+  $uiport = (Get-Content $note -ErrorAction SilentlyContinue | Select-Object -First 1)
+  if ($uiport) {
+    try {
+      Invoke-WebRequest -UseBasicParsing -Method POST "http://127.0.0.1:$uiport/action/quit" -TimeoutSec 3 | Out-Null
+    } catch { }
+    Start-Sleep -Milliseconds 800
+  }
+}
+
 # Fetch every time: a few megabytes over a LAN is cheaper than reasoning about whether the
 # copy on disk is still newest, and re-running the command is how a person updates.
 Write-Host "seam: fetching the latest release..."
@@ -45,6 +62,27 @@ if ($true) {
     }
   } catch { }
 
+  # A running seam holds a lock on its own exe, and Move-Item cannot replace a
+  # locked file - re-running this script then died on the move. Ask the running
+  # one to quit over loopback (works whatever it is elevated to), give it a
+  # moment, and rename the old file aside as the last resort: Windows allows
+  # renaming a running exe even while it refuses to overwrite it.
+  $note = Join-Path $env:APPDATA "seam\seam\data\ui-port"
+  if (Test-Path $note) {
+    $uiport = (Get-Content $note -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($uiport) {
+      try {
+        Invoke-WebRequest -UseBasicParsing -Method POST "http://127.0.0.1:$uiport/action/quit" -TimeoutSec 3 | Out-Null
+      } catch { }
+      Start-Sleep -Milliseconds 800
+    }
+  }
+  if (Test-Path $bin) {
+    try { Remove-Item -Force $bin -ErrorAction Stop } catch {
+      try { Remove-Item -Force "$bin.old" -ErrorAction SilentlyContinue } catch { }
+      Rename-Item -Force $bin "$bin.old"
+    }
+  }
   Move-Item -Force $tmp $bin
 }
 

@@ -283,17 +283,38 @@ pub mod clipboard {
         }
     }
 
+    /// Retry a clipboard write through transient contention.
+    ///
+    /// There is exactly one system clipboard and any program may be holding it at the
+    /// instant a write lands — on Windows that surfaces as `SetClipboardData failed
+    /// … (os error 1418)`, seen live when a paste from another machine collided with
+    /// whatever the browser was doing. Contention clears in milliseconds; giving up on
+    /// the first refusal silently loses the copy.
+    fn with_retry(mut attempt: impl FnMut() -> Result<(), Error>) -> Result<(), Error> {
+        let mut last = attempt();
+        for pause_ms in [50u64, 150, 400] {
+            if last.is_ok() {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+            last = attempt();
+        }
+        last
+    }
+
     /// Replace the clipboard with an image. RGBA8, row-major, dimensions must match.
     pub fn write_image(width: u32, height: u32, rgba: &[u8]) -> Result<(), Error> {
-        let mut board = arboard::Clipboard::new()
-            .map_err(|e| Error::Platform(format!("clipboard unavailable: {e}")))?;
-        board
-            .set_image(arboard::ImageData {
-                width: width as usize,
-                height: height as usize,
-                bytes: rgba.into(),
-            })
-            .map_err(|e| Error::Platform(format!("could not set the clipboard image: {e}")))
+        with_retry(|| {
+            let mut board = arboard::Clipboard::new()
+                .map_err(|e| Error::Platform(format!("clipboard unavailable: {e}")))?;
+            board
+                .set_image(arboard::ImageData {
+                    width: width as usize,
+                    height: height as usize,
+                    bytes: rgba.into(),
+                })
+                .map_err(|e| Error::Platform(format!("could not set the clipboard image: {e}")))
+        })
     }
 
     /// The absolute paths of files currently on the clipboard, if any.
@@ -320,7 +341,7 @@ pub mod clipboard {
         }
         #[cfg(target_os = "windows")]
         {
-            crate::windows::write_file_list(paths)
+            with_retry(|| crate::windows::write_file_list(paths))
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -331,11 +352,13 @@ pub mod clipboard {
 
     /// Replace the clipboard's text.
     pub fn write_text(text: &str) -> Result<(), Error> {
-        let mut board = arboard::Clipboard::new()
-            .map_err(|e| Error::Platform(format!("clipboard unavailable: {e}")))?;
-        board
-            .set_text(text.to_owned())
-            .map_err(|e| Error::Platform(format!("could not set the clipboard: {e}")))
+        with_retry(|| {
+            let mut board = arboard::Clipboard::new()
+                .map_err(|e| Error::Platform(format!("clipboard unavailable: {e}")))?;
+            board
+                .set_text(text.to_owned())
+                .map_err(|e| Error::Platform(format!("could not set the clipboard: {e}")))
+        })
     }
 }
 

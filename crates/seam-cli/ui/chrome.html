@@ -3,6 +3,7 @@
 
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>seam — menu bar &amp; tray</title>
+<link rel="icon" type="image/png" sizes="32x32" href="_ds/assets/logo/seam-logo-32.png">
 <link rel="stylesheet" href="_ds/tokens.css">
 <style>
 .shell{max-width:900px;margin:0 auto;padding:28px 24px 64px}
@@ -42,15 +43,15 @@ p.lede{color:var(--text-secondary);font:400 var(--text-sm)/1.6 var(--font-sans);
   <p class="lede">seam lives in the corner of the screen. The icon answers the only constant question — <i>who has the pointer?</i> — and the popover answers everything else in one click. Identical structure on macOS and Windows; native placement on each.</p>
 
   <div class="menubar">
-    <span class="mb-item"><span class="g">SEAM</span> · here</span>
-    <span class="mb-item away"><span class="g">SEAM</span> → iMac</span>
+    <span class="mb-item"><span class="g"><img class="brand-icon" src="_ds/assets/logo/seam-logo-32.png" alt="seam"></span> · here</span>
+    <span class="mb-item away"><span class="g"><img class="brand-icon" src="_ds/assets/logo/seam-logo-32.png" alt="seam"></span> → iMac</span>
   </div>
 
   <div class="pair">
     <div class="variant">
       <span class="label">macOS · menu bar popover · pointer here</span>
       <div class="popover">
-        <div class="head"><span class="n">seam</span><span class="v">v0.2.1 · 8c1695ce</span></div>
+        <div class="head"><span class="n brand-mini"><img class="brand-icon" src="_ds/assets/logo/seam-logo-32.png" alt="">seam</span><span class="v">v0.2.1 · 8c1695ce</span></div>
         <div class="holder"><span class="k">POINTER</span><span class="who">on this machine</span></div>
         <div class="plist">
           <div class="p"><span class="dot ok"></span><span class="nm">AMorIMac</span><span class="ms">2.1 ms · left</span></div>
@@ -68,7 +69,7 @@ p.lede{color:var(--text-secondary);font:400 var(--text-sm)/1.6 var(--font-sans);
     <div class="variant">
       <span class="label">windows · tray popover · pointer away + a problem</span>
       <div class="popover">
-        <div class="head"><span class="n">seam</span><span class="v">v0.2.1 · d6be3828</span></div>
+        <div class="head"><span class="n brand-mini"><img class="brand-icon" src="_ds/assets/logo/seam-logo-32.png" alt="">seam</span><span class="v">v0.2.1 · d6be3828</span></div>
         <div class="holder" style="background:var(--feedback-warning-bg);border-color:var(--feedback-warning-line)"><span class="k" style="color:var(--feedback-warning-fg)">BLOCKED</span><span class="who" style="color:var(--feedback-warning-fg)">an administrator window has focus — input is refused (UIPI). Click a normal window, or run seam elevated.</span></div>
         <div class="plist">
           <div class="p"><span class="dot ok"></span><span class="nm">Mac-mini</span><span class="ms">holds pointer</span></div>

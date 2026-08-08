@@ -724,6 +724,24 @@ licence, which is the safe direction to fail.
 patch the binary can remove the check — true of every client-side licence ever shipped.
 What it does is make running seam require something only the owner can issue.
 
+**macOS signing (v0.8.8).** Release binaries for macOS are signed with the persistent
+self-signed identity **"seam updates"** (identifier `dev.seam.seam`), which lives in
+`~/Library/Keychains/seam-sign.keychain-db` on the owner's machine — never ad-hoc.
+macOS keys Input Monitoring on the signing identity: with a stable one the grant survives
+every update, with ad-hoc each release is a stranger and the fleet goes captureless until
+someone toggles System Settings again. That happened twice in one afternoon before this
+existed. Sign with:
+
+```
+security unlock-keychain -p seam-sign-local ~/Library/Keychains/seam-sign.keychain-db
+codesign --force --sign "seam updates" --keychain ~/Library/Keychains/seam-sign.keychain-db \
+  -i dev.seam.seam dist/seam-macos-arm64
+```
+
+The identity is machine-local and self-signed; it exists for TCC continuity, not
+notarisation. If it is ever lost, recreate it, sign the next release with the new one, and
+expect exactly one more Input Monitoring toggle on each Mac.
+
 **Private source with public downloads needs two repositories.** A private repo's release
 assets require a GitHub token to download, so "private code, public releases" cannot be one
 repo:
@@ -749,3 +767,146 @@ Pages notice. A page whose daemon stops answering for four polls says so rather 
 polling a port that may now belong to a different seam. Clicking a download on the update
 page stops the running seam first, so the old copy is not holding the port or the input tap
 when the new one starts.
+
+---
+
+## 14. /goal — application logo system (implementation complete; release pending)
+
+**Objective:** establish one approved Seam mark, publish production-ready platform sizes,
+author its usage in the Claude Design System and Pages projects, and serve the synced
+assets from the real application.
+
+**Design source of truth**
+
+- Design System `22ae8beb-c703-4b1c-aa6d-ae63e84ef135` owns the master logo assets and
+  `guidelines/brand-wordmark.card.html`.
+- Pages `e3000f2f-209b-434d-b7a8-4ca8813e66d0` consumes the logo under
+  `_ds/assets/logo/`. Every page uses the 32 px favicon; the fleet, onboarding, and
+  licence pages use the full lockup; the menu-bar/tray study uses the compact symbol.
+- The application mirror matches the generated visible HTML/CSS. Its only additions are
+  the existing runtime-binding script tags.
+
+**Production assets**
+
+- Transparent PNG: 16, 32, 48, 64, 128, 256, 512, and 1024 px.
+- Windows ICO and macOS ICNS.
+- The binary embeds the 32 and 128 px PNGs and serves their exact bytes from both the
+  normal fleet server and the activation-only server.
+
+**Verification evidence for commit `4693ca1`**
+
+- Claude Design previews: desktop 1280 px and compact 390 × 844; no horizontal overflow,
+  missing logo images, or breakpoint drift.
+- Local runtime: activation page rendered at both widths; 32 and 128 px responses were
+  `200 image/png`, byte-identical to the committed files; a foreign Origin received 403.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+- `cargo test --workspace`: 174 passed, 2 intentionally ignored.
+- LLVM changed-code coverage: every executable line in the new asset response helper and
+  both server integration branches executed.
+- Branch `codex/seam-logo-assets` is pushed to origin at `4693ca1`.
+
+**Remaining release step:** merge the reviewed branch and publish a newly tagged signed
+macOS/Windows release. No tag is chosen here: overwriting an existing public release is
+not an implementation detail and requires an explicit version decision.
+
+---
+
+## 14. The join flow is wrong, and how it must work — **built in v0.9.0**
+
+Status: implemented and verified end-to-end (two isolated daemons paired on one machine:
+codes matched, both confirmed over `POST /action/pair/confirm`, trust persisted to both
+peers files, fleet links established without a restart). The pieces:
+
+- A stranger connecting is **parked, not refused**: the accept path holds the link and
+  derives the SAS code (`park_pairing`), shown on both machines' pairing pages.
+- A seam that trusts nobody yet **offers itself** to whatever it discovers or was told to
+  `--connect` to — a fresh install rings the doorbell with nothing typed anywhere.
+- `/state` carries `discovered` (everyone mDNS can see, stranger or not) and `pairing`
+  (`code`, `with`, `showing|paired|declined`); `POST /action/pair/<peer>` dials a listed
+  machine, `…/confirm` writes trust and saves, `…/decline` closes without trusting.
+- The pairing page binds those states through `page-pairing.js`; the design's state
+  catalogue (discovering, found, verify, paired, differ) collapses to the live one.
+
+The command in "Add a machine" remains as the download vehicle and firewall fallback.
+
+A person downloads an app and opens it. They do not paste shell commands into a terminal
+they have never used. "Add a machine" previously handed out only a `curl | sh` one-liner,
+which is a developer's install flow wearing a product's clothes — and the user said so
+plainly.
+
+**What it must be:**
+
+1. Download `seam.exe` (or the macOS binary) on the new machine. One link, one file.
+2. Double-click it. It already opens its own page and asks for a licence.
+3. **The page then lists seam machines it can see on this network** — discovery already
+   finds them (`Discovery::browse`, `_seam._udp`), and `advertised_fingerprint` already
+   tells us which are strangers rather than known peers.
+4. Click one. Both screens show the same six digits, confirm, done.
+
+No address to type, no port, no version, no command. Everything needed exists:
+
+- Discovery finds unpaired machines already; auto-dial deliberately ignores them because
+  they are not trusted yet. That check stays — this adds a way for a person to *grant* that
+  trust, which is exactly what pairing is.
+- `Command::Pair` performs the SAS exchange today, from the command line. The page needs
+  `POST /action/pair/<peer>` over the same code path, and `/state` needs a `discovered`
+  list of seen-but-unpaired machines.
+- `pairing.html` is already designed for precisely this: discovering, machines found, the
+  six-digit verify dialog, paired, and the mismatch refusal. It has never been bound.
+
+**The shell scripts stay** as a fallback for headless machines, but they must not be the
+answer given to a person adding their laptop.
+
+**Also still open** (unchanged, and both real):
+
+- **Machine positions cannot be changed.** Layout comes from pairing order alone: first
+  paired sits left, second below it. If the physical arrangement differs, seam is wrong and
+  there is no way to tell it. Needs a layout surface in Claude Design, persistence, and
+  agreement between both ends.
+- **The Windows UAC handoff is unverified.** The parent exits assuming a successful
+  `ShellExecute` means a running daemon, without confirming the child came up. It is the
+  best explanation for the laptop's repeated slow or failed starts, and it should wait for
+  the child before exiting.
+
+### Waking a sleeping machine needs Wake-on-LAN, and may not be possible
+
+Reported: the laptop sleeps and moving the pointer at its edge does not wake it.
+
+This is not a defect. A sleeping machine has its CPU halted and its network stack down, so
+injected input arrives as packets nobody is listening for. Real USB input wakes a machine
+because the USB controller stays powered; a network packet has no such privilege.
+
+**The only mechanism is Wake-on-LAN** — a magic packet to the peer's MAC address, which the
+network adapter watches for while the machine sleeps. Implementable as: when the pointer
+crosses to a machine whose link is dead, send the magic packet, wait briefly, then dial.
+
+Three preconditions, none of which seam controls:
+
+1. **The peer's MAC.** seam knows only its IP. The MAC would be announced on connect and
+   remembered alongside the pairing, so it is known while the machine is unreachable.
+2. **WoL enabled** in the peer's firmware *and* adapter properties. Off by default on most
+   Windows laptops, and commonly disabled on battery power.
+3. **Wi-Fi.** WoWLAN needs specific adapter support and is often unavailable. The laptop on
+   this project's own fleet is on Wi-Fi, so it may be impossible there regardless of code.
+
+**Do not promise this in the UI as though it always works.** If built, the honest surface
+is: attempt the wake, and if the machine does not answer within a few seconds, say plainly
+that it is asleep and could not be woken — rather than a pointer that silently vanishes
+into a machine that is not there.
+
+## 15. The sign-in screen — the one desktop seam cannot reach yet
+
+After sleep, a Windows machine wakes to the Secure Desktop (Winlogon), and Windows
+refuses injected input there from any user-session process, elevated or not — the same
+boundary that protects UAC prompts. Physical keyboard only. This is OS design, and the
+v0.9.9 desktop-reattach deliberately fixes only the moment AFTER unlock.
+
+Reaching the sign-in screen itself is possible and well-trodden: Synergy and Barrier run
+a Windows service as SYSTEM whose helper process follows desktop switches (console
+session tracking + `SetThreadDesktop` onto Winlogon) and injects from the one privilege
+level Windows permits there. For seam that means: a service mode (install/uninstall via
+the existing elevated path), a SYSTEM-launched helper in the active console session, a
+desktop-switch watcher, and input forwarding handed to whichever process currently owns
+the reachable desktop. Substantial, self-contained, and the last input surface seam does
+not cover. Until then: the machine's own keyboard at sign-in, or Windows' own
+"require sign-in: Never" setting for machines where that tradeoff is acceptable.

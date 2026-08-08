@@ -12,8 +12,13 @@
   "use strict";
 
   // [path, label, who] — "all", "server" or "client".
+  //
+  // Arranging the desk sits next to the machines it rearranges, and belongs to the
+  // server: the layout is the server's model of the room, and it is the machine whose
+  // pointer crosses the edges being described.
   var SECTIONS = [
     ["/", "Machines", "all"],
+    ["/layout.html", "Arrange", "server"],
     ["/join.html", "Add a machine", "server"],
     ["/pairing.html", "Pairing", "server"],
     ["/transfers.html", "Clipboard", "all"],

@@ -40,8 +40,17 @@ fn transport_config() -> quinn::TransportConfig {
 
     // Default is 30 s. A peer that has genuinely gone must be noticed quickly, because
     // the receiving side releases held keys and returns the cursor on that signal (R2).
+    //
+    // But not in 5 s. A power-managed Wi-Fi adapter naps for longer than that while a
+    // link is idle, and both sides then declare "timed out" while both processes are
+    // demonstrably fine — a laptop spent a whole morning connecting and dying every few
+    // seconds-to-minutes, dropping out of the desk each time, its console and the
+    // server's log each blaming the other side's silence. Fifteen seconds rides out an
+    // adapter nap; with a 1 s keep-alive it still means fifteen missed heartbeats
+    // before anyone is declared dead, and a machine that really is gone still hands
+    // input back well inside a person's patience.
     tc.max_idle_timeout(Some(
-        Duration::from_secs(5).try_into().expect("5s is a valid idle timeout"),
+        Duration::from_secs(15).try_into().expect("15s is a valid idle timeout"),
     ));
 
     // Default is 1200, then MTU discovery ramps up. On a LAN the path supports 1500, and
@@ -68,6 +77,22 @@ impl core::fmt::Debug for Endpoint {
 }
 
 impl Endpoint {
+
+    /// Replace the UDP socket underneath this endpoint, keeping its identity and config.
+    ///
+    /// A laptop that sleeps wakes with a different network underneath it: the socket bound
+    /// before standby still exists, still accepts writes, and reaches nothing. Every
+    /// reconnect attempt then fails forever while looking like an unreachable peer, which
+    /// is why sharing only came back after restarting seam.
+    ///
+    /// Rebinding is cheap and safe to do when nothing is wrong — the endpoint keeps its
+    /// certificate, so peers still recognise this machine.
+    pub fn rebind(&self, port: u16) -> Result<(), Error> {
+        let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+        let socket = std::net::UdpSocket::bind(addr)
+            .map_err(|e| Error::Bind { addr, reason: e.to_string() })?;
+        self.inner.rebind(socket).map_err(|e| Error::Bind { addr, reason: e.to_string() })
+    }
     /// Bind to `addr`. Use port 0 to let the OS choose (tests, and any peer that does not
     /// need a stable port because it is found by discovery rather than by address).
     pub fn bind(identity: Arc<Identity>, addr: SocketAddr) -> Result<Self, Error> {
@@ -126,7 +151,11 @@ impl Endpoint {
         let addr = incoming.remote_address();
         Some(match incoming.await {
             Ok(connection) => Link::from_connection(connection),
-            Err(e) => Err(Error::Connect { addr, reason: e.to_string() }),
+            // Not `Error::Connect`: that one says "could not reach the peer at …", which
+            // reads as an outbound failure. An afternoon was spent chasing a log that
+            // said a machine could not *reach* an address it was in fact being dialled
+            // from.
+            Err(e) => Err(Error::Handshake { addr, reason: e.to_string() }),
         })
     }
 
@@ -245,10 +274,29 @@ impl Link {
     /// per frame means a stalled or failed frame cannot head-of-line-block the next —
     /// which is the whole reason for not using TCP.
     pub async fn send_reliable(&self, frame: &Frame) -> Result<(), Error> {
+        self.send_with_priority(frame, 0).await
+    }
+
+    /// Send a frame as **bulk**: reliable, but scheduled behind everything else.
+    ///
+    /// On a healthy LAN this is indistinguishable from `send_reliable`. On a thin or
+    /// degraded path it is the difference between a usable desk and a glitching one:
+    /// QUIC schedules scarce bandwidth by stream priority, so a megabyte screenshot
+    /// marked bulk trickles while keystrokes and clicks — tiny, priority zero — go
+    /// first. A client on a bad network is a normal machine, not a broken one, and
+    /// input must feel local there too.
+    pub async fn send_bulk(&self, frame: &Frame) -> Result<(), Error> {
+        self.send_with_priority(frame, -1).await
+    }
+
+    async fn send_with_priority(&self, frame: &Frame, priority: i32) -> Result<(), Error> {
         let mut buf = Vec::with_capacity(64);
         frame.encode_framed(&mut buf)?;
         let mut stream =
             self.connection.open_uni().await.map_err(|e| Error::Send(e.to_string()))?;
+        if priority != 0 {
+            let _ = stream.set_priority(priority);
+        }
         stream.write_all(&buf).await.map_err(|e| Error::Send(e.to_string()))?;
         stream.finish().map_err(|e| Error::Send(e.to_string()))?;
         Ok(())

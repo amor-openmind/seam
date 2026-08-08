@@ -112,18 +112,29 @@ fn virtual_screen() -> PixelRect {
 /// Where the pointer is, in virtual-desktop pixel coordinates.
 pub fn cursor_position() -> Result<(i32, i32), Error> {
     let mut point = POINT { x: 0, y: 0 };
-    // SAFETY: `point` is a valid, initialised out-parameter.
-    if unsafe { GetCursorPos(&raw mut point) } == 0 {
-        return Err(Error::Platform("GetCursorPos failed".into()));
+    // SAFETY: `point` is a valid, initialised out-parameter. A failure is retried once
+    // after re-attaching to the input desktop — a lock/unlock cycle detaches this
+    // thread's desktop, and every cursor call fails until someone re-attaches.
+    unsafe {
+        if GetCursorPos(&raw mut point) == 0
+            && !(reattach_to_input_desktop() && GetCursorPos(&raw mut point) != 0)
+        {
+            return Err(Error::Platform("GetCursorPos failed".into()));
+        }
     }
     Ok((point.x, point.y))
 }
 
 /// Move the pointer without generating input events.
 pub fn warp_cursor(x: i32, y: i32) -> Result<(), Error> {
-    // SAFETY: plain integer arguments; the OS clamps out-of-range values.
-    if unsafe { SetCursorPos(x, y) } == 0 {
-        return Err(Error::Platform("SetCursorPos failed".into()));
+    // SAFETY: plain integer arguments; the OS clamps out-of-range values. Same
+    // re-attach-and-retry as `cursor_position`, for the same lock-screen reason.
+    unsafe {
+        if SetCursorPos(x, y) == 0
+            && !(reattach_to_input_desktop() && SetCursorPos(x, y) != 0)
+        {
+            return Err(Error::Platform("SetCursorPos failed".into()));
+        }
     }
     Ok(())
 }
@@ -226,7 +237,52 @@ fn send_one(input: INPUT) -> Result<(), Error> {
     // SAFETY: one correctly initialised INPUT, with the size the API requires.
     let sent =
         unsafe { SendInput(1, &raw const input, i32::try_from(size_of::<INPUT>()).unwrap_or(0)) };
-    if sent == 1 { Ok(()) } else { Err(Error::Platform("SendInput accepted no events".into())) }
+    if sent == 1 {
+        return Ok(());
+    }
+    // A refused injection after a lock/unlock cycle is a thread still attached to a
+    // desktop that no longer receives input. Windows swaps the interactive desktop for
+    // the secure one at the sign-in screen; a process that lived through that swap
+    // keeps its old attachment, and every SendInput after unlock returns zero —
+    // "keyboard share stopped after the laptop slept and woke" was exactly this.
+    // Re-attach to whatever desktop currently receives input and try once more.
+    if reattach_to_input_desktop() {
+        let retried = unsafe {
+            SendInput(1, &raw const input, i32::try_from(size_of::<INPUT>()).unwrap_or(0))
+        };
+        if retried == 1 {
+            return Ok(());
+        }
+    }
+    Err(Error::Platform("SendInput accepted no events".into()))
+}
+
+/// Attach this thread to the desktop that currently receives input.
+///
+/// Per-thread, cheap, and idempotent. The handle deliberately stays open on success:
+/// the assignment is only valid while it is.
+fn reattach_to_input_desktop() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenInputDesktop(flags: u32, inherit: i32, access: u32) -> *mut core::ffi::c_void;
+        fn SetThreadDesktop(desktop: *mut core::ffi::c_void) -> i32;
+        fn CloseDesktop(desktop: *mut core::ffi::c_void) -> i32;
+    }
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    // SAFETY: documented calls; the handle is closed only when the attach failed and
+    // it is therefore not in use.
+    unsafe {
+        let desktop = OpenInputDesktop(0, 0, GENERIC_ALL);
+        if desktop.is_null() {
+            return false;
+        }
+        if SetThreadDesktop(desktop) != 0 {
+            true
+        } else {
+            CloseDesktop(desktop);
+            false
+        }
+    }
 }
 
 fn mouse_input(flags: u32, data: i32) -> INPUT {
@@ -269,7 +325,114 @@ pub fn inject_button(button: u8, down: bool) -> Result<(), Error> {
         (3, false) => MOUSEEVENTF_MIDDLEUP,
         _ => return Err(Error::Unsupported("that mouse button")),
     };
-    send_one(mouse_input(flags, 0))
+    send_one(mouse_input(flags, 0))?;
+    note_pressed(&PRESSED_BUTTONS, u16::from(button), down);
+    Ok(())
+}
+
+/// Everything this machine has been told to press and not yet told to release.
+///
+/// Injected state outlives the link that caused it: a connection that dies between a
+/// key's DOWN and its UP leaves the key held at the OS level. From the chair that is
+/// "some keys stopped working" — a phantom Ctrl turns every letter into a shortcut —
+/// and a phantom mouse button turns every touchpad tap into a drag.
+static PRESSED_KEYS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+static PRESSED_BUTTONS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+fn note_pressed(set: &std::sync::Mutex<Vec<u16>>, value: u16, down: bool) {
+    if let Ok(mut held) = set.lock() {
+        held.retain(|&v| v != value);
+        if down {
+            held.push(value);
+        }
+    }
+}
+
+/// Release every key and button still held from injection.
+///
+/// Wired to the same moments as cursor reveal — the pointer leaving, the link dying —
+/// because both are the same promise: when this machine stops being driven, it is left
+/// exactly as a machine nobody touched.
+pub fn release_everything() {
+    let keys = PRESSED_KEYS.lock().map(|mut held| std::mem::take(&mut *held)).unwrap_or_default();
+    for usage in keys {
+        let _ = inject_key(usage, false);
+    }
+    let buttons =
+        PRESSED_BUTTONS.lock().map(|mut held| std::mem::take(&mut *held)).unwrap_or_default();
+    for button in buttons {
+        let _ = inject_button(u8::try_from(button).unwrap_or(1), false);
+    }
+}
+
+/// After injecting a button-down, ask the OS whether the button reads as pressed.
+///
+/// `SendInput` returning success means the event was queued, not that anything kept
+/// it: the same silent-discard family as UIPI. Motion already verifies by reading the
+/// cursor back; this is the button equivalent. Two days were spent on a machine where
+/// clicks were accepted, elevation checked out, no modifier was held — and nothing on
+/// screen ever happened. This read-back is the missing witness.
+#[must_use]
+pub fn button_reads_pressed(button: u8) -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(vk: i32) -> i16;
+    }
+    let vk = match button {
+        1 => 0x01,
+        2 => 0x02,
+        3 => 0x04,
+        _ => return true,
+    };
+    // SAFETY: documented stateless query.
+    (unsafe { GetAsyncKeyState(vk) }).cast_unsigned() & 0x8000 != 0
+}
+
+/// Which modifiers the OS considers held right now that seam did not press.
+///
+/// The diagnosis this exists for: "clicks and keyboard not working" on a machine whose
+/// links, elevation and injection all checked out — because a phantom Ctrl or Win was
+/// held, turning every click into a chord and every keypress into a shortcut, while
+/// motion sailed through untouched. One log line naming the held key ends the guessing.
+#[must_use]
+pub fn oddly_held_modifiers() -> Vec<&'static str> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(vk: i32) -> i16;
+    }
+    const CHECKS: [(i32, u16, &str); 8] = [
+        (0xA2, 224, "left Ctrl"),
+        (0xA3, 228, "right Ctrl"),
+        (0xA0, 225, "left Shift"),
+        (0xA1, 229, "right Shift"),
+        (0xA4, 226, "left Alt"),
+        (0xA5, 230, "right Alt"),
+        (0x5B, 227, "left Win"),
+        (0x5C, 231, "right Win"),
+    ];
+    let ours = PRESSED_KEYS.lock().map(|held| held.clone()).unwrap_or_default();
+    CHECKS
+        .iter()
+        // SAFETY: documented stateless query.
+        .filter(|(vk, _, _)| unsafe { GetAsyncKeyState(*vk) }.cast_unsigned() & 0x8000 != 0)
+        .filter(|(_, usage, _)| !ours.contains(usage))
+        .map(|(_, _, name)| *name)
+        .collect()
+}
+
+/// Release the modifiers and buttons a *previous* seam may have left held.
+///
+/// A fresh process has an empty pressed set, so `release_everything` cannot undo what a
+/// crashed predecessor did — but injecting an UP for a key that is not down is a no-op,
+/// so at startup every modifier is released unconditionally. Fail open, like the cursor.
+pub fn release_stuck_modifiers() {
+    // HID usages: LeftControl..RightGUI, then the three buttons.
+    for usage in 224u16..=231 {
+        let _ = inject_key(usage, false);
+    }
+    for button in 1u8..=3 {
+        let _ = inject_button(button, false);
+    }
 }
 
 /// Scroll. Positive `dy` is away from the user, matching the protocol.
@@ -386,7 +549,43 @@ pub fn inject_key(usage: u16, down: bool) -> Result<(), Error> {
         time: 0,
         dwExtraInfo: 0,
     };
-    send_one(input)
+    send_one(input)?;
+    note_pressed(&PRESSED_KEYS, usage, down);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- console self-defence
+
+// SAFETY CONTRACT: reading and setting our own console's input mode. QuickEdit is the
+// default, and it means one stray click in the console window enters selection mode and
+// blocks every write to stdout — which freezes the whole daemon at the next log line.
+// Observed live: a console titled "Auswählen" (mark mode), the process wedged holding its
+// own exe lock, the link timing out, and injected keys left held. Logging must never be
+// able to stop the machine.
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(which: u32) -> *mut core::ffi::c_void;
+    fn GetConsoleMode(handle: *mut core::ffi::c_void, mode: *mut u32) -> i32;
+    fn SetConsoleMode(handle: *mut core::ffi::c_void, mode: u32) -> i32;
+}
+
+/// Turn off `QuickEdit` on our own console, so a click can never freeze the daemon.
+///
+/// Harmless when there is no console (launched at login, output redirected): the handle
+/// is invalid and the calls fail quietly, which is the right amount of noise.
+pub fn disable_console_quick_edit() {
+    const STD_INPUT_HANDLE: u32 = (-10i32).cast_unsigned();
+    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    // SAFETY: documented calls on our own process's console handles; an invalid or
+    // absent handle makes GetConsoleMode return 0 and nothing is changed.
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0u32;
+        if !handle.is_null() && GetConsoleMode(handle, &raw mut mode) != 0 {
+            let _ = SetConsoleMode(handle, (mode & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- file clipboard

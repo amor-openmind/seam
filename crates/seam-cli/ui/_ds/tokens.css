@@ -54,3 +54,11 @@ body{background:var(--surface-page);color:var(--text-primary);font:400 var(--tex
 button.btn{font:500 var(--text-sm)/1.2 var(--font-sans);padding:8px 14px;border-radius:var(--radius-md);border:1px solid var(--border-line);background:var(--surface-card);color:var(--text-primary);cursor:pointer}
 button.btn.primary{background:var(--action-primary);border-color:var(--action-primary);color:var(--text-inverse)}
 button.btn.ghost{border-color:transparent;background:transparent;color:var(--text-link)}
+
+/* seam brand lockups — source mark lives in the Design System assets/logo folder */
+.brand-lockup{display:inline-flex;align-items:center;gap:10px}
+.brand-lockup>img{display:block;width:30px;height:30px;object-fit:contain;flex:none}
+.brand-icon{display:block;width:16px;height:16px;object-fit:contain;flex:none}
+.brand-mini{display:inline-flex!important;align-items:center;gap:7px}
+.brand-mini .brand-icon{width:18px;height:18px}
+@media (max-width:560px){.brand-lockup{gap:8px}.brand-lockup>img{width:26px;height:26px}}

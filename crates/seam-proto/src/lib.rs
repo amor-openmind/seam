@@ -43,7 +43,7 @@ pub use state::{KeyState, Reconciliation};
 /// Bumped on any incompatible change to the frame encoding. Peers exchange this in
 /// [`Hello`] and refuse to proceed on mismatch — a version check that only warns is how
 /// you get silent misinterpretation of key events, which is far worse than not connecting.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Magic bytes opening a control stream, so a wrong-protocol peer fails immediately
 /// and legibly rather than at the first malformed frame.
